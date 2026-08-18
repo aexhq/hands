@@ -161,6 +161,35 @@ pub async fn probe(
     response.json().await.context("probe body")
 }
 
+/// The speculative resume: send endpoint traffic to a suspended hand so Lambda holds the request
+/// while `/resume` runs, then answers from the resumed guest. Right after an explicit suspend the
+/// endpoint can briefly answer 502/503 before auto-resume is wired, so this retries the held
+/// request until it succeeds or `overall` elapses. This is the D6/F-4 path a brain uses to hide
+/// the resume behind model inference.
+pub async fn resume_via_probe(
+    http: &reqwest::Client,
+    hand: &LaunchedHand,
+    overall: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + overall;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match probe(http, hand, Duration::from_secs(60)).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(
+                        e.context(format!("resume-via-probe gave up after {attempt} tries"))
+                    );
+                }
+                tracing::debug!(attempt, error = %e, "resume probe not ready; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 /// Endpoint traffic on a timer, so a hand with live jobs is never idle-suspended under them.
 /// Dropping the handle stops it.
 pub struct Keepalive {

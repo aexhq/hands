@@ -421,7 +421,9 @@ async fn e2e(
     let hello = c.hello(hello_req(&session_id("e2e"), &token)).await?;
     step("connect_and_hello", t);
     anyhow::ensure!(hello.tools.len() == 7, "sealed manifest served");
-    let _keepalive = launch::Keepalive::spawn(hand.clone(), Duration::from_secs(60));
+    // Keepalive holds the VM up while jobs are live; it is stopped before we choose to suspend
+    // (otherwise its own traffic would auto-resume the VM we just suspended).
+    let keepalive = launch::Keepalive::spawn(hand.clone(), Duration::from_secs(60));
 
     // 2. A real build: source written through the tool, compiled and run in the VM.
     let t = Instant::now();
@@ -467,6 +469,7 @@ async fn e2e(
     step("sync_initial", t);
 
     // 4. Suspend, then resume via the speculative probe (endpoint-held until /resume).
+    drop(keepalive); // stop generating traffic, or the VM auto-resumes under us
     let t = Instant::now();
     control.suspend(&hand.microvm_id).await?;
     launch::wait_for_state(
@@ -477,9 +480,11 @@ async fn e2e(
     )
     .await?;
     step("suspend", t);
+    // Speculative resume: endpoint traffic to the suspended hand, held until /resume completes.
+    // Retries across the brief post-suspend window where the endpoint answers 502.
     let t = Instant::now();
     let http = reqwest::Client::new();
-    let probe = launch::probe(&http, &hand, Duration::from_secs(60)).await?;
+    let probe = launch::resume_via_probe(&http, &hand, Duration::from_secs(120)).await?;
     anyhow::ensure!(probe["service"] == "aex-hand", "probe: {probe}");
     step("probe_resume", t);
     launch::wait_for_state(
