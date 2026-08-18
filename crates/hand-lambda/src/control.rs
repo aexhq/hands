@@ -94,6 +94,10 @@ impl Control {
             .auto_resume_enabled(true)
             .build()
             .map_err(|e| ControlError::Fatal(format!("idle policy: {e}")))?;
+        // Deliberately no `.execution_role_arn(...)`: an execution role would make IAM
+        // credentials retrievable from inside the guest via IMDSv2 (spike S2-D confirmed the
+        // metadata service answers; only the *absence* of an attached role keeps it empty). I8 —
+        // the hand holds no cloud credential — depends on this staying unset.
         let out = self
             .client
             .run_microvm()
