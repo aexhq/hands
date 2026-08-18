@@ -137,6 +137,12 @@ impl HandClient {
         })
     }
 
+    /// True once the underlying WebSocket has closed. A closed client never recovers; the
+    /// owner must reconnect (and re-hello) or reclassify the hand.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     pub fn set_fence(&self, fence: u64) {
         self.fence.store(fence, Ordering::SeqCst);
     }
