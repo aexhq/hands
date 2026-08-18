@@ -206,6 +206,14 @@ impl Spill {
             let _ = std::fs::remove_file(&seg.path);
         }
     }
+
+    /// Forces retained bytes to durable storage. Called from the `/suspend` lifecycle hook so
+    /// the snapshot the platform takes holds every byte the streams have produced.
+    pub fn flush(&mut self) {
+        for seg in &self.segments {
+            let _ = seg.file.sync_all();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -77,6 +77,26 @@ pub struct Hand {
     manifest_digest: Sha256Hex,
     idle_since: Mutex<Instant>,
     heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The armed per-session secret. `None` until the environment or the `/run` lifecycle hook
+    /// supplies it; an unarmed hand refuses every `hello`.
+    token: RwLock<Option<String>>,
+    /// Where the hand is in the provider lifecycle. Informational (probe + status); admission
+    /// is gated by the armed token, not by this.
+    pub lifecycle: RwLock<LifecyclePhase>,
+}
+
+/// The provider-lifecycle phase, as the hooks report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePhase {
+    /// Booted; `/run` has not completed (only reachable when the token comes from `/run`).
+    AwaitingRun,
+    /// `/run` or `/resume` completed; serving.
+    Serving,
+    /// `/suspend` completed; the platform is snapshotting (or resumed us without re-posting).
+    Suspended,
+    /// `/terminate` received; the VM is going away.
+    Terminating,
 }
 
 impl Hand {
@@ -94,7 +114,7 @@ impl Hand {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()?;
-        Ok(Arc::new(Self {
+        let hand = Arc::new(Self {
             cfg,
             generation_id: random_id("gen").parse().expect("id"),
             boot_id: random_id("boot").parse().expect("id"),
@@ -109,7 +129,45 @@ impl Hand {
             manifest_digest: manifest_digest(manifest_v1()),
             idle_since: Mutex::new(Instant::now()),
             heartbeat: Mutex::new(None),
-        }))
+            token: RwLock::new(None),
+            lifecycle: RwLock::new(LifecyclePhase::AwaitingRun),
+        });
+        if let Some(token) = hand.cfg.token.clone() {
+            // Environment-armed (plain container): serving from boot, no run hook required.
+            *hand.token.write().unwrap() = Some(token);
+            *hand.lifecycle.write().unwrap() = LifecyclePhase::Serving;
+        }
+        Ok(hand)
+    }
+
+    /// Arms the hand with the per-session secret (from the `/run` hook). Idempotent for the
+    /// same token; refuses a different one — a hand serves exactly one session in its life.
+    pub fn arm(&self, token: &str) -> Result<(), &'static str> {
+        if token.is_empty() {
+            return Err("empty token");
+        }
+        let mut cur = self.token.write().unwrap();
+        match cur.as_deref() {
+            None => {
+                *cur = Some(token.to_owned());
+                Ok(())
+            }
+            Some(t) if t == token => Ok(()),
+            Some(_) => Err("hand is already armed with a different token"),
+        }
+    }
+
+    pub fn armed(&self) -> bool {
+        self.token.read().unwrap().is_some()
+    }
+
+    /// Forces every retained stream byte to durable storage (the `/suspend` hook).
+    pub async fn flush_spills(&self) {
+        let ops = self.ops.lock().unwrap().all();
+        for op in ops {
+            op.stdout.lock().await.flush();
+            op.stderr.lock().await.flush();
+        }
     }
 
     fn session(&self) -> AbiResult<Arc<Session>> {
@@ -181,8 +239,17 @@ impl Hand {
                 ),
             ));
         }
-        if a.session_token != self.cfg.token {
-            return Err(err(ErrorCode::Unauthorized, "session_token mismatch"));
+        match self.token.read().unwrap().as_deref() {
+            None => {
+                return Err(err(
+                    ErrorCode::Unauthorized,
+                    "hand is not armed: the run hook has not delivered a session token",
+                ));
+            }
+            Some(t) if *t != *a.session_token => {
+                return Err(err(ErrorCode::Unauthorized, "session_token mismatch"));
+            }
+            Some(_) => {}
         }
         if let Some(d) = &a.tool_manifest_digest
             && *d != self.manifest_digest

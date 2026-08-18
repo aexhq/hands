@@ -9,6 +9,7 @@ pub mod config;
 pub mod errors;
 pub mod exec;
 pub mod hand;
+pub mod hooks;
 pub mod lanes;
 pub mod ops;
 pub mod server;

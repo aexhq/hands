@@ -2,7 +2,7 @@
 //! detached job + poll + cancel, then prints a one-line PASS/FAIL. Used by tools/smoke.sh to
 //! prove the guest agent works inside a plain Docker container.
 //!
-//!   cargo run -p hand-client --example smoke -- ws://127.0.0.1:7000/ <token>
+//!   cargo run -p hand-client --example smoke -- ws://127.0.0.1:8080/ <token>
 use std::time::Duration;
 
 use aex_contracts::abi::{
@@ -16,7 +16,7 @@ use serde_json::json;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let url = args.next().unwrap_or_else(|| "ws://127.0.0.1:7000/".into());
+    let url = args.next().unwrap_or_else(|| "ws://127.0.0.1:8080/".into());
     let token = args.next().unwrap_or_else(|| "tok".into());
 
     let c = HandClient::connect(&url, 1).await?;

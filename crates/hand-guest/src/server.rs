@@ -1,19 +1,33 @@
-//! WebSocket transport: one connection per brain, JSON text frames, requests multiplexed by id.
-//! Each request runs as its own task; responses and `hand_status` events share one writer.
+//! One port, three kinds of traffic (axum):
+//!
+//! - `GET /` with a WebSocket upgrade → the ABI: JSON text frames, requests multiplexed by id.
+//! - `GET /` plain → a probe: identity and lifecycle phase, no secrets. Through the provider's
+//!   authenticated endpoint this doubles as the speculative resume trigger — an endpoint
+//!   request to a suspended MicroVM is held until `/resume` completes.
+//! - `POST /aws/lambda-microvms/runtime/v1/{run,resume,suspend,terminate,ready,validate}` →
+//!   the provider lifecycle hooks ([`crate::hooks`]).
+//!
+//! One port is deliberate: the MicroVM endpoint auth token is scoped to a single port, and a
+//! second unauthenticated port would be a hole, not a feature.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aex_contracts::abi::{HandFrame, Request, RequestId, Response, ResponseResult};
+use axum::Router;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRequestParts, State};
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Json};
+use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::config::MAX_FRAME_BYTES;
 use crate::errors::malformed;
 use crate::hand::{Hand, is_fatal_for_connection};
+use crate::hooks;
 
 pub struct Server {
     listener: TcpListener,
@@ -31,24 +45,69 @@ impl Server {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        tracing::info!(addr = %self.local_addr()?, generation = %*self.hand.generation_id, "hand listening");
-        loop {
-            let (stream, peer) = self.listener.accept().await?;
-            let hand = self.hand.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_connection(hand, stream).await {
-                    tracing::warn!(%peer, error = %e, "connection ended with error");
-                }
-            });
-        }
+        tracing::info!(
+            addr = %self.local_addr()?,
+            generation = %*self.hand.generation_id,
+            armed = self.hand.armed(),
+            "hand listening"
+        );
+        let hooks = Router::new()
+            .route("/run", post(hooks::run))
+            .route("/resume", post(hooks::resume))
+            .route("/suspend", post(hooks::suspend))
+            .route("/terminate", post(hooks::terminate))
+            .route("/ready", post(hooks::ready))
+            .route("/validate", post(hooks::validate));
+        let app = Router::new()
+            .route("/", get(root))
+            .nest(hooks::HOOK_PREFIX, hooks)
+            .with_state(self.hand);
+        axum::serve(self.listener, app).await?;
+        Ok(())
     }
 }
 
-async fn serve_connection(hand: Arc<Hand>, stream: TcpStream) -> anyhow::Result<()> {
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME_BYTES as usize))
-        .max_frame_size(Some(MAX_FRAME_BYTES as usize));
-    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await?;
+/// An optional WebSocket upgrade. axum 0.8 does not implement the optional extractor for
+/// `WebSocketUpgrade`, so this wrapper turns "not an upgrade request" into `None` instead of a
+/// rejection — letting one `GET /` serve both the ABI socket and the plain probe.
+struct MaybeWs(Option<WebSocketUpgrade>);
+
+impl<S: Send + Sync> FromRequestParts<S> for MaybeWs {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Ok(MaybeWs(
+            WebSocketUpgrade::from_request_parts(parts, state)
+                .await
+                .ok(),
+        ))
+    }
+}
+
+/// `GET /`: the ABI WebSocket when the client upgrades, the probe document when it does not.
+async fn root(State(hand): State<Arc<Hand>>, MaybeWs(ws): MaybeWs) -> axum::response::Response {
+    match ws {
+        Some(upgrade) => upgrade
+            .max_message_size(MAX_FRAME_BYTES as usize)
+            .max_frame_size(MAX_FRAME_BYTES as usize)
+            .on_upgrade(move |socket| async move {
+                if let Err(e) = serve_connection(hand, socket).await {
+                    tracing::warn!(error = %e, "connection ended with error");
+                }
+            }),
+        None => Json(serde_json::json!({
+            "service": "aex-hand",
+            "abi_major": aex_contracts::abi::ProtocolVersion::CURRENT.major,
+            "generation_id": hand.generation_id.to_string(),
+            "boot_id": hand.boot_id.to_string(),
+            "armed": hand.armed(),
+            "lifecycle": *hand.lifecycle.read().unwrap(),
+        }))
+        .into_response(),
+    }
+}
+
+async fn serve_connection(hand: Arc<Hand>, ws: WebSocket) -> anyhow::Result<()> {
     let (mut sink, mut source) = ws.split();
     let (tx, mut rx) = mpsc::channel::<HandFrame>(256);
 
@@ -105,7 +164,6 @@ async fn serve_connection(hand: Arc<Hand>, stream: TcpStream) -> anyhow::Result<
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Close(_) => break,
-            Message::Frame(_) => continue,
         };
         let hand = hand.clone();
         let tx = tx.clone();

@@ -18,7 +18,11 @@ pub const ENV_SPILL_DIR: &str = "AEX_HAND_SPILL_DIR";
 pub struct Config {
     pub listen: SocketAddr,
     /// Per-session secret the brain must present in `hello`.
-    pub token: String,
+    ///
+    /// `None` means the hand boots **unarmed**: every `hello` is refused until the platform
+    /// delivers the token through the `/run` lifecycle hook (Lambda MicroVM has no per-VM
+    /// environment, so the secret cannot arrive as an env var there).
+    pub token: Option<String>,
     pub workspace: PathBuf,
     pub home: PathBuf,
     pub spill_dir: PathBuf,
@@ -28,13 +32,13 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read from the process environment; missing token is fatal (a hand without a token would
-    /// accept any brain).
+    /// Read from the process environment. A missing `AEX_HAND_TOKEN` is not an error: the hand
+    /// boots unarmed and waits for the `/run` lifecycle hook to deliver the session token. An
+    /// unarmed hand refuses every `hello`, so it never accepts an unauthenticated brain.
     pub fn from_env() -> anyhow::Result<Self> {
-        let token = std::env::var(ENV_TOKEN)
-            .map_err(|_| anyhow::anyhow!("{ENV_TOKEN} must be set (per-session secret)"))?;
+        let token = std::env::var(ENV_TOKEN).ok().filter(|t| !t.is_empty());
         let listen: SocketAddr = std::env::var(ENV_LISTEN)
-            .unwrap_or_else(|_| "0.0.0.0:7000".into())
+            .unwrap_or_else(|_| "0.0.0.0:8080".into())
             .parse()
             .map_err(|e| anyhow::anyhow!("{ENV_LISTEN}: {e}"))?;
         let workspace =
@@ -51,7 +55,7 @@ impl Config {
 
     pub fn new(
         listen: SocketAddr,
-        token: String,
+        token: Option<String>,
         workspace: PathBuf,
         home: PathBuf,
         spill_dir: PathBuf,

@@ -55,7 +55,29 @@ pub struct HandClient {
 impl HandClient {
     /// Connects to `ws://host:port/` (or `wss://`). No request is sent; call [`hello`] next.
     pub async fn connect(url: &str, fence: u64) -> Result<Self, ClientError> {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
+        Self::connect_with_headers(url, fence, &[]).await
+    }
+
+    /// [`connect`], with extra request headers. This is how a brain reaches a hand behind the
+    /// AWS Lambda MicroVM endpoint: `wss://<endpoint-host>/` plus
+    /// `("X-aws-proxy-auth", <JWE token from CreateMicrovmAuthToken>)`.
+    pub async fn connect_with_headers(
+        url: &str,
+        fence: u64,
+        headers: &[(&str, &str)],
+    ) -> Result<Self, ClientError> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        for (name, value) in headers {
+            let name = tokio_tungstenite::tungstenite::http::HeaderName::try_from(*name)
+                .map_err(|e| ClientError::Transport(e.to_string()))?;
+            let value = tokio_tungstenite::tungstenite::http::HeaderValue::try_from(*value)
+                .map_err(|e| ClientError::Transport(e.to_string()))?;
+            request.headers_mut().insert(name, value);
+        }
+        let (ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let (mut sink, mut source) = ws.split();

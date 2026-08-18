@@ -40,7 +40,7 @@ async fn spawn_hand_at(dir: TempDir, workspace: PathBuf, home: PathBuf) -> TestH
     let spill = dir.path().join("spill");
     let cfg = Config::new(
         "127.0.0.1:0".parse().unwrap(),
-        TOKEN.into(),
+        Some(TOKEN.into()),
         workspace.clone(),
         home.clone(),
         spill.clone(),

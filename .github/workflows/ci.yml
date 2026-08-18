@@ -36,7 +36,7 @@ jobs:
         run: |
           docker build -f image/Dockerfile --build-arg BIN=target/release/hand-guest -t aex-hand:ci .
           TOKEN=ci-smoke
-          CID=$(docker run -d --rm -p 7000:7000 -e AEX_HAND_TOKEN=$TOKEN aex-hand:ci)
-          for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/7000) 2>/dev/null && { exec 3>&-; sleep 1; break; }; sleep 0.5; done
-          ./target/release/examples/smoke ws://127.0.0.1:7000/ $TOKEN || { docker logs "$CID"; exit 1; }
+          CID=$(docker run -d --rm -p 8080:8080 -e AEX_HAND_TOKEN=$TOKEN aex-hand:ci)
+          for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && { exec 3>&-; sleep 1; break; }; sleep 0.5; done
+          ./target/release/examples/smoke ws://127.0.0.1:8080/ $TOKEN || { docker logs "$CID"; exit 1; }
           docker stop "$CID"
