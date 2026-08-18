@@ -3,14 +3,14 @@
 `Dockerfile` builds the sandbox the agent's tools run inside: the `hand-guest` binary plus a
 curated toolchain (git, Python, Node, ripgrep, build-essential, common archivers). ARM64.
 
-The binary is built statically against musl so the image is a thin runtime layer that rebuilds
+The binary is built for the aarch64 gnu (glibc) target, matching the ubuntu base, so the image is a thin runtime layer that rebuilds
 in seconds when only the code changes:
 
 ```
-# on an aarch64 Linux host with the musl target and musl-tools installed
-cargo build -p hand-guest --release --target aarch64-unknown-linux-musl
+# on an aarch64 Linux host (or cross with aarch64-linux-gnu-gcc)
+cargo build -p hand-guest --release --target aarch64-unknown-linux-gnu
 docker build -f image/Dockerfile \
-  --build-arg BIN=target/aarch64-unknown-linux-musl/release/hand-guest \
+  --build-arg BIN=target/aarch64-unknown-linux-gnu/release/hand-guest \
   -t aex-hand:dev .
 ```
 

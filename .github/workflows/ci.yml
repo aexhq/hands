@@ -25,23 +25,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.1"
-          targets: aarch64-unknown-linux-musl
+          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Cross toolchain for musl/arm64
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user-static binfmt-support
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static binfmt-support
       - name: Build guest (static musl arm64)
         env:
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build -p hand-guest --release --target aarch64-unknown-linux-musl
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build -p hand-guest --release --target aarch64-unknown-linux-gnu
       - name: Build client smoke example
         run: cargo build -p hand-client --example smoke --release
       - name: Build image and drive a session
         run: |
           docker build -f image/Dockerfile \
-            --build-arg BIN=target/aarch64-unknown-linux-musl/release/hand-guest \
+            --build-arg BIN=target/aarch64-unknown-linux-gnu/release/hand-guest \
             -t aex-hand:ci .
           TOKEN=ci-smoke
           CID=$(docker run -d --rm -p 7000:7000 -e AEX_HAND_TOKEN=$TOKEN aex-hand:ci)

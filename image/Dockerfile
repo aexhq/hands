@@ -1,8 +1,8 @@
 # The aex hand image: the guest agent plus a curated toolchain. Built for ARM64 (Lambda MicroVM
 # and Graviton). The hand guest binary is compiled separately (musl static) and copied in, so this
-# stage stays a thin, cached runtime layer.
+# stage stays a thin, cached runtime layer. glibc (gnu) target, matching the ubuntu base.
 #
-#   docker build -f image/Dockerfile --build-arg BIN=target/aarch64-unknown-linux-musl/release/hand-guest -t aex-hand:dev .
+#   docker build -f image/Dockerfile --build-arg BIN=target/aarch64-unknown-linux-gnu/release/hand-guest -t aex-hand:dev .
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \

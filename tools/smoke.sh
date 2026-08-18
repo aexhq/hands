@@ -3,7 +3,7 @@
 # a plain Docker container. Run on an aarch64 Linux host with docker + the musl target.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-TARGET=aarch64-unknown-linux-musl
+TARGET=aarch64-unknown-linux-gnu
 TOKEN="smoke-$(date +%s)"
 
 echo "== build guest (static musl) and client"
