@@ -79,6 +79,19 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
     },
+    /// The slice-5 security + latency gates: no IAM role or credentials reachable from inside
+    /// the guest (hard fail), and platform-added latency per tool call through the endpoint
+    /// (published; optionally thresholded). Run it IN-REGION for the publishable number —
+    /// from the operator's machine the internet RTT dominates.
+    Gate {
+        #[arg(long)]
+        image: String,
+        #[arg(long)]
+        version: String,
+        /// Fail if the tool-call round trip p95 exceeds this (ms). Only meaningful in-region.
+        #[arg(long)]
+        max_tool_p95_ms: Option<f64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -165,6 +178,68 @@ async fn run() -> anyhow::Result<()> {
             version,
             only,
         } => spikes(&control, &image, &version, &only).await,
+        Cmd::Gate {
+            image,
+            version,
+            max_tool_p95_ms,
+        } => gate(&control, &image, &version, max_tool_p95_ms).await,
+    }
+}
+
+/// The slice-5 gates on a real MicroVM: launch once, probe IMDS adversarially, measure the
+/// tool-call round trip, terminate. Exit is nonzero if any gate fails; the latency record is
+/// the publishable number when run in-region.
+async fn gate(
+    control: &Control,
+    image: &str,
+    version: &str,
+    max_tool_p95_ms: Option<f64>,
+) -> anyhow::Result<()> {
+    let image_arn = image::find_image_arn(control, image)
+        .await?
+        .with_context(|| format!("no image named {image}"))?;
+    let token = fresh_token();
+    let run = hex::encode(rand::random::<[u8; 4]>());
+    let hand = launch::launch(
+        control,
+        &image_arn,
+        version,
+        &token,
+        &format!("aexgate-{run}"),
+    )
+    .await?;
+    let _keepalive = launch::Keepalive::spawn(hand.clone(), Duration::from_secs(60));
+    let c = launch::connect(&hand, 1).await?;
+    c.hello(hello_req(&session_id("gate"), &token)).await?;
+
+    let imds = spike_imds(&c).await?;
+    let latency = spike_latency(&c, &hand).await?;
+    control.terminate(&hand.microvm_id).await?;
+
+    println!("{}", serde_json::to_string_pretty(&imds)?);
+    println!("{}", serde_json::to_string_pretty(&latency)?);
+    let mut failures = Vec::new();
+    if imds["gate_pass"] != json!(true) {
+        failures
+            .push("IMDS: an IAM role or credentials are reachable from inside the guest".into());
+    }
+    if let Some(limit) = max_tool_p95_ms {
+        let p95: f64 = latency["tool_call_ms"]["p95"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(f64::NAN);
+        if p95.is_nan() || p95 > limit {
+            failures.push(format!("latency: tool-call p95 {p95} ms > {limit} ms"));
+        }
+    }
+    if failures.is_empty() {
+        println!("GATES PASS (no IAM role reachable; latency recorded)");
+        Ok(())
+    } else {
+        for f in &failures {
+            eprintln!("GATE FAILED: {f}");
+        }
+        bail!("{} gate(s) failed", failures.len());
     }
 }
 
