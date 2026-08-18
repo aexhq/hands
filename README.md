@@ -20,6 +20,12 @@ semantics are in that repo's `contracts/abi/v1/README.md`.
 cargo test --workspace                              # unit + end-to-end (in-process hand + client)
 cargo clippy --workspace --all-targets -- -D warnings
 tools/smoke.sh                                      # build the image, run it, drive a session
+hand-lambda gate --image <name> --version <v>       # slice-5 gates on a real MicroVM: no IAM
+                                                    # role/creds reachable from the guest (hard
+                                                    # fail) + in-region tool-call latency record
 ```
+
+The published latency and security numbers live in the brain repo's `BENCHMARKS.md`
+(one record for the whole platform).
 
 License: Apache-2.0.
