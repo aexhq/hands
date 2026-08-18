@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!(
         "hello: generation={} tools={:?}",
-        &*hello.generation_id,
+        *hello.generation_id,
         hello
             .tools
             .iter()
