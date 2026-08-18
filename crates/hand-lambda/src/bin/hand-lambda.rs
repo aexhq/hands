@@ -678,6 +678,26 @@ async fn spike_imds(c: &HandClient) -> anyhow::Result<serde_json::Value> {
             "aws_files",
             "ls -la /root/.aws /home/agent/.aws 2>&1 || true",
         ),
+        // The one that actually decides the gate: mint an IMDSv2 token (the endpoint answered
+        // 200 in the first run), then use it to try to list an IAM role and fetch its
+        // credentials. A responding metadata service is harmless if no role is attached; a
+        // retrievable role is the leak the gate forbids.
+        (
+            "imdsv2_role_list",
+            "T=$(curl -s -m 4 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); \
+             curl -s -m 4 -w ' [http %{http_code}]' -H \"X-aws-ec2-metadata-token: $T\" http://169.254.169.254/latest/meta-data/iam/security-credentials/; echo",
+        ),
+        (
+            "imdsv2_creds",
+            "T=$(curl -s -m 4 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); \
+             R=$(curl -s -m 4 -H \"X-aws-ec2-metadata-token: $T\" http://169.254.169.254/latest/meta-data/iam/security-credentials/ | head -1); \
+             curl -s -m 4 -w ' [http %{http_code}]' -H \"X-aws-ec2-metadata-token: $T\" \"http://169.254.169.254/latest/meta-data/iam/security-credentials/$R\" | grep -iE 'AccessKeyId|SecretAccessKey|Token|Code|http ' || echo 'no creds'; echo",
+        ),
+        (
+            "imdsv2_identity",
+            "T=$(curl -s -m 4 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); \
+             curl -s -m 4 -w ' [http %{http_code}]' -H \"X-aws-ec2-metadata-token: $T\" http://169.254.169.254/latest/dynamic/instance-identity/document; echo",
+        ),
     ];
     let mut out = serde_json::Map::new();
     for (name, cmd) in probes {
@@ -687,7 +707,19 @@ async fn spike_imds(c: &HandClient) -> anyhow::Result<serde_json::Value> {
             json!({"exit": exit, "output": stdout.trim()}),
         );
     }
-    Ok(json!({"spike": "s2-imds", "probes": out}))
+    // The verdict: the gate holds iff no IAM credentials are retrievable, regardless of whether
+    // the metadata endpoint answers at all.
+    let creds = out
+        .get("imdsv2_creds")
+        .and_then(|v| v["output"].as_str())
+        .unwrap_or("");
+    let role_reachable = creds.contains("SecretAccessKey") || creds.contains("AccessKeyId");
+    Ok(json!({
+        "spike": "s2-imds",
+        "role_reachable": role_reachable,
+        "gate_pass": !role_reachable,
+        "probes": out,
+    }))
 }
 
 /// S2-B: is swap on (boot script), and does allocation past baseline survive.
