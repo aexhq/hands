@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "aex-contracts"
 version = "0.1.0"
-source = "git+https://github.com/aexhq/aex?tag=aex-contracts-v0.3.0#f3c80e5c4bb1a978e92552d08247dcf13d3d06c4"
+source = "git+https://github.com/aexhq/aex?tag=aex-contracts-v0.4.0#6e3d5c7f387374117ee0e1142a32f0efd96b7730"
 dependencies = [
  "chrono",
  "hex",
