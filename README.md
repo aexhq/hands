@@ -1,6 +1,6 @@
 # hands
 
-The **hand**: where an aex agent's tools run, isolated in a microVM (AWS Lambda MicroVM now, an own
+The **hand**: where an Aex agent's tools run, isolated in a microVM (AWS Lambda MicroVM now, an own
 Firecracker fleet later). This repo has the guest agent that serves the brain↔hand ABI v1 and the
 image it ships in; the host-side adapters (`lambda-microvm`, `firecracker-host`) land in slice 2.
 
