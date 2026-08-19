@@ -1,0 +1,47 @@
+name: publish hand image
+
+on:
+  workflow_dispatch:
+    inputs:
+      plane:
+        description: Plane whose isolated image should be published
+        required: true
+        type: choice
+        options: [dev, prd]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency: hand-image-${{ inputs.plane }}
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-24.04-arm
+    environment: ${{ inputs.plane }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Build aarch64 guest and publisher
+        run: cargo build -p hand-guest -p hand-lambda --release
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::522921482290:role/aex-hands-${{ inputs.plane }}-image-publisher
+          aws-region: eu-west-1
+      - name: Publish isolated plane image
+        run: |
+          target/release/hand-lambda --region eu-west-1 image publish \
+            --binary target/release/hand-guest \
+            --name aex-hands-${{ inputs.plane }}-1gb \
+            --bucket aex-hands-${{ inputs.plane }}-artifacts-522921482290 \
+            --build-role arn:aws:iam::522921482290:role/aex-hands-${{ inputs.plane }}-image-build \
+            --log-group /aex/${{ inputs.plane }}/hands/image-build

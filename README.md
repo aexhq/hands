@@ -25,6 +25,12 @@ hand-lambda gate --image <name> --version <v>       # slice-5 gates on a real Mi
                                                     # fail) + in-region tool-call latency record
 ```
 
+`.github/workflows/image.yml` is the release path for Lambda MicroVM images. It reruns the
+complete Rust gate on a native ARM runner, assumes a plane-scoped OIDC publisher role, and can
+publish only the matching `dev` or protected `prd` environment image. Dev and production have
+separate artifact buckets, build roles, image names, and version lines; no AWS keys live in
+GitHub.
+
 The published latency and security numbers live in the brain repo's `BENCHMARKS.md`
 (one record for the whole platform).
 
