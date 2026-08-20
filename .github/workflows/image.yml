@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     environment: ${{ inputs.plane }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.1"
@@ -33,7 +33,7 @@ jobs:
           cargo test --workspace
       - name: Build aarch64 guest and publisher
         run: cargo build -p hand-guest -p hand-lambda --release
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::522921482290:role/aex-hands-${{ inputs.plane }}-image-publisher
           aws-region: eu-west-1
