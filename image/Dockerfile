@@ -31,10 +31,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git openssh-client \
       build-essential pkg-config \
       python3 python3-venv python3-pip pipx \
-      nodejs npm \
       ripgrep jq unzip zip zstd xz-utils file less \
       procps coreutils bash \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$(dpkg --print-architecture)" in \
+         arm64) node_arch=arm64; node_sha=fff4078c69dc7a142de617d104105a599b324297380d382bc65c09f59e94abb8 ;; \
+         amd64) node_arch=x64; node_sha=d60acfe210e1159cb70604bde4de4d21435086938be895ff640c18f60c3f307 ;; \
+         *) echo "unsupported Node architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+       esac \
+    && curl --fail --location --retry 5 \
+         --output /tmp/node.tar.xz \
+         "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-${node_arch}.tar.xz" \
+    && echo "${node_sha}  /tmp/node.tar.xz" | sha256sum --check --strict \
+    && tar --extract --file /tmp/node.tar.xz --directory /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && test "$(node --version)" = v22.23.2 \
+    && npm --version
 
 # ubuntu:24.04 ships a uid-1000 "ubuntu" user; remove it, then create "agent" as uid 1000.
 RUN deluser --remove-home ubuntu 2>/dev/null || true; \

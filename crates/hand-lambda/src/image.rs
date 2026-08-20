@@ -29,6 +29,12 @@ use crate::control::Control;
 /// build environment pulls anonymously and Docker Hub throttles anonymous pulls from AWS IPs.
 pub const CONTAINER_BASE: &str = "public.ecr.aws/ubuntu/ubuntu:24.04@sha256:a54764b5b6340c272ffb45e303fe4c8064bbdfb76d732b325b79ae6b92900e4c";
 
+/// The JavaScript runtime used by deployable Brain tools. The MicroVM image is ARM64-only, so
+/// its archive digest can be pinned directly. Keep the plain-Docker image's ARM64 pin in sync.
+pub const NODE_VERSION: &str = "22.23.2";
+pub const NODE_ARM64_SHA256: &str =
+    "fff4078c69dc7a142de617d104105a599b324297380d382bc65c09f59e94abb8";
+
 /// The Lambda-managed MicroVM base every image must sit on.
 pub fn base_image_arn(region: &str) -> String {
     format!("arn:aws:lambda:{region}:aws:microvm-image:al2023-1")
@@ -103,10 +109,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git openssh-client \
       build-essential pkg-config \
       python3 python3-venv python3-pip pipx \
-      nodejs npm \
       ripgrep jq unzip zip zstd xz-utils file less \
       procps coreutils bash \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail --location --retry 5 \
+         --output /tmp/node.tar.xz \
+         "https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-linux-arm64.tar.xz" \
+    && echo "{NODE_ARM64_SHA256}  /tmp/node.tar.xz" | sha256sum --check --strict \
+    && tar --extract --file /tmp/node.tar.xz --directory /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && test "$(node --version)" = "v{NODE_VERSION}" \
+    && npm --version
 
 # ubuntu:24.04 ships a uid-1000 "ubuntu" user; remove it, then create "agent" as uid 1000.
 RUN deluser --remove-home ubuntu 2>/dev/null || true; \
@@ -448,6 +461,9 @@ mod tests {
         let df = dockerfile();
         assert!(df.contains("@sha256:"), "base must be digest-pinned");
         assert!(df.contains("EXPOSE 8080"));
+        assert!(df.contains(&format!("node-v{NODE_VERSION}-linux-arm64.tar.xz")));
+        assert!(df.contains(NODE_ARM64_SHA256));
+        assert!(df.contains(&format!(r#"test "$(node --version)" = "v{NODE_VERSION}""#)));
         assert!(
             !df.contains("\nUSER "),
             "the boot script drops privileges; the Dockerfile must not"
