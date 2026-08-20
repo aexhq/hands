@@ -1,41 +1,37 @@
-# hands
+# Hands
 
-The default **Hand** runtime: where Brain tools run. This repository contains the guest that serves
-Brain's public Brain↔Hand ABI, the generic Node tool runner, a Docker image, and the AWS Lambda
-MicroVM adapter used by Aex.
+The default runtime for Brain tools. Hands contains the Linux guest, curated container image, and
+AWS Lambda MicroVM adapter that implement Brain's public Hand ports.
 
-| Crate / dir | What |
+## Components
+
+| Path | Purpose |
 | --- | --- |
-| `crates/hand-guest` | the guest agent: serves the ABI over one WebSocket — lanes, operations with bounded spilled output, detached jobs, files in/out over presigned URLs, workspace sync (pack + manifest) and restore |
-| `crates/hand-brain-aws` | AWS Lambda MicroVM implementation of Brain's public Hand ports and the neutral hosted composition binary |
-| `image/` | the Dockerfile for the sandbox image (guest binary + curated toolchain) |
-| `tools/` | `smoke.sh` (build image, drive one session end to end), `dev-sync.sh` (push to a Linux box and run) |
+| `crates/hand-guest` | WebSocket guest, tool runner, bounded output, jobs, file transfer, and workspace sync |
+| `crates/hand-brain-aws` | Lambda MicroVM implementation of Brain's Hand factory and adapter ports |
+| `crates/hand-lambda` | Image publication, lifecycle controls, and hosted runtime checks |
+| `image/` | Curated Linux tool image |
+| `tools/smoke.sh` | Local container build and end-to-end protocol smoke test |
 
-Contracts and the Brain-side client come from an immutable revision of
-[`aexhq/brain`](https://github.com/aexhq/brain); their normative semantics live there. Hands
-depends on Brain and implements its interfaces. Brain never depends on this repository.
+The protocol and Brain-side client come from one immutable revision of
+[`aexhq/brain`](https://github.com/aexhq/brain). Change wire contracts in Brain first, then update
+the pinned revision here.
 
-## Build and test (Linux; the guest is Linux-only — setsid, signals, /proc)
+## Develop
 
-```
-cargo test --workspace                              # unit + end-to-end (in-process hand + client)
+The guest is Linux-only and uses process groups, signals, and `/proc`.
+
+```sh
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-tools/smoke.sh                                      # build the image, run it, drive a session
-hand-lambda gate --image <name> --version <v>       # slice-5 gates on a real MicroVM: no IAM
-                                                    # role/creds reachable from the guest (hard
-                                                    # fail) + in-region tool-call latency record
+cargo test --workspace
+tools/smoke.sh
 ```
 
-`.github/workflows/oci.yml` publishes the public Linux AMD64/ARM64 Hand image consumed by
-standalone Brain. `.github/workflows/brain-image.yml` publishes the generic hosted composition of
-the pinned Brain revision, AWS durability, and this Lambda MicroVM Hand. `.github/workflows/image.yml`
-is the release path for Aex's isolated MicroVM images. It reruns the
-complete Rust gate on a native ARM runner, assumes a plane-scoped OIDC publisher role, and can
-publish only the matching `dev` or protected `prd` environment image. Dev and production have
-separate artifact buckets, build roles, image names, and version lines; no AWS keys live in
-GitHub.
+`tools/smoke.sh` requires an ARM64 Linux host, Docker, and the
+`aarch64-unknown-linux-gnu` Rust target. CI also builds and tests the public AMD64/ARM64 image.
 
-The published latency and security numbers live in the brain repo's `BENCHMARKS.md`
-(one record for the whole platform).
+See [image/README.md](image/README.md) for the container and
+[hosted/README.md](hosted/README.md) for the neutral AWS composition.
 
-License: Apache-2.0.
+Apache-2.0 licensed.

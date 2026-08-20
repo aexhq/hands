@@ -2,7 +2,7 @@
 //!
 //! Classification is the `hand_lost` contract: the brain needs to know whether a failed call
 //! means *try again* ([`ControlError::Retryable`]), *the hand is gone* ([`ControlError::Gone`],
-//! surfaced to the session as `hand_lost` — never replayed, per D7), or *the request itself is
+//! surfaced to the session as `hand_lost` and never replayed), or *the request itself is
 //! wrong* ([`ControlError::Fatal`], a bug or a config error, loud and unretried).
 
 use aws_sdk_lambdamicrovms::Client;
@@ -17,7 +17,7 @@ pub const AUTH_HEADER: &str = "X-aws-proxy-auth";
 /// The AWS-managed ingress connector that exposes the authenticated public endpoint.
 pub const ALL_INGRESS: &str = "ALL_INGRESS";
 
-/// The AWS-managed egress connector for direct public internet (D14: direct egress in MVP).
+/// The AWS-managed egress connector for direct public internet access.
 pub const INTERNET_EGRESS: &str = "INTERNET_EGRESS";
 
 #[derive(Debug, thiserror::Error)]
@@ -95,8 +95,9 @@ impl Control {
             .build()
             .map_err(|e| ControlError::Fatal(format!("idle policy: {e}")))?;
         // Deliberately no `.execution_role_arn(...)`: an execution role would make IAM
-        // credentials retrievable from inside the guest via IMDSv2 (spike S2-D confirmed the
-        // metadata service answers; only the *absence* of an attached role keeps it empty). I8 —
+        // credentials retrievable from inside the guest via IMDSv2. The adversarial IMDS probe
+        // confirmed the metadata service answers; only the *absence* of an attached role keeps it
+        // empty. I8 —
         // the hand holds no cloud credential — depends on this staying unset.
         let out = self
             .client

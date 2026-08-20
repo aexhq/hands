@@ -3,8 +3,8 @@
 `Dockerfile` builds the sandbox the agent's tools run inside: the `hand-guest` binary plus a
 curated toolchain (git, Python, Node, ripgrep, build-essential, common archivers). ARM64.
 
-The binary is built for the aarch64 gnu (glibc) target, matching the ubuntu base, so the image is a thin runtime layer that rebuilds
-in seconds when only the code changes:
+The binary uses the aarch64 GNU target to match the Ubuntu base. The resulting image is a thin
+runtime layer that rebuilds quickly when only code changes:
 
 ```
 # on an aarch64 Linux host (or cross with aarch64-linux-gnu-gcc)

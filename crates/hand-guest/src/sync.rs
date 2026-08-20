@@ -1,4 +1,4 @@
-//! Workspace sync (D7): diff the sync scope against the last manifest, upload one `tar+zstd`
+//! Workspace sync: diff the sync scope against the last manifest, upload one `tar+zstd`
 //! pack of added/modified files plus a new manifest listing the whole tree; restore is the
 //! inverse. Everything travels over presigned URLs handed to us per request.
 

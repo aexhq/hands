@@ -930,7 +930,7 @@ impl HandAdapter for LambdaHand {
     }
 
     fn on_message_admitted(&self) {
-        // Speculative resume (F-4): endpoint traffic now, so a suspended hand is running
+        // Speculative resume: endpoint traffic now, so a suspended Hand is running
         // again by the time the model asks for a tool. An unauthenticated probe still reaches
         // the endpoint and triggers the resume, so no fresh JWE is needed here.
         let st = self.snap();
