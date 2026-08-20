@@ -29,6 +29,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Curated toolchain. Installers are redirected into /workspace/.hand/** (see ENV above) so their
 # output is captured by workspace sync; system-wide installs are ephemeral and the agent is told so.
+# Node 22.23.2 bundles npm with node-tar 7.5.11 (CVE-2026-59873), so replace that bundled
+# installation in place; leaving it beside a newer npm would leave vulnerable files in the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git openssh-client \
       build-essential pkg-config \
@@ -48,7 +50,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && tar --extract --file /tmp/node.tar.xz --directory /usr/local --strip-components=1 \
     && rm /tmp/node.tar.xz \
     && test "$(node --version)" = v22.23.2 \
-    && npm --version
+    && npm_config_prefix=/usr/local npm install --global npm@11.19.0 \
+    && test "$(npm --version)" = 11.19.0
 
 # ubuntu:24.04 ships a uid-1000 "ubuntu" user; remove it, then create "agent" as uid 1000.
 RUN deluser --remove-home ubuntu 2>/dev/null || true; \

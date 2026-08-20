@@ -33,7 +33,9 @@ pub const CONTAINER_BASE: &str = "public.ecr.aws/ubuntu/ubuntu:24.04@sha256:a547
 /// its archive digest can be pinned directly. Keep the plain-Docker image's ARM64 pin in sync.
 pub const NODE_VERSION: &str = "22.23.2";
 pub const NODE_ARM64_SHA256: &str =
-    "fff4078c69dc7a142de617d104105a599b324297380d382bc65c09f59e94abb8";
+    "fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8";
+/// Patched npm replacing the vulnerable copy bundled with the pinned Node archive.
+pub const NPM_VERSION: &str = "11.19.0";
 
 /// The Lambda-managed MicroVM base every image must sit on.
 pub fn base_image_arn(region: &str) -> String {
@@ -121,7 +123,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && tar --extract --file /tmp/node.tar.xz --directory /usr/local --strip-components=1 \
     && rm /tmp/node.tar.xz \
     && test "$(node --version)" = "v{NODE_VERSION}" \
-    && npm --version
+    && npm_config_prefix=/usr/local npm install --global npm@{NPM_VERSION} \
+    && test "$(npm --version)" = "{NPM_VERSION}"
 
 # ubuntu:24.04 ships a uid-1000 "ubuntu" user; remove it, then create "agent" as uid 1000.
 RUN deluser --remove-home ubuntu 2>/dev/null || true; \
@@ -477,6 +480,8 @@ mod tests {
         assert!(df.contains(&format!("node-v{NODE_VERSION}-linux-arm64.tar.xz")));
         assert!(df.contains(NODE_ARM64_SHA256));
         assert!(df.contains(&format!(r#"test "$(node --version)" = "v{NODE_VERSION}""#)));
+        assert!(df.contains(&format!("npm@{NPM_VERSION}")));
+        assert!(df.contains(&format!(r#"test "$(npm --version)" = "{NPM_VERSION}""#)));
         assert!(
             !df.contains("\nUSER "),
             "the boot script drops privileges; the Dockerfile must not"
