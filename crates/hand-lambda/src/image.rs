@@ -197,8 +197,58 @@ pub struct PublishedImage {
     pub image_version: String,
 }
 
+/// Bump this whenever a fixed `CreateMicrovmImage`/`UpdateMicrovmImage` request field changes.
+/// Variable request fields are hashed individually below.
+const PUBLISH_REQUEST_TOKEN_SCHEMA: &str = "hand-lambda-publish-request-v1";
+
+#[derive(Clone, Copy)]
+enum PublishOperation {
+    Create,
+    Update,
+}
+
+impl PublishOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+        }
+    }
+}
+
+/// AWS treats a client token as an idempotency key for the complete API request, not merely the
+/// uploaded bytes. Hash every variable request identity field with unambiguous length prefixes.
+/// The schema marker represents the fixed fields (hooks, ARM64, internet egress, and capabilities).
+fn publish_client_token(
+    operation: PublishOperation,
+    region: &str,
+    image_identifier: &str,
+    cfg: &PublishConfig,
+    artifact_key: &str,
+) -> String {
+    let memory_mib = cfg.memory_mib.to_string();
+    let mut digest = sha2::Sha256::new();
+    for field in [
+        PUBLISH_REQUEST_TOKEN_SCHEMA,
+        operation.as_str(),
+        region,
+        image_identifier,
+        &cfg.name,
+        &cfg.bucket,
+        &cfg.build_role_arn,
+        &cfg.log_group,
+        &memory_mib,
+        artifact_key,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    hex::encode(&digest.finalize()[..16])
+}
+
 /// Uploads the context and registers a new image (or a new version of an existing one), then
-/// waits for AWS's build to finish. Idempotent by content: the client token is the ZIP hash.
+/// waits for AWS's build to finish. Idempotent by exact publish request: the client token includes
+/// the artifact digest and all plane-specific request identity.
 pub async fn publish(
     control: &Control,
     s3: &aws_sdk_s3::Client,
@@ -207,7 +257,6 @@ pub async fn publish(
 ) -> anyhow::Result<PublishedImage> {
     let key = artifact_key(&zip);
     let uri = format!("s3://{}/{key}", cfg.bucket);
-    let client_token = hex::encode(&sha2::Sha256::digest(&zip)[..16]);
     s3.put_object()
         .bucket(&cfg.bucket)
         .key(&key)
@@ -250,6 +299,8 @@ pub async fn publish(
     let exists = find_image_arn(control, &cfg.name).await?;
 
     let arn = if let Some(arn) = exists {
+        let client_token =
+            publish_client_token(PublishOperation::Update, control.region(), &arn, cfg, &key);
         sdk.update_microvm_image()
             .image_identifier(&arn)
             .base_image_arn(base_image_arn(control.region()))
@@ -281,6 +332,13 @@ pub async fn publish(
             .map_err(|e| anyhow::anyhow!("update_microvm_image: {}", detail(&e)))?;
         arn
     } else {
+        let client_token = publish_client_token(
+            PublishOperation::Create,
+            control.region(),
+            &cfg.name,
+            cfg,
+            &key,
+        );
         let out = sdk
             .create_microvm_image()
             .name(&cfg.name)
@@ -470,6 +528,130 @@ mod tests {
         );
         let c = pack_zip(b"other-binary").unwrap();
         assert_ne!(artifact_key(&b), artifact_key(&c));
+    }
+
+    fn publish_config(name: &str) -> PublishConfig {
+        PublishConfig {
+            name: name.to_owned(),
+            bucket: "artifacts-dev".to_owned(),
+            build_role_arn: "arn:aws:iam::111111111111:role/build-dev".to_owned(),
+            log_group: "/aex/dev/hands-build".to_owned(),
+            memory_mib: 1024,
+        }
+    }
+
+    #[test]
+    fn publish_token_is_stable_for_the_same_exact_request() {
+        let cfg = publish_config("hands-dev-1gb");
+        let key = artifact_key(b"same image");
+        let token = publish_client_token(
+            PublishOperation::Update,
+            "eu-west-2",
+            "arn:aws:lambda:eu-west-2:111111111111:microvm-image:hands-dev-1gb",
+            &cfg,
+            &key,
+        );
+        assert_eq!(
+            token,
+            publish_client_token(
+                PublishOperation::Update,
+                "eu-west-2",
+                "arn:aws:lambda:eu-west-2:111111111111:microvm-image:hands-dev-1gb",
+                &cfg,
+                &key,
+            )
+        );
+    }
+
+    #[test]
+    fn publish_token_separates_planes_and_request_parameters() {
+        let dev = publish_config("hands-dev-1gb");
+        let mut prd = dev.clone();
+        prd.name = "hands-prd-1gb".to_owned();
+        prd.bucket = "artifacts-prd".to_owned();
+        prd.build_role_arn = "arn:aws:iam::222222222222:role/build-prd".to_owned();
+        prd.log_group = "/aex/prd/hands-build".to_owned();
+        let key = artifact_key(b"same image");
+        let dev_token = publish_client_token(
+            PublishOperation::Update,
+            "eu-west-2",
+            "arn:aws:lambda:eu-west-2:111111111111:microvm-image:hands-dev-1gb",
+            &dev,
+            &key,
+        );
+        let prd_token = publish_client_token(
+            PublishOperation::Update,
+            "eu-west-2",
+            "arn:aws:lambda:eu-west-2:222222222222:microvm-image:hands-prd-1gb",
+            &prd,
+            &key,
+        );
+        assert_ne!(dev_token, prd_token);
+    }
+
+    #[test]
+    fn publish_token_changes_when_any_request_identity_changes() {
+        let cfg = publish_config("hands-dev-1gb");
+        let key = artifact_key(b"image a");
+        let target = "arn:aws:lambda:eu-west-2:111111111111:microvm-image:hands-dev-1gb";
+        let token = publish_client_token(PublishOperation::Update, "eu-west-2", target, &cfg, &key);
+
+        let variants = [
+            publish_client_token(PublishOperation::Create, "eu-west-2", target, &cfg, &key),
+            publish_client_token(PublishOperation::Update, "us-east-1", target, &cfg, &key),
+            publish_client_token(
+                PublishOperation::Update,
+                "eu-west-2",
+                "different-target",
+                &cfg,
+                &key,
+            ),
+            publish_client_token(
+                PublishOperation::Update,
+                "eu-west-2",
+                target,
+                &cfg,
+                &artifact_key(b"image b"),
+            ),
+        ];
+        for variant in variants {
+            assert_ne!(token, variant);
+        }
+
+        let config_variants = [
+            PublishConfig {
+                name: "different-name".to_owned(),
+                ..cfg.clone()
+            },
+            PublishConfig {
+                bucket: "different-bucket".to_owned(),
+                ..cfg.clone()
+            },
+            PublishConfig {
+                build_role_arn: "different-role".to_owned(),
+                ..cfg.clone()
+            },
+            PublishConfig {
+                log_group: "different-log-group".to_owned(),
+                ..cfg.clone()
+            },
+            PublishConfig {
+                memory_mib: 2048,
+                ..cfg.clone()
+            },
+        ];
+        for changed in config_variants {
+            assert_ne!(
+                token,
+                publish_client_token(
+                    PublishOperation::Update,
+                    "eu-west-2",
+                    target,
+                    &changed,
+                    &key,
+                )
+            );
+        }
     }
 
     #[test]
