@@ -13,7 +13,7 @@ Required settings:
 - `HAND_IMAGE_VERSION`
 - `HAND_STORAGE_BUCKET`
 
-`AWS_REGION` defaults to `eu-west-1`; `BRAIN_LISTEN` defaults to loopback port 8700. A trusted
+`AWS_REGION` defaults to `us-east-1`; `BRAIN_LISTEN` defaults to loopback port 8700. A trusted
 server-tool service is optional, but `BRAIN_EXTERNAL_TOOL_EXECUTOR_URL`,
 `BRAIN_EXTERNAL_TOOL_EXECUTOR_TOKEN`, and `BRAIN_EXTERNAL_TOOL_CAPABILITIES` must be configured
 together. Those credentials never enter a session prefix or Hand.
