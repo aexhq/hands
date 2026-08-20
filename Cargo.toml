@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hand-guest", "crates/hand-client", "crates/hand-lambda"]
+members = ["crates/hand-guest", "crates/hand-lambda", "crates/hand-brain-aws"]
 
 [workspace.package]
 edition = "2024"
@@ -9,7 +9,12 @@ license = "Apache-2.0"
 repository = "https://github.com/aexhq/hands"
 
 [workspace.dependencies]
-aex-contracts = { git = "https://github.com/aexhq/aex", tag = "aex-contracts-v0.4.0" }
+# Brain owns the protocol and Hand ports. All three packages resolve from one immutable source
+# identity so Hands can build without a sibling checkout and cannot drift across contracts.
+brain = { git = "https://github.com/aexhq/brain.git", rev = "8a0802ef79e89890bf9650a22ffc0810899fbc0c" }
+brain-protocol = { git = "https://github.com/aexhq/brain.git", rev = "8a0802ef79e89890bf9650a22ffc0810899fbc0c" }
+brain-hand-client = { git = "https://github.com/aexhq/brain.git", rev = "8a0802ef79e89890bf9650a22ffc0810899fbc0c" }
+brain-aws = { git = "https://github.com/aexhq/brain.git", rev = "8a0802ef79e89890bf9650a22ffc0810899fbc0c" }
 anyhow = "1"
 async-trait = "0.1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
@@ -42,6 +47,7 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zeroize = "1"
 walkdir = "2"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 zstd = "0.13"

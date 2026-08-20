@@ -1,4 +1,4 @@
-//! Host-side adapter that runs aex hands on **AWS Lambda MicroVMs**.
+//! Host-side mechanics for Hands on **AWS Lambda MicroVMs**.
 //!
 //! The MicroVM service gives us Firecracker isolation as a product: one VM per session, a
 //! Lambda-managed AL2023 base image with our container layer inside it, an authenticated

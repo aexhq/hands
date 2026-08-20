@@ -44,19 +44,42 @@ impl ToolOutcome {
     }
 }
 
-/// Every hand tool name the manifest v1 lists, in the order the hand dispatches them.
-pub const HAND_TOOLS: &[&str] = &["bash", "edit", "glob", "grep", "ls", "read", "write"];
+/// Concrete executables compiled into the image. Selection is by checksum, never by the
+/// model-visible Tool name. Renaming a sealed Tool therefore requires no dispatcher change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preinstalled {
+    Bash,
+    Edit,
+    Glob,
+    Grep,
+    Ls,
+    Read,
+    Write,
+}
+
+pub fn preinstalled(checksum: &str) -> Option<Preinstalled> {
+    Some(match checksum {
+        "0ed0bae284be7259c3d82f498885dc7010747fdb4b9f3edcc3160c922dac161b" => Preinstalled::Bash,
+        "deb8dd2afb0ad6658dd3667a7bc525266b776a959adc0e5c99ff5a3f27ca9c43" => Preinstalled::Edit,
+        "4721f58d411cf593b5f91a434680c16c08ae6da7409663928b3b512f3d39ddb4" => Preinstalled::Glob,
+        "5fd52904b191d45e58b308a3f336ae534616948fd28ef5a278210571d4d073f1" => Preinstalled::Grep,
+        "b9cec943bf70a2896f65ab5120e7a52f20b38ad39536f70058e32bf2bc19943a" => Preinstalled::Ls,
+        "74d97cc52d0607605e9b0c0fa3e90127f5cd68fcc4d6673c855b515c582006ef" => Preinstalled::Read,
+        "0560ad249be00118236ba6918bb432d64dbc01f92a50e668ca0b7476f3447e46" => Preinstalled::Write,
+        _ => return None,
+    })
+}
 
 /// Runs a typed tool synchronously (call inside `spawn_blocking`).
-pub fn run(tool: &str, input: &Value, cwd: &Path) -> ToolOutcome {
+pub fn run(tool: Preinstalled, input: &Value, cwd: &Path) -> ToolOutcome {
     match tool {
-        "read" => read::run(input, cwd),
-        "write" => write::run(input, cwd),
-        "edit" => edit::run(input, cwd),
-        "glob" => glob::run(input, cwd),
-        "grep" => grep::run(input, cwd),
-        "ls" => ls::run(input, cwd),
-        other => ToolOutcome::fail(format!("unknown typed tool {other}")),
+        Preinstalled::Read => read::run(input, cwd),
+        Preinstalled::Write => write::run(input, cwd),
+        Preinstalled::Edit => edit::run(input, cwd),
+        Preinstalled::Glob => glob::run(input, cwd),
+        Preinstalled::Grep => grep::run(input, cwd),
+        Preinstalled::Ls => ls::run(input, cwd),
+        Preinstalled::Bash => ToolOutcome::fail("bash uses the process runner"),
     }
 }
 

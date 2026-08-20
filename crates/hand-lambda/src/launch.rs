@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use aws_sdk_lambdamicrovms::types::MicrovmState;
-use hand_client::HandClient;
+use brain_hand_client::HandClient;
 
 use crate::control::{AUTH_HEADER, Control, ControlError, Microvm, is_gone};
 

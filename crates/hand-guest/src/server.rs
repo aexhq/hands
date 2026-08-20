@@ -13,13 +13,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aex_contracts::abi::{HandFrame, Request, RequestId, Response, ResponseResult};
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
+use brain_protocol::abi::{HandFrame, Request, RequestId, Response, ResponseResult};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -102,8 +102,8 @@ async fn root(State(hand): State<Arc<Hand>>, MaybeWs(ws): MaybeWs) -> axum::resp
                 }
             }),
         None => Json(serde_json::json!({
-            "service": "aex-hand",
-            "abi_major": aex_contracts::abi::ProtocolVersion::CURRENT.major,
+            "service": "hand",
+            "abi_major": brain_protocol::abi::ProtocolVersion::CURRENT.major,
             "generation_id": hand.generation_id.to_string(),
             "boot_id": hand.boot_id.to_string(),
             "armed": hand.armed(),

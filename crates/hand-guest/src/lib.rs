@@ -1,4 +1,4 @@
-//! aex hand guest agent — serves the brain↔hand ABI v1 (`aex_contracts::abi`) inside the sandbox.
+//! Default Hand guest — serves the Brain↔Hand ABI v1 (`brain_protocol::abi`) inside the sandbox.
 //!
 //! One process per hand. It listens for one multiplexed WebSocket per brain connection, keeps
 //! lanes (persistent shell environments), runs operations (tool calls) with bounded, spilled

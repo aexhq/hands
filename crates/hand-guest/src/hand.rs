@@ -6,23 +6,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aex_contracts::abi::{
+use base64::Engine;
+use brain_protocol::abi::{
     AbiError, BootId, CancelRequest, CancelResponse, Clock, EffectiveBounds, ErrorCode,
     GenerationId, HandStatusEvent, HelloRequest, HelloResponse, LaneCloseRequest,
     LaneCloseResponse, LaneMode, MonotonicMs, Outcome, PersistRequest, PersistResponse,
     PersistResponsePersistedItem, PersistSource, PollRequest, PollResponse, ProtocolVersion,
     PutRequest, PutResponse, PutResponseWrittenItem, PutSource, ReleaseRequest, ReleaseResponse,
     Reply, Request, RequestCall, ResponseResult, SessionId, Sha256Hex, StartRequest, StartResponse,
-    Stream, SyncRequest, SyncResponse, WallMs,
+    Stream, SyncRequest, SyncResponse, ToolExecutableSource, ToolManifest, WallMs,
 };
-use aex_contracts::tools::{manifest_digest, manifest_v1};
-use base64::Engine;
+use brain_protocol::tools::manifest_digest;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::Config;
 use crate::errors::{AbiResult, err, err_retryable, err_with, internal, malformed};
-use crate::exec::{BashSpec, run_bash};
+use crate::exec::{BashSpec, NodeSpec, run_bash, run_node};
 use crate::lanes::Lanes;
 use crate::ops::{Operation, Registry};
 use crate::spill::Spill;
@@ -60,6 +60,16 @@ pub struct Session {
     pub scope: Scope,
     pub sync_scope: SyncScope,
     pub heartbeat_ms: u64,
+    pub manifest: ToolManifest,
+    pub manifest_digest: Sha256Hex,
+    validators: HashMap<String, (jsonschema::Validator, jsonschema::Validator)>,
+    executables: HashMap<String, SessionExecutable>,
+}
+
+#[derive(Debug, Clone)]
+enum SessionExecutable {
+    Preinstalled(tools::Preinstalled),
+    Bundle(PathBuf),
 }
 
 pub struct Hand {
@@ -73,8 +83,6 @@ pub struct Hand {
     sync: AsyncMutex<SyncState>,
     pub status: StatusEmitter,
     http: reqwest::Client,
-    validators: HashMap<String, (jsonschema::Validator, jsonschema::Validator)>,
-    manifest_digest: Sha256Hex,
     idle_since: Mutex<Instant>,
     heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The armed per-session secret. `None` until the environment or the `/run` lifecycle hook
@@ -105,12 +113,7 @@ impl Hand {
         std::fs::create_dir_all(&cfg.spill_dir)?;
         std::fs::create_dir_all(cfg.spill_dir.join("sync"))?;
         std::fs::create_dir_all(&cfg.workspace)?;
-        let mut validators = HashMap::new();
-        for t in &manifest_v1().tools {
-            let input = jsonschema::draft202012::new(&Value::Object(t.input_schema.clone()))?;
-            let output = jsonschema::draft202012::new(&Value::Object(t.output_schema.clone()))?;
-            validators.insert(t.name.to_string(), (input, output));
-        }
+        std::fs::create_dir_all(&cfg.tool_dir)?;
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()?;
@@ -125,8 +128,6 @@ impl Hand {
             sync: AsyncMutex::new(SyncState::default()),
             status: StatusEmitter::new(),
             http,
-            validators,
-            manifest_digest: manifest_digest(manifest_v1()),
             idle_since: Mutex::new(Instant::now()),
             heartbeat: Mutex::new(None),
             token: RwLock::new(None),
@@ -228,6 +229,134 @@ impl Hand {
 
     // ----- hello -------------------------------------------------------------------------
 
+    async fn prepare_manifest(
+        &self,
+        requested: &ToolManifest,
+        expected_digest: &Sha256Hex,
+    ) -> AbiResult<(
+        ToolManifest,
+        HashMap<String, (jsonschema::Validator, jsonschema::Validator)>,
+        HashMap<String, SessionExecutable>,
+    )> {
+        let actual_digest = manifest_digest(requested);
+        if &actual_digest != expected_digest {
+            return Err(err_with(
+                ErrorCode::ToolManifestMismatch,
+                "tool manifest does not match its sealed digest",
+                [(
+                    "computed_digest".into(),
+                    Value::String(actual_digest.to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            ));
+        }
+
+        let mut manifest = requested.clone();
+        let mut validators = HashMap::new();
+        let mut executables = HashMap::new();
+        for tool in &mut manifest.tools {
+            let name = tool.name.to_string();
+            if validators.contains_key(&name) {
+                return Err(err(
+                    ErrorCode::ToolManifestMismatch,
+                    format!("duplicate tool name {name}"),
+                ));
+            }
+            if tool.executable.protocol != 1 {
+                return Err(err(
+                    ErrorCode::ToolBundleInvalid,
+                    format!("tool {name} uses unsupported executable protocol"),
+                ));
+            }
+            let input = jsonschema::draft202012::new(&Value::Object(tool.input_schema.clone()))
+                .map_err(|error| {
+                    err(
+                        ErrorCode::ToolManifestMismatch,
+                        format!("tool {name} input schema: {error}"),
+                    )
+                })?;
+            let output = jsonschema::draft202012::new(&Value::Object(tool.output_schema.clone()))
+                .map_err(|error| {
+                err(
+                    ErrorCode::ToolManifestMismatch,
+                    format!("tool {name} output schema: {error}"),
+                )
+            })?;
+            validators.insert(name.clone(), (input, output));
+
+            let executable = match tool.executable.source {
+                ToolExecutableSource::Preinstalled => {
+                    if tool.executable.get_url.is_some() || tool.executable.bytes.is_some() {
+                        return Err(err(
+                            ErrorCode::ToolBundleInvalid,
+                            format!("preinstalled tool {name} carries bundle transport fields"),
+                        ));
+                    }
+                    let implementation = tools::preinstalled(&tool.executable.checksum)
+                        .ok_or_else(|| {
+                            err(
+                                ErrorCode::ToolBundleInvalid,
+                                format!(
+                                    "preinstalled checksum {} is unavailable in this Hand image",
+                                    *tool.executable.checksum
+                                ),
+                            )
+                        })?;
+                    SessionExecutable::Preinstalled(implementation)
+                }
+                ToolExecutableSource::Bundle => {
+                    let bytes =
+                        tool.executable
+                            .bytes
+                            .map(|value| value.get())
+                            .ok_or_else(|| {
+                                err(
+                                    ErrorCode::ToolBundleInvalid,
+                                    format!("bundle tool {name} is missing bytes"),
+                                )
+                            })?;
+                    if bytes > 4 * 1024 * 1024 {
+                        return Err(err(
+                            ErrorCode::ToolBundleInvalid,
+                            format!("bundle tool {name} exceeds 4 MiB"),
+                        ));
+                    }
+                    let get_url = tool.executable.get_url.as_deref().ok_or_else(|| {
+                        err(
+                            ErrorCode::ToolBundleInvalid,
+                            format!("bundle tool {name} is missing get_url"),
+                        )
+                    })?;
+                    let path = self
+                        .cfg
+                        .tool_dir
+                        .join(format!("{}.mjs", *tool.executable.checksum));
+                    let already_valid = transfer::sha256_file(&path)
+                        .map(|(existing_bytes, checksum)| {
+                            existing_bytes == bytes && checksum == tool.executable.checksum
+                        })
+                        .unwrap_or(false);
+                    if !already_valid {
+                        transfer::download_to(
+                            &self.http,
+                            get_url,
+                            &path,
+                            Some(bytes),
+                            Some(&tool.executable.checksum),
+                        )
+                        .await?;
+                    }
+                    SessionExecutable::Bundle(path)
+                }
+            };
+            // A presigned URL is bearer material. Keep only the sealed identity after staging.
+            tool.executable.get_url = None;
+            executables.insert(name, executable);
+        }
+        Ok((manifest, validators, executables))
+    }
+
     async fn hello(self: &Arc<Self>, a: HelloRequest) -> AbiResult<HelloResponse> {
         if a.protocol.major != ProtocolVersion::CURRENT.major {
             return Err(err(
@@ -251,20 +380,6 @@ impl Hand {
             }
             Some(_) => {}
         }
-        if let Some(d) = &a.tool_manifest_digest
-            && *d != self.manifest_digest
-        {
-            return Err(err_with(
-                ErrorCode::ToolManifestMismatch,
-                "this hand cannot serve the sealed tool manifest",
-                [(
-                    "hand_digest".to_string(),
-                    Value::String(self.manifest_digest.to_string()),
-                )]
-                .into_iter()
-                .collect(),
-            ));
-        }
         let existing = self.session.read().unwrap().clone();
         let session = match existing {
             Some(s) => {
@@ -274,9 +389,18 @@ impl Hand {
                         "this hand belongs to another session",
                     ));
                 }
+                if s.manifest_digest != a.tool_manifest_digest {
+                    return Err(err(
+                        ErrorCode::ToolManifestMismatch,
+                        "this Hand generation is already sealed to another tool manifest",
+                    ));
+                }
                 s
             }
             None => {
+                let (manifest, validators, executables) = self
+                    .prepare_manifest(&a.tool_manifest, &a.tool_manifest_digest)
+                    .await?;
                 let scope = Scope::new(&a.sync.roots)?;
                 let sync_scope = SyncScope::new(scope.roots.clone(), &a.sync.exclude)?;
                 let mut env = self.cfg.base_env.clone();
@@ -286,6 +410,10 @@ impl Hand {
                     scope,
                     sync_scope,
                     heartbeat_ms: a.heartbeat_ms.max(1000) as u64,
+                    manifest,
+                    manifest_digest: a.tool_manifest_digest.clone(),
+                    validators,
+                    executables,
                 });
                 *self.lanes.lock().unwrap() = Some(Lanes::new(
                     env,
@@ -328,12 +456,12 @@ impl Hand {
             protocol: ProtocolVersion::CURRENT,
             generation_id: self.generation_id.clone(),
             boot_id: self.boot_id.clone(),
-            tool_manifest_digest: self.manifest_digest.clone(),
-            tools: manifest_v1().tools.clone(),
+            tool_manifest_digest: session.manifest_digest.clone(),
+            tools: session.manifest.tools.clone(),
             lanes,
             operations,
             limits: self.cfg.limits.clone(),
-            paths: aex_contracts::abi::Paths {
+            paths: brain_protocol::abi::Paths {
                 workspace: self.cfg.workspace.to_string_lossy().into_owned(),
                 home: self.cfg.home.to_string_lossy().into_owned(),
                 spill_dir: self.cfg.spill_dir.to_string_lossy().into_owned(),
@@ -367,7 +495,7 @@ impl Hand {
 
     // ----- start / poll / cancel / release ---------------------------------------------------
 
-    fn effective_bounds(&self, b: Option<&aex_contracts::abi::Bounds>) -> EffectiveBounds {
+    fn effective_bounds(&self, b: Option<&brain_protocol::abi::Bounds>) -> EffectiveBounds {
         let d = &self.cfg.limits.default_bounds;
         EffectiveBounds {
             timeout_ms: b.and_then(|b| b.timeout_ms).or(d.timeout_ms),
@@ -380,12 +508,17 @@ impl Hand {
 
     async fn start(self: &Arc<Self>, a: StartRequest) -> AbiResult<StartResponse> {
         let session = self.session()?;
-        let Some((input_v, _)) = self.validators.get(&a.tool) else {
+        let Some((input_v, _)) = session.validators.get(&a.tool) else {
             return Err(err(
                 ErrorCode::ToolNotFound,
                 format!("{} is not in the sealed manifest", a.tool),
             ));
         };
+        let executable = session
+            .executables
+            .get(&a.tool)
+            .cloned()
+            .ok_or_else(|| err(ErrorCode::ToolNotFound, "tool executable is unavailable"))?;
         if let Some(e) = input_v.iter_errors(&a.input).next() {
             let mut details = Map::new();
             details.insert(
@@ -402,7 +535,7 @@ impl Hand {
                 details,
             ));
         }
-        let expected = aex_contracts::tools::call_hash(&a);
+        let expected = brain_protocol::tools::call_hash(&a);
         if expected != a.call_hash {
             return Err(malformed(format!(
                 "call_hash {} does not match the request identity (expected {})",
@@ -511,31 +644,45 @@ impl Hand {
         let op2 = op.clone();
         let tool = a.tool.clone();
         let input = a.input.clone();
-        let capture_env = lane_mode == LaneMode::Persistent && !a.detach && tool == "bash";
+        let capture_env = lane_mode == LaneMode::Persistent
+            && !a.detach
+            && matches!(
+                executable,
+                SessionExecutable::Preinstalled(tools::Preinstalled::Bash)
+            );
         let spill_dir = self.cfg.spill_dir.clone();
         tokio::spawn(async move {
-            let captured = if tool == "bash" {
-                let command = input
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64);
-                let spec = BashSpec {
-                    command,
-                    env,
-                    cwd,
-                    capture_env_to: if capture_env {
-                        Some(spill_dir.join(format!("{}.env", *op2.id)))
-                    } else {
-                        None
-                    },
-                    timeout_ms,
-                };
-                run_bash(op2.clone(), spec).await.captured_env
-            } else {
-                hand.run_typed_tool(&op2, &tool, input, cwd).await;
-                None
+            let captured = match executable {
+                SessionExecutable::Preinstalled(tools::Preinstalled::Bash) => {
+                    let command = input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64);
+                    let spec = BashSpec {
+                        command,
+                        env,
+                        cwd,
+                        capture_env_to: if capture_env {
+                            Some(spill_dir.join(format!("{}.env", *op2.id)))
+                        } else {
+                            None
+                        },
+                        timeout_ms,
+                    };
+                    run_bash(op2.clone(), spec).await.captured_env
+                }
+                SessionExecutable::Preinstalled(implementation) => {
+                    hand.run_typed_tool(&op2, &tool, implementation, input, cwd, &session)
+                        .await;
+                    None
+                }
+                SessionExecutable::Bundle(bundle) => {
+                    hand.run_bundle_tool(&op2, &tool, &bundle, input, env, cwd, &session)
+                        .await;
+                    None
+                }
             };
             hand.on_op_terminal(&op2, captured);
         });
@@ -560,7 +707,7 @@ impl Hand {
         &self,
         op: &Operation,
         max_bytes: u64,
-    ) -> AbiResult<Vec<aex_contracts::abi::OutputSlice>> {
+    ) -> AbiResult<Vec<brain_protocol::abi::OutputSlice>> {
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
@@ -574,9 +721,17 @@ impl Hand {
         .await
     }
 
-    async fn run_typed_tool(&self, op: &Arc<Operation>, tool: &str, input: Value, cwd: PathBuf) {
-        let t = tool.to_string();
-        let res = tokio::task::spawn_blocking(move || tools::run(&t, &input, &cwd)).await;
+    async fn run_typed_tool(
+        &self,
+        op: &Arc<Operation>,
+        tool: &str,
+        implementation: tools::Preinstalled,
+        input: Value,
+        cwd: PathBuf,
+        session: &Session,
+    ) {
+        let res =
+            tokio::task::spawn_blocking(move || tools::run(implementation, &input, &cwd)).await;
         let outcome = match res {
             Ok(o) => o,
             Err(e) => {
@@ -598,7 +753,7 @@ impl Hand {
             Option<Value>,
             Option<AbiError>,
             Outcome,
-        ) = match (&outcome.output, self.validators.get(tool)) {
+        ) = match (&outcome.output, session.validators.get(tool)) {
             (Some(out), Some((_, output_v))) => match output_v.iter_errors(out).next() {
                 None => (
                     Some(outcome.exit_code),
@@ -625,6 +780,93 @@ impl Hand {
             output,
             error,
         );
+        op.set_terminal(info);
+    }
+
+    async fn run_bundle_tool(
+        &self,
+        op: &Arc<Operation>,
+        tool: &str,
+        bundle: &Path,
+        input: Value,
+        env: HashMap<String, String>,
+        cwd: PathBuf,
+        session: &Session,
+    ) {
+        let Some(spec) = session
+            .manifest
+            .tools
+            .iter()
+            .find(|spec| &*spec.name == tool)
+        else {
+            let info = op.terminal_info(
+                Outcome::Failed,
+                None,
+                None,
+                None,
+                Some(err(
+                    ErrorCode::ToolNotFound,
+                    "sealed Tool definition is missing",
+                )),
+            );
+            op.set_terminal(info);
+            return;
+        };
+        let timeout_ms = op
+            .bounds
+            .timeout_ms
+            .map(|value| value.get())
+            .unwrap_or(24 * 60 * 60 * 1000);
+        let request_path = self
+            .cfg
+            .spill_dir
+            .join(format!("{}.tool-request.json", *op.id));
+        let result_path = self
+            .cfg
+            .spill_dir
+            .join(format!("{}.tool-result.json", *op.id));
+        let request = serde_json::json!({
+            "call_id": op.id.to_string(),
+            "definition": {
+                "name": spec.name.to_string(),
+                "description": spec.description,
+            },
+            "required_env": spec.executable.required_env.iter().map(|name| name.to_string()).collect::<Vec<_>>(),
+            "input": input,
+            "workspace": self.cfg.workspace.to_string_lossy(),
+            "deadline_ms": wall_ms().saturating_add(timeout_ms),
+        });
+        let finished = run_node(
+            op.clone(),
+            NodeSpec {
+                runner: self.cfg.tool_runner.clone(),
+                bundle: bundle.to_path_buf(),
+                request,
+                env,
+                cwd,
+                request_path,
+                result_path,
+            },
+        )
+        .await;
+        let mut outcome = finished.outcome;
+        let mut output = finished.output;
+        let mut error = finished
+            .infrastructure_error
+            .map(|message| err(ErrorCode::Internal, message));
+        let validation_error = output.as_ref().and_then(|value| {
+            session.validators.get(tool).and_then(|(_, validator)| {
+                validator.iter_errors(value).next().map(|validation| {
+                    format!("{tool} output{}: {validation}", validation.instance_path())
+                })
+            })
+        });
+        if let Some(validation_error) = validation_error {
+            outcome = Outcome::Failed;
+            output = None;
+            error = Some(err(ErrorCode::ToolOutputInvalid, validation_error));
+        }
+        let info = op.terminal_info(outcome, finished.exit_code, finished.signal, output, error);
         op.set_terminal(info);
     }
 

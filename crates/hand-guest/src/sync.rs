@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use aex_contracts::abi::{
+use brain_protocol::abi::{
     ErrorCode, GenerationId, RestoreReport, RestoreSource, Sha256Hex, SyncEntry, SyncManifest,
     SyncManifestPackFormat, SyncManifestPacksItem, SyncRequest, SyncResponse, WallMs,
 };

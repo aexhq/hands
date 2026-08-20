@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aex_contracts::abi::{
+use base64::Engine;
+use brain_protocol::abi::{
     AbiError, EffectiveBounds, LaneId, LaneMode, OperationId, OperationStatus, OperationView,
     Outcome, OutputSlice, Sha256Hex, Stream, StreamInfo, TerminalInfo, Usage,
 };
-use base64::Engine;
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex, watch};
 
@@ -78,7 +78,7 @@ impl Operation {
             signal,
             output,
             error,
-            ended_at_monotonic_ms: aex_contracts::abi::MonotonicMs(now),
+            ended_at_monotonic_ms: brain_protocol::abi::MonotonicMs(now),
             usage: Usage {
                 wall_ms: self.started_at.elapsed().as_millis() as u64,
                 cpu_ms: None,
@@ -125,7 +125,7 @@ impl Operation {
             lane_id: self.lane_id.clone(),
             detach: self.detach,
             status,
-            started_at_monotonic_ms: aex_contracts::abi::MonotonicMs(self.started_at_monotonic_ms),
+            started_at_monotonic_ms: brain_protocol::abi::MonotonicMs(self.started_at_monotonic_ms),
             terminal,
             streams,
             correlation: self.correlation.clone(),
@@ -170,7 +170,7 @@ impl Operation {
                     details.insert("offset".into(), offset.into());
                     details.insert("retained_from".into(), retained_from.into());
                     return Err(crate::errors::err_with(
-                        aex_contracts::abi::ErrorCode::OperationOutputEvicted,
+                        brain_protocol::abi::ErrorCode::OperationOutputEvicted,
                         format!(
                             "{stream:?} offset {offset} predates retained region (starts at {retained_from})"
                         ),

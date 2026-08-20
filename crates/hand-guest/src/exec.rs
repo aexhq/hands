@@ -13,7 +13,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aex_contracts::abi::{ErrorCode, Outcome, Stream};
+use brain_protocol::abi::{ErrorCode, Outcome, Stream};
+use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -26,7 +27,7 @@ const VOLATILE_ENV: &[&str] = &[
     "SHLVL",
     "PWD",
     "OLDPWD",
-    "AEX_ENV_CAPTURE",
+    "HAND_ENV_CAPTURE",
     "BASH_EXECUTION_STRING",
 ];
 
@@ -44,11 +45,29 @@ pub struct Finished {
     pub captured_env: Option<HashMap<String, String>>,
 }
 
+pub struct NodeSpec {
+    pub runner: PathBuf,
+    pub bundle: PathBuf,
+    pub request: Value,
+    pub env: HashMap<String, String>,
+    pub cwd: PathBuf,
+    pub request_path: PathBuf,
+    pub result_path: PathBuf,
+}
+
+pub struct NodeFinished {
+    pub outcome: Outcome,
+    pub exit_code: Option<i64>,
+    pub signal: Option<String>,
+    pub output: Option<Value>,
+    pub infrastructure_error: Option<String>,
+}
+
 fn script(command: &str, capture: bool) -> String {
     if capture {
         // Run the user's command as-is, remember its status, dump the environment, exit with it.
         format!(
-            "{command}\n__aex_rc=$?\nenv -0 > \"$AEX_ENV_CAPTURE\" 2>/dev/null\nexit $__aex_rc\n"
+            "{command}\n__hand_rc=$?\nenv -0 > \"$HAND_ENV_CAPTURE\" 2>/dev/null\nexit $__hand_rc\n"
         )
     } else {
         command.to_string()
@@ -64,7 +83,7 @@ pub async fn run_bash(op: Arc<Operation>, spec: BashSpec) -> Finished {
     cmd.env_clear();
     cmd.envs(&spec.env);
     if let Some(p) = &spec.capture_env_to {
-        cmd.env("AEX_ENV_CAPTURE", p);
+        cmd.env("HAND_ENV_CAPTURE", p);
     }
     cmd.current_dir(&spec.cwd);
     cmd.stdin(Stdio::null())
@@ -185,6 +204,177 @@ pub async fn run_bash(op: Arc<Operation>, spec: BashSpec) -> Finished {
     let info = op.terminal_info(outcome, exit_code, signal, output, error);
     op.set_terminal(info);
     Finished { captured_env }
+}
+
+/// Runs one checksum-staged ESM bundle in a fresh Node 22 process. The result travels through a
+/// private file so customer stdout/stderr remain ordinary operation streams.
+pub async fn run_node(op: Arc<Operation>, spec: NodeSpec) -> NodeFinished {
+    let request = match serde_json::to_vec(&spec.request) {
+        Ok(request) => request,
+        Err(error) => {
+            return NodeFinished {
+                outcome: Outcome::Failed,
+                exit_code: None,
+                signal: None,
+                output: None,
+                infrastructure_error: Some(format!("serialize tool request: {error}")),
+            };
+        }
+    };
+    if let Some(parent) = spec.request_path.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            return NodeFinished {
+                outcome: Outcome::Failed,
+                exit_code: None,
+                signal: None,
+                output: None,
+                infrastructure_error: Some(format!("prepare tool request directory: {error}")),
+            };
+        }
+    }
+    if let Err(error) = tokio::fs::write(&spec.request_path, request).await {
+        return NodeFinished {
+            outcome: Outcome::Failed,
+            exit_code: None,
+            signal: None,
+            output: None,
+            infrastructure_error: Some(format!("write tool request: {error}")),
+        };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            tokio::fs::set_permissions(&spec.request_path, std::fs::Permissions::from_mode(0o600))
+                .await;
+    }
+    let _ = tokio::fs::remove_file(&spec.result_path).await;
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&spec.runner)
+        .arg(&spec.bundle)
+        .arg(&spec.request_path)
+        .arg(&spec.result_path)
+        .env_clear()
+        .envs(&spec.env)
+        .env("NODE_NO_WARNINGS", "1")
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(false);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&spec.request_path).await;
+            return NodeFinished {
+                outcome: Outcome::Failed,
+                exit_code: None,
+                signal: None,
+                output: None,
+                infrastructure_error: Some(format!("spawn Node tool runner: {error}")),
+            };
+        }
+    };
+    let pid = child.id().map(|pid| pid as i32);
+    {
+        let mut state = op.state.lock().unwrap();
+        state.pgid = pid;
+        if state.cancel_requested
+            && let Some(pgid) = pid
+        {
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        }
+    }
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let out_task = tokio::spawn(drain(op.clone(), Stream::Stdout, stdout));
+    let err_task = tokio::spawn(drain(op.clone(), Stream::Stderr, stderr));
+    let deadline_task = op.bounds.timeout_ms.map(|timeout| {
+        let op = op.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timeout.get())).await;
+            op.state.lock().unwrap().deadline_hit = true;
+            op.signal(libc::SIGTERM);
+            tokio::time::sleep(Duration::from_millis(op.bounds.grace_ms)).await;
+            op.signal(libc::SIGKILL);
+        })
+    });
+    let status = child.wait().await;
+    if let Some(task) = deadline_task {
+        task.abort();
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(50), async {
+        let _ = tokio::join!(out_task, err_task);
+    })
+    .await;
+    let (cancel_requested, deadline_hit) = {
+        let state = op.state.lock().unwrap();
+        (state.cancel_requested, state.deadline_hit)
+    };
+    let (exit_code, signal) = match &status {
+        Ok(status) => {
+            use std::os::unix::process::ExitStatusExt;
+            (
+                status.code().map(i64::from),
+                status.signal().map(signal_name),
+            )
+        }
+        Err(_) => (None, None),
+    };
+    let mut infrastructure_error = status
+        .as_ref()
+        .err()
+        .map(|error| format!("wait for Node tool runner: {error}"));
+    let output = if cancel_requested || deadline_hit {
+        None
+    } else {
+        match tokio::fs::read(&spec.result_path).await {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    value.get("output").cloned()
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    infrastructure_error = Some(format!("parse Node tool result: {error}"));
+                    None
+                }
+            },
+            Err(error) if exit_code == Some(0) => {
+                infrastructure_error = Some(format!("read Node tool result: {error}"));
+                None
+            }
+            Err(_) => None,
+        }
+    };
+    let _ = tokio::fs::remove_file(&spec.request_path).await;
+    let _ = tokio::fs::remove_file(&spec.result_path).await;
+    let outcome = if cancel_requested {
+        Outcome::Cancelled
+    } else if deadline_hit {
+        Outcome::DeadlineExceeded
+    } else if infrastructure_error.is_some() {
+        Outcome::Failed
+    } else {
+        // A thrown Tool error is a completed invocation with non-zero exit status, matching the
+        // preinstalled command tools. Brain exposes it as an error result without replaying it.
+        Outcome::Completed
+    };
+    NodeFinished {
+        outcome,
+        exit_code,
+        signal,
+        output,
+        infrastructure_error,
+    }
 }
 
 async fn drain<R: tokio::io::AsyncRead + Unpin>(op: Arc<Operation>, stream: Stream, mut r: R) {

@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aex_contracts::abi::{HandStatusEvent, Pressure};
+use brain_protocol::abi::{HandStatusEvent, Pressure};
 use tokio::sync::broadcast;
 
 pub struct StatusEmitter {

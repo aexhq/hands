@@ -3,7 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use aex_contracts::abi::{ErrorCode, Sha256Hex};
+use brain_protocol::abi::{ErrorCode, Sha256Hex};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -120,6 +120,17 @@ pub async fn download_to(
     expected_bytes: Option<u64>,
     expected_sha: Option<&Sha256Hex>,
 ) -> AbiResult<(u64, Sha256Hex)> {
+    if let Ok(parsed) = reqwest::Url::parse(url)
+        && parsed.scheme() == "file"
+    {
+        let source = parsed.to_file_path().map_err(|_| {
+            err(
+                ErrorCode::TransferFailed,
+                "file transfer URL is not an absolute local path",
+            )
+        })?;
+        return copy_local_to(&source, dest, expected_bytes, expected_sha).await;
+    }
     let resp = client
         .get(url)
         .send()
@@ -137,7 +148,7 @@ pub async fn download_to(
             .map_err(|e| err(ErrorCode::Internal, format!("mkdir: {e}")))?;
     }
     let tmp = dest.with_extension(format!(
-        "{}.aex-tmp",
+        "{}.hand-tmp",
         dest.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
     let mut file = tokio::fs::File::create(&tmp)
@@ -180,6 +191,88 @@ pub async fn download_to(
                 *sha,
                 expected_bytes,
                 expected_sha.map(|s| s.to_string())
+            ),
+        ));
+    }
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .map_err(|e| err(ErrorCode::Internal, format!("rename into place: {e}")))?;
+    Ok((total, sha))
+}
+
+/// Copies a file exposed through a read-only container mount. The trusted Brain still supplies
+/// the URI and the Hand still verifies the sealed byte count and checksum before acknowledging
+/// the manifest; no host path is inferred from model input.
+async fn copy_local_to(
+    source: &Path,
+    dest: &Path,
+    expected_bytes: Option<u64>,
+    expected_sha: Option<&Sha256Hex>,
+) -> AbiResult<(u64, Sha256Hex)> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| err(ErrorCode::Internal, format!("mkdir: {e}")))?;
+    }
+    let tmp = dest.with_extension(format!(
+        "{}.hand-tmp",
+        dest.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    let mut input = tokio::fs::File::open(source).await.map_err(|e| {
+        err(
+            ErrorCode::TransferFailed,
+            format!("open mounted bundle: {e}"),
+        )
+    })?;
+    let mut output = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|e| err(ErrorCode::Internal, format!("create: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        use tokio::io::AsyncReadExt as _;
+        let read = input.read(&mut buffer).await.map_err(|e| {
+            err(
+                ErrorCode::TransferFailed,
+                format!("read mounted bundle: {e}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if expected_bytes.is_some_and(|limit| total > limit) {
+            drop(output);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(err(
+                ErrorCode::ChecksumMismatch,
+                "mounted bundle exceeds its declared byte count",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|e| err(ErrorCode::Internal, format!("write: {e}")))?;
+    }
+    output
+        .flush()
+        .await
+        .map_err(|e| err(ErrorCode::Internal, format!("flush: {e}")))?;
+    drop(output);
+    let sha = Sha256Hex::try_from(hex::encode(hasher.finalize())).expect("hex");
+    if expected_bytes.is_some_and(|bytes| bytes != total)
+        || expected_sha.is_some_and(|expected| expected != &sha)
+    {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(err(
+            ErrorCode::ChecksumMismatch,
+            format!(
+                "mounted bundle has {total} bytes sha256 {}; expected {:?} bytes sha256 {:?}",
+                *sha,
+                expected_bytes,
+                expected_sha.map(|sha| sha.to_string())
             ),
         ));
     }

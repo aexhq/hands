@@ -1,18 +1,19 @@
 # hands
 
-The **hand**: where an aex agent's tools run, isolated in a microVM (AWS Lambda MicroVM now, an own
-Firecracker fleet later). This repo has the guest agent that serves the brain↔hand ABI v1 and the
-image it ships in; the host-side adapters (`lambda-microvm`, `firecracker-host`) land in slice 2.
+The default **Hand** runtime: where Brain tools run. This repository contains the guest that serves
+Brain's public Brain↔Hand ABI, the generic Node tool runner, a Docker image, and the AWS Lambda
+MicroVM adapter used by Aex.
 
 | Crate / dir | What |
 | --- | --- |
 | `crates/hand-guest` | the guest agent: serves the ABI over one WebSocket — lanes, operations with bounded spilled output, detached jobs, files in/out over presigned URLs, workspace sync (pack + manifest) and restore |
-| `crates/hand-client` | brain-side client of the ABI (one multiplexed WebSocket per hand) + a `smoke` example |
+| `crates/hand-brain-aws` | AWS Lambda MicroVM implementation of Brain's public Hand ports and the neutral hosted composition binary |
 | `image/` | the Dockerfile for the sandbox image (guest binary + curated toolchain) |
 | `tools/` | `smoke.sh` (build image, drive one session end to end), `dev-sync.sh` (push to a Linux box and run) |
 
-Contracts come from [`aexhq/aex`](https://github.com/aexhq/aex) (`aex-contracts`, pinned by tag);
-semantics are in that repo's `contracts/abi/v1/README.md`.
+Contracts and the Brain-side client come from an immutable revision of
+[`aexhq/brain`](https://github.com/aexhq/brain); their normative semantics live there. Hands
+depends on Brain and implements its interfaces. Brain never depends on this repository.
 
 ## Build and test (Linux; the guest is Linux-only — setsid, signals, /proc)
 
@@ -25,7 +26,10 @@ hand-lambda gate --image <name> --version <v>       # slice-5 gates on a real Mi
                                                     # fail) + in-region tool-call latency record
 ```
 
-`.github/workflows/image.yml` is the release path for Lambda MicroVM images. It reruns the
+`.github/workflows/oci.yml` publishes the public Linux AMD64/ARM64 Hand image consumed by
+standalone Brain. `.github/workflows/brain-image.yml` publishes the generic hosted composition of
+the pinned Brain revision, AWS durability, and this Lambda MicroVM Hand. `.github/workflows/image.yml`
+is the release path for Aex's isolated MicroVM images. It reruns the
 complete Rust gate on a native ARM runner, assumes a plane-scoped OIDC publisher role, and can
 publish only the matching `dev` or protected `prd` environment image. Dev and production have
 separate artifact buckets, build roles, image names, and version lines; no AWS keys live in
