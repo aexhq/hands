@@ -30,7 +30,7 @@ pub const REGION: &str = "eu-west-1";
 /// image registration declares and the endpoint auth token is scoped to.
 pub const AGENT_PORT: u16 = 8080;
 
-/// Idle policy: AWS suspends the VM after this much endpoint-traffic silence (D6).
+/// Idle policy: AWS suspends the VM after this much endpoint-traffic silence.
 pub const MAX_IDLE_SECONDS: u64 = 180;
 
 /// The provider-hard retention wall: running plus suspended (quota L-B430C318).

@@ -9,7 +9,7 @@
 //! traffic (an authenticated probe) well inside the 180 s idle window. When the brain admits a
 //! message for a possibly-suspended hand it calls [`probe`] first: the endpoint holds the
 //! request until `/resume` completes, so the resume cost is paid concurrently with model
-//! inference rather than in front of the first tool call (D6/F-4).
+//! inference rather than in front of the first tool call.
 
 use std::time::Duration;
 
@@ -164,7 +164,7 @@ pub async fn probe(
 /// The speculative resume: send endpoint traffic to a suspended hand so Lambda holds the request
 /// while `/resume` runs, then answers from the resumed guest. Right after an explicit suspend the
 /// endpoint can briefly answer 502/503 before auto-resume is wired, so this retries the held
-/// request until it succeeds or `overall` elapses. This is the D6/F-4 path a brain uses to hide
+/// request until it succeeds or `overall` elapses. Brain uses this path to hide
 /// the resume behind model inference.
 pub async fn resume_via_probe(
     http: &reqwest::Client,

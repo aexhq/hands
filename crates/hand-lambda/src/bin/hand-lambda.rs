@@ -3,9 +3,9 @@
 //! - `image publish` — pack the guest into a build-context ZIP, upload, register, wait.
 //! - `image status` — versions and whether an expiry-driven rebuild is due.
 //! - `list` / `get` / `suspend` / `resume` / `terminate` — raw lifecycle.
-//! - `e2e` — the slice-2 gate: launch → build → suspend → resume → sync → terminate →
+//! - `e2e` — launch → build → suspend → resume → sync → terminate →
 //!   re-materialise from the sync into a fresh VM, byte-for-byte.
-//! - `spike` — S2-A burst, S2-B swap, S2-C latency, S2-D imds; JSON records on stdout.
+//! - `spike` — burst, swap, latency, and IMDS probes; JSON records on stdout.
 
 use std::time::{Duration, Instant};
 
@@ -57,7 +57,7 @@ enum Cmd {
     Terminate {
         id: String,
     },
-    /// The slice-2 gate, end to end against real AWS.
+    /// End-to-end lifecycle check against real AWS.
     E2e {
         /// Image name or ARN.
         #[arg(long)]
@@ -69,7 +69,7 @@ enum Cmd {
         #[arg(long)]
         bucket: String,
     },
-    /// Slice-2 spikes. Emits one JSON record per spike on stdout.
+    /// Runtime probes. Emits one JSON record per probe on stdout.
     Spike {
         #[arg(long)]
         image: String,
@@ -79,10 +79,10 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
     },
-    /// The slice-5 security + latency gates: no IAM role or credentials reachable from inside
+    /// Security and latency checks: no IAM role or credentials reachable from inside
     /// the guest (hard fail), and platform-added latency per tool call through the endpoint
-    /// (published; optionally thresholded). Run it IN-REGION for the publishable number —
-    /// from the operator's machine the internet RTT dominates.
+    /// (optionally thresholded). Run it in-region for comparable measurements; internet RTT
+    /// dominates when run elsewhere.
     Gate {
         #[arg(long)]
         image: String,
@@ -186,7 +186,7 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// The slice-5 gates on a real MicroVM: launch once, probe IMDS adversarially, measure the
+/// Checks on a real MicroVM: launch once, probe IMDS adversarially, measure the
 /// tool-call round trip, terminate. Exit is nonzero if any gate fails; the latency record is
 /// the publishable number when run in-region.
 async fn gate(
@@ -732,7 +732,7 @@ async fn spikes(
     Ok(())
 }
 
-/// S2-D: no instance identity reachable from inside the guest.
+/// Verify that no instance identity is reachable from inside the guest.
 async fn spike_imds(c: &HandClient) -> anyhow::Result<serde_json::Value> {
     let probes = [
         (
@@ -796,7 +796,7 @@ async fn spike_imds(c: &HandClient) -> anyhow::Result<serde_json::Value> {
     }))
 }
 
-/// S2-B: is swap on (boot script), and does allocation past baseline survive.
+/// Check whether swap is active and whether allocation beyond the baseline survives.
 async fn spike_swap(c: &HandClient) -> anyhow::Result<serde_json::Value> {
     let (_, swapon) = bash(
         c,
@@ -825,7 +825,7 @@ print(f"allocated_mib={(len(chunks)*32)} wall_s={time.monotonic()-t0:.2f}")
     }))
 }
 
-/// S2-C: platform-added latency per tool call through the endpoint.
+/// Measure platform-added latency per tool call through the endpoint.
 async fn spike_latency(c: &HandClient, hand: &LaunchedHand) -> anyhow::Result<serde_json::Value> {
     // Warm up.
     for i in 0..3 {
@@ -850,11 +850,11 @@ async fn spike_latency(c: &HandClient, hand: &LaunchedHand) -> anyhow::Result<se
         "samples": tool_ms.len(),
         "tool_call_ms": percentiles(&mut tool_ms),
         "http_probe_ms": percentiles(&mut probe_ms),
-        "note": "measured from the operator's machine; includes internet RTT to eu-west-1. The probe row is the network+proxy baseline; tool-call minus probe is the in-VM ABI cost.",
+        "note": "The probe row is the network+proxy baseline; tool-call minus probe approximates the in-VM ABI cost. Run in-region for comparable results.",
     }))
 }
 
-/// S2-A: does the 4× CPU burst hold through a 5-minute sustained load.
+/// Check whether the 4× CPU burst holds through a five-minute sustained load.
 async fn spike_burst(c: &HandClient) -> anyhow::Result<serde_json::Value> {
     // Two full-tilt workers on a 0.5-vCPU-baseline / 2-vCPU-burst shape, reporting the joint
     // hash rate every 5 s for 6 minutes. If AWS throttles the burst, the curve drops.

@@ -52,8 +52,8 @@ fn zip_time() -> zip::DateTime {
 /// resolv.conf entries; this AWS-provided address answers inside the VM.
 pub const GUEST_DNS: &str = "169.254.169.253";
 
-/// Default swap: 2 GiB, created and enabled at boot (D5 / M-6c: swap turns "job failed" into
-/// "job was slow"). Boot continues if `swapon` is refused — spike S2-B records the outcome.
+/// Default swap: 2 GiB, created and enabled at boot so memory pressure turns "job failed" into
+/// "job was slow". Boot continues if `swapon` is refused; the swap probe records the outcome.
 pub const DEFAULT_SWAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The boot script: root sets up DNS and swap, then drops to the `agent` user for the guest.

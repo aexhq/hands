@@ -62,8 +62,8 @@ impl Server {
             .route("/", get(root))
             .nest(hooks::HOOK_PREFIX, hooks)
             .with_state(self.hand);
-        // TCP_NODELAY: ABI frames are small; Nagle + delayed ACK on this socket adds ~40 ms
-        // to every op round trip (the slice-5 latency gate caught it end to end).
+        // TCP_NODELAY: ABI frames are small; Nagle plus delayed ACK added a measured ~40 ms
+        // to every operation round trip.
         use axum::serve::ListenerExt as _;
         let listener = self.listener.tap_io(|io| {
             let _ = io.set_nodelay(true);
