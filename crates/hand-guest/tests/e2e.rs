@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aex_contracts::abi::{
+use base64::Engine;
+use brain_hand_client::{ClientError, HandClient, root_lane, start_request};
+use brain_protocol::abi::{
     Bounds, CancelRequest, Cursor, ErrorCode, HelloRequest, LaneCloseRequest, LaneMode, LaneRef,
     OperationStatus, Outcome, PersistItem, PersistRequest, PersistSource, PollRequest,
     ProtocolVersion, PutFile, PutRequest, PutSource, ReleaseRequest, RestoreSource,
-    RestoreSourcePacksItem, Stream, SyncReason, SyncRequest, SyncScope,
+    RestoreSourcePacksItem, Stream, SyncReason, SyncRequest, SyncScope, ToolManifest,
 };
-use base64::Engine;
-use hand_client::{ClientError, HandClient, root_lane, start_request};
 use hand_guest::{Config, Hand, Server};
 use serde_json::json;
 use tempfile::TempDir;
@@ -38,13 +38,16 @@ struct TestHand {
 
 async fn spawn_hand_at(dir: TempDir, workspace: PathBuf, home: PathBuf) -> TestHand {
     let spill = dir.path().join("spill");
-    let cfg = Config::new(
+    let mut cfg = Config::new(
         "127.0.0.1:0".parse().unwrap(),
         Some(TOKEN.into()),
         workspace.clone(),
         home.clone(),
         spill.clone(),
     );
+    cfg.tool_runner =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../image/tool-runner.mjs");
+    cfg.tool_dir = dir.path().join("tools");
     let hand = Hand::new(cfg).unwrap();
     let server = Server::bind(hand.clone()).await.unwrap();
     let addr = server.local_addr().unwrap();
@@ -75,12 +78,11 @@ fn hello_req(h: &TestHand) -> HelloRequest {
         session_id: SESSION.parse().unwrap(),
         session_token: TOKEN.into(),
         expected_generation_id: None,
-        tool_manifest_digest: Some(
-            aex_contracts::tools::TOOL_MANIFEST_V1_DIGEST
-                .trim()
-                .parse()
-                .unwrap(),
-        ),
+        tool_manifest: brain_protocol::tools::manifest_v1().clone(),
+        tool_manifest_digest: brain_protocol::tools::TOOL_MANIFEST_V1_DIGEST
+            .trim()
+            .parse()
+            .unwrap(),
         env: HashMap::from([("SESSION_TAG".to_string(), "t1".to_string())]),
         sync: SyncScope {
             roots: vec![
@@ -106,14 +108,14 @@ fn b64(s: &[u8]) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
 }
 
-fn stdout_of(slices: &[aex_contracts::abi::OutputSlice]) -> String {
+fn stdout_of(slices: &[brain_protocol::abi::OutputSlice]) -> String {
     let mut v = Vec::new();
     for s in slices.iter().filter(|s| s.stream == Stream::Stdout) {
         v.extend(b64(s.data_base64.as_bytes()));
     }
     String::from_utf8_lossy(&v).into_owned()
 }
-fn stderr_of(slices: &[aex_contracts::abi::OutputSlice]) -> String {
+fn stderr_of(slices: &[brain_protocol::abi::OutputSlice]) -> String {
     let mut v = Vec::new();
     for s in slices.iter().filter(|s| s.stream == Stream::Stderr) {
         v.extend(b64(s.data_base64.as_bytes()));
@@ -121,7 +123,7 @@ fn stderr_of(slices: &[aex_contracts::abi::OutputSlice]) -> String {
     String::from_utf8_lossy(&v).into_owned()
 }
 
-async fn bash(c: &HandClient, id: &str, cmd: &str) -> aex_contracts::abi::StartResponse {
+async fn bash(c: &HandClient, id: &str, cmd: &str) -> brain_protocol::abi::StartResponse {
     c.start(start_request(
         id,
         "bash",
@@ -151,6 +153,86 @@ fn abi_code(e: &ClientError) -> Option<ErrorCode> {
         ClientError::Abi(a) => Some(a.code),
         _ => None,
     }
+}
+
+fn custom_bundle(dir: &Path) -> (ToolManifest, brain_protocol::abi::Sha256Hex) {
+    use sha2::Digest as _;
+
+    let source = br#"
+const reverse = (value) => [...value].reverse().join("");
+export default {
+  kind: "brain.tool",
+  name: "third_party_lookup",
+  description: "Exercise a bundled third-party Tool.",
+  requiredEnv: ["CUSTOM_SECRET"],
+  async execute({ value, delay_ms = 0 }, { signal }) {
+    if (delay_ms > 0) await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, delay_ms);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(signal.reason ?? new Error("cancelled"));
+      }, { once: true });
+    });
+    process.stdout.write(`bundle:${process.env.CUSTOM_SECRET}\n`);
+    return { value: `${reverse(value)}:${process.env.CUSTOM_SECRET}` };
+  },
+};
+"#;
+    let path = dir.join("third-party-tool.mjs");
+    std::fs::write(&path, source).unwrap();
+    let checksum = hex::encode(sha2::Sha256::digest(source));
+    let manifest: ToolManifest = serde_json::from_value(json!({
+        "version": "1",
+        "tools": [{
+            "name": "third_party_lookup",
+            "description": "Exercise a bundled third-party Tool.",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {
+                    "value": {"type": "string"},
+                    "delay_ms": {"type": "integer", "minimum": 0}
+                }
+            },
+            "output_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "string"}}
+            },
+            "executable": {
+                "protocol": 1,
+                "checksum": checksum,
+                "source": "bundle",
+                "required_env": ["CUSTOM_SECRET"],
+                "get_url": format!("file://{}", path.display()),
+                "bytes": source.len()
+            }
+        }]
+    }))
+    .unwrap();
+    let digest = brain_protocol::tools::manifest_digest(&manifest);
+    (manifest, digest)
+}
+
+async fn connect_custom(
+    hand: &TestHand,
+    session: &str,
+    secret: &str,
+    manifest: ToolManifest,
+    digest: brain_protocol::abi::Sha256Hex,
+) -> HandClient {
+    let client = HandClient::connect(&format!("ws://{}/", hand.addr), 1)
+        .await
+        .unwrap();
+    let mut hello = hello_req(hand);
+    hello.session_id = session.parse().unwrap();
+    hello.env = HashMap::from([("CUSTOM_SECRET".to_string(), secret.to_string())]);
+    hello.tool_manifest = manifest;
+    hello.tool_manifest_digest = digest;
+    client.hello(hello).await.unwrap();
+    client
 }
 
 /// In-process object store: PUT /{key} stores, GET /{key} serves. Stands in for presigned URLs.
@@ -220,6 +302,132 @@ impl Blob {
 
 // ----- tests -----------------------------------------------------------------------------
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bundled_tools_are_isolated_cancelled_and_restaged_after_recreation() {
+    let alpha = spawn_hand().await;
+    let beta = spawn_hand().await;
+    let (alpha_manifest, alpha_digest) = custom_bundle(alpha._dir.path());
+    let (beta_manifest, beta_digest) = custom_bundle(beta._dir.path());
+    let alpha_client = connect_custom(
+        &alpha,
+        "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "alpha-secret",
+        alpha_manifest.clone(),
+        alpha_digest.clone(),
+    );
+    let beta_client = connect_custom(
+        &beta,
+        "ses_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "beta-secret",
+        beta_manifest,
+        beta_digest,
+    );
+    let (alpha_client, beta_client) = tokio::join!(alpha_client, beta_client);
+
+    let alpha_call = alpha_client.start(start_request(
+        "bundle-alpha",
+        "third_party_lookup",
+        json!({"value": "one"}),
+        root_lane(),
+        None,
+        false,
+        10_000,
+        4_096,
+    ));
+    let beta_call = beta_client.start(start_request(
+        "bundle-beta",
+        "third_party_lookup",
+        json!({"value": "two"}),
+        root_lane(),
+        None,
+        false,
+        10_000,
+        4_096,
+    ));
+    let (alpha_result, beta_result) = tokio::join!(alpha_call, beta_call);
+    let alpha_result = alpha_result.unwrap();
+    let beta_result = beta_result.unwrap();
+    assert_eq!(
+        alpha_result.view.terminal.as_ref().unwrap().output.clone(),
+        Some(json!({"value": "eno:alpha-secret"}))
+    );
+    assert_eq!(
+        beta_result.view.terminal.as_ref().unwrap().output.clone(),
+        Some(json!({"value": "owt:beta-secret"}))
+    );
+    assert!(stdout_of(&alpha_result.slices).contains("alpha-secret"));
+    assert!(!stdout_of(&alpha_result.slices).contains("beta-secret"));
+    assert!(stdout_of(&beta_result.slices).contains("beta-secret"));
+    assert!(!stdout_of(&beta_result.slices).contains("alpha-secret"));
+
+    let started = alpha_client
+        .start(start_request(
+            "bundle-cancel",
+            "third_party_lookup",
+            json!({"value": "slow", "delay_ms": 30_000}),
+            root_lane(),
+            None,
+            false,
+            0,
+            0,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.view.status, OperationStatus::Running);
+    let cancelled = alpha_client
+        .cancel(CancelRequest {
+            operation_id: "bundle-cancel".parse().unwrap(),
+            grace_ms: Some(500),
+        })
+        .await
+        .unwrap();
+    assert!(cancelled.accepted);
+    let terminal = loop {
+        let polled = alpha_client
+            .poll(PollRequest {
+                operation_id: "bundle-cancel".parse().unwrap(),
+                cursors: vec![],
+                max_bytes: 0,
+                wait_ms: 2_000,
+            })
+            .await
+            .unwrap();
+        if polled.view.status == OperationStatus::Terminal {
+            break polled.view.terminal.unwrap();
+        }
+    };
+    assert_eq!(terminal.outcome, Outcome::Cancelled);
+
+    // A fresh Hand has no staged state. Supplying the same sealed manifest restages the exact
+    // bytes and runs successfully; no preinstalled-name fallback is involved.
+    let recreated = spawn_hand().await;
+    let recreated_client = connect_custom(
+        &recreated,
+        "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "alpha-secret",
+        alpha_manifest,
+        alpha_digest,
+    )
+    .await;
+    let result = recreated_client
+        .start(start_request(
+            "bundle-restored",
+            "third_party_lookup",
+            json!({"value": "again"}),
+            root_lane(),
+            None,
+            false,
+            10_000,
+            4_096,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.view.terminal.unwrap().output,
+        Some(json!({"value": "niaga:alpha-secret"}))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn hello_seals_manifest_and_bash_round_trips_in_one_call() {
     let h = spawn_hand().await;
@@ -234,7 +442,7 @@ async fn hello_seals_manifest_and_bash_round_trips_in_one_call() {
     );
     assert_eq!(
         &*hello.tool_manifest_digest,
-        aex_contracts::tools::TOOL_MANIFEST_V1_DIGEST.trim()
+        brain_protocol::tools::TOOL_MANIFEST_V1_DIGEST.trim()
     );
     assert_eq!(hello.lanes.len(), 1);
     assert_eq!(&*hello.lanes[0].id, "0");
@@ -669,7 +877,7 @@ async fn deadline_and_grandchildren_do_not_hang_the_operation() {
         grace_ms: Some(200),
         max_retained_bytes: None,
     });
-    req.call_hash = aex_contracts::tools::call_hash(&req);
+    req.call_hash = brain_protocol::tools::call_hash(&req);
     let r = c.start(req).await.unwrap();
     let t = r.view.terminal.unwrap();
     assert_eq!(t.outcome, Outcome::DeadlineExceeded);
@@ -777,7 +985,7 @@ async fn start_is_idempotent_and_envelope_checks_hold() {
         .await
         .unwrap();
     let mut req = hello_req(&h);
-    req.tool_manifest_digest = Some("f".repeat(64).parse().unwrap());
+    req.tool_manifest_digest = "f".repeat(64).parse().unwrap();
     let e = c3.hello(req).await.unwrap_err();
     assert_eq!(abi_code(&e), Some(ErrorCode::ToolManifestMismatch));
     // Before hello, nothing else works.
@@ -840,7 +1048,7 @@ async fn output_retention_is_bounded_and_eviction_is_reported() {
         grace_ms: None,
         max_retained_bytes: Some(8192),
     });
-    req.call_hash = aex_contracts::tools::call_hash(&req);
+    req.call_hash = brain_protocol::tools::call_hash(&req);
     let r = c.start(req).await.unwrap();
     let out = r
         .view
@@ -1133,7 +1341,7 @@ async fn sync_then_restore_into_a_fresh_hand_reproduces_the_tree() {
         "zstd should squash the zeros: {}",
         r1.bytes_uploaded
     );
-    let manifest_1: aex_contracts::abi::SyncManifest =
+    let manifest_1: brain_protocol::abi::SyncManifest =
         serde_json::from_slice(&blob.get("ses/m-1.json").unwrap()).unwrap();
     assert!(
         manifest_1
@@ -1166,7 +1374,7 @@ async fn sync_then_restore_into_a_fresh_hand_reproduces_the_tree() {
         r3.packs_referenced, 2,
         "old pack still holds lib.rs and .gitconfig"
     );
-    let manifest_3: aex_contracts::abi::SyncManifest =
+    let manifest_3: brain_protocol::abi::SyncManifest =
         serde_json::from_slice(&blob.get("ses/m-3.json").unwrap()).unwrap();
     assert_eq!(
         manifest_3.parent_manifest_id.as_deref().map(|s| &**s),
@@ -1224,7 +1432,7 @@ async fn do_sync(
     n: u32,
     reason: SyncReason,
     full: bool,
-) -> aex_contracts::abi::SyncResponse {
+) -> brain_protocol::abi::SyncResponse {
     c.sync(SyncRequest {
         reason,
         manifest_id: format!("m-{n}").parse().unwrap(),

@@ -14,10 +14,10 @@ docker build -f image/Dockerfile \
   -t aex-hand:dev .
 ```
 
-Installer output is redirected into `/workspace/.aex/**` (CARGO_HOME, GOPATH, npm prefix, pip/uv
+Installer output is redirected into `/workspace/.hand/**` (CARGO_HOME, GOPATH, npm prefix, pip/uv
 caches, pipx) so a `pip install` or `npm i -g` survives workspace sync; system-wide installs are
 ephemeral and the agent is told so.
 
-The hand listens on `:7000` for the brain's WebSocket. It needs `AEX_HAND_TOKEN` (the per-session
+The Hand listens on `:8080` for Brain's WebSocket. It needs `HAND_TOKEN` (the per-session
 secret) set at launch; the platform sets it. `tools/smoke.sh` builds the image and drives one
 session through it end to end.

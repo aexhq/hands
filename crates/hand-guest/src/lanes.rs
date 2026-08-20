@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use aex_contracts::abi::{
+use brain_protocol::abi::{
     ErrorCode, LaneId, LaneMode, LaneRef, LaneSummary, LaneSummaryState, MonotonicMs, OperationId,
 };
 

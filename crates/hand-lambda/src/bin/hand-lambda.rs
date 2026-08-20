@@ -1,4 +1,4 @@
-//! Operator CLI for aex hands on AWS Lambda MicroVMs.
+//! Operator CLI for Hands on AWS Lambda MicroVMs.
 //!
 //! - `image publish` — pack the guest into a build-context ZIP, upload, register, wait.
 //! - `image status` — versions and whether an expiry-driven rebuild is due.
@@ -17,16 +17,16 @@ use hand_lambda::control::Control;
 use hand_lambda::image::{self, PublishConfig};
 use hand_lambda::launch::{self, Disposition, LaunchedHand};
 
-use aex_contracts::abi::{
+use base64::Engine as _;
+use brain_hand_client::{HandClient, root_lane, start_request};
+use brain_protocol::abi::{
     Cursor, HelloRequest, OperationStatus, PollRequest, ProtocolVersion, RestoreSource,
     RestoreSourcePacksItem, Stream, SyncReason, SyncRequest, SyncScope,
 };
-use base64::Engine as _;
-use hand_client::{HandClient, root_lane, start_request};
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "hand-lambda", about = "aex hands on AWS Lambda MicroVMs")]
+#[command(name = "hand-lambda", about = "Hands on AWS Lambda MicroVMs")]
 struct Cli {
     /// AWS region.
     #[arg(long, default_value = REGION)]
@@ -101,7 +101,7 @@ enum ImageCmd {
         /// The aarch64-unknown-linux-gnu hand-guest binary.
         #[arg(long)]
         binary: std::path::PathBuf,
-        #[arg(long, default_value = "aex-hands-dev-1gb")]
+        #[arg(long, default_value = "hands-dev-1gb")]
         name: String,
         #[arg(long, default_value_t = 1024)]
         memory_mib: u32,
@@ -114,7 +114,7 @@ enum ImageCmd {
     },
     /// Latest version, its base version, and whether a rebuild is due.
     Status {
-        #[arg(long, default_value = "aex-hands-dev-1gb")]
+        #[arg(long, default_value = "hands-dev-1gb")]
         name: String,
     },
     /// Print the generated Dockerfile (what goes into the ZIP).
@@ -341,12 +341,11 @@ fn hello_req(session: &str, token: &str) -> HelloRequest {
         session_id: session.parse().expect("session id"),
         session_token: token.to_owned(),
         expected_generation_id: None,
-        tool_manifest_digest: Some(
-            aex_contracts::tools::TOOL_MANIFEST_V1_DIGEST
-                .trim()
-                .parse()
-                .expect("digest"),
-        ),
+        tool_manifest: brain_protocol::tools::manifest_v1().clone(),
+        tool_manifest_digest: brain_protocol::tools::TOOL_MANIFEST_V1_DIGEST
+            .trim()
+            .parse()
+            .expect("digest"),
         env: Default::default(),
         sync: SyncScope {
             roots: vec!["/workspace".into(), "/home/agent".into()],
@@ -357,7 +356,7 @@ fn hello_req(session: &str, token: &str) -> HelloRequest {
     }
 }
 
-fn decode(slices: &[aex_contracts::abi::OutputSlice]) -> String {
+fn decode(slices: &[brain_protocol::abi::OutputSlice]) -> String {
     let mut out = String::new();
     for s in slices {
         if s.stream == Stream::Stdout {
@@ -560,7 +559,7 @@ async fn e2e(
     let t = Instant::now();
     let http = reqwest::Client::new();
     let probe = launch::resume_via_probe(&http, &hand, Duration::from_secs(120)).await?;
-    anyhow::ensure!(probe["service"] == "aex-hand", "probe: {probe}");
+    anyhow::ensure!(probe["service"] == "hand", "probe: {probe}");
     step("probe_resume", t);
     launch::wait_for_state(
         control,
@@ -641,7 +640,7 @@ async fn e2e(
         .collect()
         .await?
         .into_bytes();
-    let manifest: aex_contracts::abi::SyncManifest = serde_json::from_slice(&manifest_bytes)?;
+    let manifest: brain_protocol::abi::SyncManifest = serde_json::from_slice(&manifest_bytes)?;
     let mut packs = Vec::new();
     for p in &manifest.packs {
         packs.push(RestoreSourcePacksItem {
@@ -921,7 +920,7 @@ while time.monotonic() - t0 < 360:
     }
     // Cancel the load (it loops forever by design).
     let _ = c
-        .cancel(aex_contracts::abi::CancelRequest {
+        .cancel(brain_protocol::abi::CancelRequest {
             operation_id: "burst-load".parse().expect("id"),
             grace_ms: Some(1000),
         })

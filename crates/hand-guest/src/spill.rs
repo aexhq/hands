@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use aex_contracts::abi::Sha256Hex;
+use brain_protocol::abi::Sha256Hex;
 use sha2::{Digest, Sha256};
 
 pub const MIN_SEGMENT_BYTES: u64 = 4096;

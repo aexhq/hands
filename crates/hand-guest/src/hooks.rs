@@ -17,7 +17,7 @@
 //!
 //! The payload's key set is **closed** (`deny_unknown_fields`): there is deliberately nowhere
 //! for a platform credential to arrive. Outside Lambda (plain container), the token comes from
-//! `AEX_HAND_TOKEN` instead and these routes are simply never called.
+//! `HAND_TOKEN` instead and these routes are simply never called.
 
 use std::sync::Arc;
 
@@ -129,7 +129,7 @@ pub async fn ready(State(hand): State<Arc<Hand>>) -> (StatusCode, Json<Value>) {
             continue;
         }
         // Writable, not merely present: the agent user must own its working trees.
-        let probe = dir.join(".aex-ready-probe");
+        let probe = dir.join(".hand-ready-probe");
         match std::fs::write(&probe, b"ok") {
             Ok(()) => {
                 let _ = std::fs::remove_file(&probe);

@@ -5,14 +5,16 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-use aex_contracts::abi::{EffectiveBounds, Limits};
+use brain_protocol::abi::{EffectiveBounds, Limits};
 
 /// Environment variables the hand reads at start-up.
-pub const ENV_TOKEN: &str = "AEX_HAND_TOKEN";
-pub const ENV_LISTEN: &str = "AEX_HAND_LISTEN";
-pub const ENV_WORKSPACE: &str = "AEX_HAND_WORKSPACE";
-pub const ENV_HOME: &str = "AEX_HAND_HOME";
-pub const ENV_SPILL_DIR: &str = "AEX_HAND_SPILL_DIR";
+pub const ENV_TOKEN: &str = "HAND_TOKEN";
+pub const ENV_LISTEN: &str = "HAND_LISTEN";
+pub const ENV_WORKSPACE: &str = "HAND_WORKSPACE";
+pub const ENV_HOME: &str = "HAND_HOME";
+pub const ENV_SPILL_DIR: &str = "HAND_SPILL_DIR";
+pub const ENV_TOOL_DIR: &str = "HAND_TOOL_DIR";
+pub const ENV_TOOL_RUNNER: &str = "HAND_TOOL_RUNNER";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -26,13 +28,15 @@ pub struct Config {
     pub workspace: PathBuf,
     pub home: PathBuf,
     pub spill_dir: PathBuf,
+    pub tool_dir: PathBuf,
+    pub tool_runner: PathBuf,
     /// Environment every lane starts from (before the session's `hello.env` overrides).
     pub base_env: HashMap<String, String>,
     pub limits: Limits,
 }
 
 impl Config {
-    /// Read from the process environment. A missing `AEX_HAND_TOKEN` is not an error: the hand
+    /// Read from the process environment. A missing `HAND_TOKEN` is not an error: the Hand
     /// boots unarmed and waits for the `/run` lifecycle hook to deliver the session token. An
     /// unarmed hand refuses every `hello`, so it never accepts an unauthenticated brain.
     pub fn from_env() -> anyhow::Result<Self> {
@@ -49,8 +53,15 @@ impl Config {
                 .unwrap_or_else(|_| "/home/agent".into()),
         );
         let spill_dir =
-            PathBuf::from(std::env::var(ENV_SPILL_DIR).unwrap_or_else(|_| "/var/aex/ops".into()));
-        Ok(Self::new(listen, token, workspace, home, spill_dir))
+            PathBuf::from(std::env::var(ENV_SPILL_DIR).unwrap_or_else(|_| "/var/hand/ops".into()));
+        let mut config = Self::new(listen, token, workspace, home, spill_dir);
+        config.tool_dir =
+            PathBuf::from(std::env::var(ENV_TOOL_DIR).unwrap_or_else(|_| "/var/hand/tools".into()));
+        config.tool_runner = PathBuf::from(
+            std::env::var(ENV_TOOL_RUNNER)
+                .unwrap_or_else(|_| "/usr/local/lib/hand/tool-runner.mjs".into()),
+        );
+        Ok(config)
     }
 
     pub fn new(
@@ -60,6 +71,10 @@ impl Config {
         home: PathBuf,
         spill_dir: PathBuf,
     ) -> Self {
+        let tool_dir = spill_dir
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("tools");
         Self {
             listen,
             token,
@@ -67,13 +82,15 @@ impl Config {
             workspace,
             home,
             spill_dir,
+            tool_dir,
+            tool_runner: PathBuf::from("/usr/local/lib/hand/tool-runner.mjs"),
             limits: default_limits(),
         }
     }
 }
 
 /// The subset of the hand process's own environment that lanes inherit. Everything else
-/// (notably our own AEX_HAND_* settings) stays out of the agent's shell.
+/// (notably our own HAND_* settings) stays out of the agent's shell.
 fn base_env_from_process(home: &std::path::Path) -> HashMap<String, String> {
     const INHERIT: &[&str] = &[
         "PATH",

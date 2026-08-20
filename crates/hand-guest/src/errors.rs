@@ -1,6 +1,6 @@
 //! `AbiError` constructors. Every refusal the hand sends goes through here.
 
-use aex_contracts::abi::{AbiError, ErrorCode};
+use brain_protocol::abi::{AbiError, ErrorCode};
 use serde_json::{Map, Value};
 
 pub type AbiResult<T> = Result<T, AbiError>;
