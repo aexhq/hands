@@ -11,10 +11,10 @@ repository = "https://github.com/aexhq/hands"
 [workspace.dependencies]
 # Brain owns the protocol and Hand ports. All three packages resolve from one immutable source
 # identity so Hands can build without a sibling checkout and cannot drift across contracts.
-brain = { git = "https://github.com/aexhq/brain.git", rev = "ea73244489311cb3a11442c3a4306b289ec97ba7" }
-brain-protocol = { git = "https://github.com/aexhq/brain.git", rev = "ea73244489311cb3a11442c3a4306b289ec97ba7" }
-brain-hand-client = { git = "https://github.com/aexhq/brain.git", rev = "ea73244489311cb3a11442c3a4306b289ec97ba7" }
-brain-aws = { git = "https://github.com/aexhq/brain.git", rev = "ea73244489311cb3a11442c3a4306b289ec97ba7" }
+brain = { git = "https://github.com/aexhq/brain.git", rev = "e38094aa2916f1c7459835af745db7e173efa782" }
+brain-protocol = { git = "https://github.com/aexhq/brain.git", rev = "e38094aa2916f1c7459835af745db7e173efa782" }
+brain-hand-client = { git = "https://github.com/aexhq/brain.git", rev = "e38094aa2916f1c7459835af745db7e173efa782" }
+brain-aws = { git = "https://github.com/aexhq/brain.git", rev = "e38094aa2916f1c7459835af745db7e173efa782" }
 anyhow = "1"
 async-trait = "0.1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
