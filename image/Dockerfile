@@ -37,8 +37,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       procps coreutils bash \
     && rm -rf /var/lib/apt/lists/* \
     && case "$(dpkg --print-architecture)" in \
-         arm64) node_arch=arm64; node_sha=fff4078c69dc7a142de617d104105a599b324297380d382bc65c09f59e94abb8 ;; \
-         amd64) node_arch=x64; node_sha=d60acfe210e1159cb70604bde4de4d21435086938be895ff640c18f60c3f307 ;; \
+         arm64) node_arch=arm64; node_sha=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8 ;; \
+         amd64) node_arch=x64; node_sha=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307 ;; \
          *) echo "unsupported Node architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
        esac \
     && curl --fail --location --retry 5 \

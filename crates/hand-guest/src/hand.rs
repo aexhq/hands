@@ -72,6 +72,16 @@ enum SessionExecutable {
     Bundle(PathBuf),
 }
 
+struct BundleInvocation {
+    op: Arc<Operation>,
+    tool: String,
+    bundle: PathBuf,
+    input: Value,
+    env: HashMap<String, String>,
+    cwd: PathBuf,
+    session: Arc<Session>,
+}
+
 pub struct Hand {
     pub cfg: Config,
     pub generation_id: GenerationId,
@@ -679,8 +689,16 @@ impl Hand {
                     None
                 }
                 SessionExecutable::Bundle(bundle) => {
-                    hand.run_bundle_tool(&op2, &tool, &bundle, input, env, cwd, &session)
-                        .await;
+                    hand.run_bundle_tool(BundleInvocation {
+                        op: op2.clone(),
+                        tool,
+                        bundle,
+                        input,
+                        env,
+                        cwd,
+                        session,
+                    })
+                    .await;
                     None
                 }
             };
@@ -783,21 +801,21 @@ impl Hand {
         op.set_terminal(info);
     }
 
-    async fn run_bundle_tool(
-        &self,
-        op: &Arc<Operation>,
-        tool: &str,
-        bundle: &Path,
-        input: Value,
-        env: HashMap<String, String>,
-        cwd: PathBuf,
-        session: &Session,
-    ) {
+    async fn run_bundle_tool(&self, invocation: BundleInvocation) {
+        let BundleInvocation {
+            op,
+            tool,
+            bundle,
+            input,
+            env,
+            cwd,
+            session,
+        } = invocation;
         let Some(spec) = session
             .manifest
             .tools
             .iter()
-            .find(|spec| &*spec.name == tool)
+            .find(|spec| *spec.name == tool)
         else {
             let info = op.terminal_info(
                 Outcome::Failed,
@@ -840,7 +858,7 @@ impl Hand {
             op.clone(),
             NodeSpec {
                 runner: self.cfg.tool_runner.clone(),
-                bundle: bundle.to_path_buf(),
+                bundle,
                 request,
                 env,
                 cwd,
@@ -855,7 +873,7 @@ impl Hand {
             .infrastructure_error
             .map(|message| err(ErrorCode::Internal, message));
         let validation_error = output.as_ref().and_then(|value| {
-            session.validators.get(tool).and_then(|(_, validator)| {
+            session.validators.get(&tool).and_then(|(_, validator)| {
                 validator.iter_errors(value).next().map(|validation| {
                     format!("{tool} output{}: {validation}", validation.instance_path())
                 })

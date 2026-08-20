@@ -221,16 +221,16 @@ pub async fn run_node(op: Arc<Operation>, spec: NodeSpec) -> NodeFinished {
             };
         }
     };
-    if let Some(parent) = spec.request_path.parent() {
-        if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            return NodeFinished {
-                outcome: Outcome::Failed,
-                exit_code: None,
-                signal: None,
-                output: None,
-                infrastructure_error: Some(format!("prepare tool request directory: {error}")),
-            };
-        }
+    if let Some(parent) = spec.request_path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        return NodeFinished {
+            outcome: Outcome::Failed,
+            exit_code: None,
+            signal: None,
+            output: None,
+            infrastructure_error: Some(format!("prepare tool request directory: {error}")),
+        };
     }
     if let Err(error) = tokio::fs::write(&spec.request_path, request).await {
         return NodeFinished {
