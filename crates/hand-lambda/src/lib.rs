@@ -23,8 +23,8 @@ pub mod control;
 pub mod image;
 pub mod launch;
 
-/// The one region hands run in for MVP.
-pub const REGION: &str = "eu-west-1";
+/// The default region for the hosted Hand image line.
+pub const REGION: &str = "us-east-1";
 
 /// The single guest port: lifecycle hooks, probe, and the ABI WebSocket. Matches the port the
 /// image registration declares and the endpoint auth token is scoped to.
