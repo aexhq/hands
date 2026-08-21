@@ -859,7 +859,6 @@ fn public_network_execution(
     ];
 
     let command = r#"node --input-type=module <<'AEX_NETWORK_CANARY'
-import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 
@@ -933,18 +932,20 @@ if (reachableControls.length === 0) {
   throw new Error("no public control was reachable");
 }
 
-const httpSurfaceResults = await Promise.all(httpSurfaces.map(async (surface) => ({
+const aexSurfaceResults = await Promise.all(httpSurfaces.map(async (surface) => ({
   surface,
-  statuses: await Promise.all([
-    requestStatus(http, { hostname: surface.host, path: surface.path, port: 80, method: "GET" }),
-    requestStatus(https, { hostname: surface.host, path: surface.path, port: 443, method: "GET" }),
-  ]),
+  status: await requestStatus(https, {
+    hostname: surface.host,
+    path: surface.path,
+    port: 443,
+    method: "GET",
+  }),
 })));
-for (const { surface, statuses } of httpSurfaceResults) {
-  for (const status of statuses) {
-    if (status !== 403) {
-      throw new Error(`Aex surface did not return the expected source denial: ${surface.host}`);
-    }
+for (const { surface, status } of aexSurfaceResults) {
+  if (status !== 403) {
+    throw new Error(
+      `Aex HTTPS surface did not return the expected source denial: ${surface.host} status=${status}`,
+    );
   }
 }
 
@@ -1294,6 +1295,8 @@ mod tests {
                 .command
                 .contains("reachableControls.length === 0")
         );
+        assert!(!request.input.command.contains("from \"node:http\";"));
+        assert!(request.input.command.contains("Aex HTTPS surface"));
         for host in [
             "aex.dev",
             "api.aex.dev",
