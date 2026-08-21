@@ -15,6 +15,7 @@ use brain_protocol::hand::{
     SubmitRequest, WriteStdinReceipt, WriteStdinRequest,
 };
 use hand_core::connector::ConnectorClass;
+use hand_core::materialization::ControlToken;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
 
@@ -30,8 +31,11 @@ pub const MAX_INSTALL_BODY_BYTES: usize = MAX_BUNDLE_INSTALL_BYTES + MAX_INSTALL
 pub const MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 pub const OBJECT_METADATA_HEADER: &str = "x-aex-object-metadata";
 pub const FILE_ENTRY_HEADER: &str = "x-aex-file-entry";
+pub const CONTROL_AUTH_HEADER: &str = "x-aex-hand-control";
 
-/// The provider run-hook payload. It contains no cloud credential or control-plane token.
+/// The provider run-hook payload. It contains no cloud credential. Its generation-scoped control
+/// bearer authenticates the trusted host after the provider proxy and must never enter logs,
+/// formatting, argv, Tool environments, or public Brain projections.
 ///
 /// An allowlist capability is intentionally visible to the sandbox generation. It is a sealed
 /// destination grant, not an Aex credential, and must still never appear in logs or process argv.
@@ -47,6 +51,7 @@ pub struct RunPayload {
     pub resource_class: String,
     pub resources: ResourceCeiling,
     pub network: NetworkCeiling,
+    pub control_token: ControlToken,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowlist_proxy: Option<AllowlistProxy>,
     /// Internal image-promotion canary only. Production Hands always send `None`. When present,

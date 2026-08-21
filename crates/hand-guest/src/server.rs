@@ -6,18 +6,20 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Json};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use brain_protocol::contract::HAND_CONTRACT_DIGEST;
 use futures_util::StreamExt;
 use hand_wire::{
-    FILE_ENTRY_HEADER, InstallBindingRequest, InstallBundleMetadata, InstallObjectMetadata,
-    InstallSecretsRequest, MAX_INSTALL_BODY_BYTES, MAX_OBJECT_BYTES, MAX_WIRE_FRAME_BYTES,
-    OBJECT_METADATA_HEADER, RequestCall, RequestFrame, ResponseFrame, ResponseReply,
+    CONTROL_AUTH_HEADER, FILE_ENTRY_HEADER, InstallBindingRequest, InstallBundleMetadata,
+    InstallObjectMetadata, InstallSecretsRequest, MAX_INSTALL_BODY_BYTES, MAX_OBJECT_BYTES,
+    MAX_WIRE_FRAME_BYTES, OBJECT_METADATA_HEADER, RequestCall, RequestFrame, ResponseFrame,
+    ResponseReply,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -27,6 +29,8 @@ use tokio_util::io::ReaderStream;
 use crate::errors::invalid;
 use crate::hand::Hand;
 use crate::hooks;
+
+const CONTROL_AUTH_PROTOCOL_PREFIX: &str = "aex-hand-control.";
 
 pub struct Server {
     listener: TcpListener,
@@ -50,13 +54,18 @@ impl Server {
             .route("/run", post(hooks::run))
             .route("/ready", post(hooks::ready))
             .route("/validate", post(hooks::validate));
-        let app = Router::new()
+        let protected = Router::new()
             .route("/", get(root))
             .route("/internal/bundles/{digest}", post(install_bundle))
             .route("/internal/objects/{digest}", post(install_object))
             .route("/internal/files/export", post(export_file))
             .route("/internal/bindings", post(install_binding))
             .route("/internal/secrets", post(install_secrets))
+            .layer(middleware::from_fn_with_state(
+                self.hand.clone(),
+                require_control,
+            ));
+        let app = protected
             .nest(hooks::HOOK_PREFIX, hooks)
             .layer(DefaultBodyLimit::max(MAX_INSTALL_BODY_BYTES))
             .with_state(self.hand);
@@ -67,6 +76,44 @@ impl Server {
         axum::serve(listener, app).await?;
         Ok(())
     }
+}
+
+async fn require_control(State(hand): State<Arc<Hand>>, request: Request, next: Next) -> Response {
+    let candidate = control_candidate(request.headers());
+    if !hand.control_authorized(candidate).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
+fn control_candidate(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(CONTROL_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|protocols| {
+                    protocols
+                        .split(',')
+                        .map(str::trim)
+                        .find_map(|protocol| protocol.strip_prefix(CONTROL_AUTH_PROTOCOL_PREFIX))
+                })
+        })
+}
+
+fn control_protocol(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|protocols| {
+            protocols
+                .split(',')
+                .map(str::trim)
+                .find(|protocol| protocol.starts_with(CONTROL_AUTH_PROTOCOL_PREFIX))
+        })
+        .map(str::to_owned)
 }
 
 struct MaybeWs(Option<WebSocketUpgrade>);
@@ -83,12 +130,22 @@ impl<S: Send + Sync> FromRequestParts<S> for MaybeWs {
     }
 }
 
-async fn root(State(hand): State<Arc<Hand>>, MaybeWs(ws): MaybeWs) -> axum::response::Response {
+async fn root(
+    State(hand): State<Arc<Hand>>,
+    headers: HeaderMap,
+    MaybeWs(ws): MaybeWs,
+) -> axum::response::Response {
     match ws {
-        Some(upgrade) => upgrade
-            .max_message_size(MAX_WIRE_FRAME_BYTES)
-            .max_frame_size(MAX_WIRE_FRAME_BYTES)
-            .on_upgrade(move |socket| serve_connection(hand, socket)),
+        Some(upgrade) => {
+            let upgrade = match control_protocol(&headers) {
+                Some(protocol) => upgrade.protocols([protocol]),
+                None => upgrade,
+            };
+            upgrade
+                .max_message_size(MAX_WIRE_FRAME_BYTES)
+                .max_frame_size(MAX_WIRE_FRAME_BYTES)
+                .on_upgrade(move |socket| serve_connection(hand, socket))
+        }
         None => Json(serde_json::json!({
             "service": "hand",
             "contract_digest": HAND_CONTRACT_DIGEST.trim(),

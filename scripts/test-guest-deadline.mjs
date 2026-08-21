@@ -3,11 +3,11 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 
 const authority = "http://127.0.0.1:8080";
-const root = await fetch(`${authority}/`).then((response) => response.json());
-assert.match(root.contract_digest, /^[0-9a-f]{64}$/u);
+const handContractDigest = "61dbf587fc4b908610744df6ca319c9bd3d5884ba6ad40bebba5a28672af9100";
+const controlToken = `control-${"a".repeat(64)}`;
 
 const payload = {
-  contract_digest: root.contract_digest,
+  contract_digest: handContractDigest,
   generation: "generation-ci",
   expires_at_ms: Date.now() + 60_000,
   root_id: "root-ci",
@@ -16,6 +16,7 @@ const payload = {
   resource_class: "microvm-1gb",
   resources: { max_output_bytes: 65536, timeout_ms: 60000 },
   network: { kind: "none" },
+  control_token: controlToken,
 };
 const armed = await fetch(`${authority}/aws/lambda-microvms/runtime/v1/run`, {
   method: "POST",
@@ -24,7 +25,17 @@ const armed = await fetch(`${authority}/aws/lambda-microvms/runtime/v1/run`, {
 });
 assert.equal(armed.status, 200, await armed.text());
 
-const socket = new WebSocket("ws://127.0.0.1:8080/");
+const deniedRoot = await fetch(`${authority}/`);
+assert.equal(deniedRoot.status, 401);
+const root = await fetch(`${authority}/`, {
+  headers: { "x-aex-hand-control": controlToken },
+}).then((response) => response.json());
+assert.equal(root.contract_digest, handContractDigest);
+
+const socket = new WebSocket(
+  "ws://127.0.0.1:8080/",
+  [`aex-hand-control.${controlToken}`],
+);
 await new Promise((resolve, reject) => {
   socket.addEventListener("open", resolve, { once: true });
   socket.addEventListener("error", reject, { once: true });
@@ -53,7 +64,7 @@ async function call(method, params) {
   });
   socket.send(JSON.stringify({
     request_id: requestId,
-    contract_digest: root.contract_digest,
+    contract_digest: handContractDigest,
     call: { method, params },
   }));
   return response;
@@ -314,7 +325,7 @@ export default {
     uid: process.getuid(),
     controlPort: await fetch("http://127.0.0.1:8080/", {
       signal: AbortSignal.timeout(1000),
-    }).then(() => "reachable", () => "denied"),
+    }).then((response) => response.status === 401 ? "denied" : "reachable", () => "denied"),
     probes: Object.fromEntries(await Promise.all(
       Object.entries(targets).map(async ([name, pid]) => [name, await probe(pid)]),
     )),
@@ -652,7 +663,10 @@ async function waitForFile(path) {
 async function postInstall(path, body, contentType = "application/json") {
   const response = await fetch(`${authority}${path}`, {
     method: "POST",
-    headers: { "content-type": contentType },
+    headers: {
+      "content-type": contentType,
+      "x-aex-hand-control": controlToken,
+    },
     body: contentType === "application/json" ? JSON.stringify(body) : body,
   });
   const result = await response.text();

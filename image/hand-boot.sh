@@ -1,21 +1,18 @@
 #!/bin/sh
-# Kernel-owned separation between the trusted Hand supervisor and every Tool uid.
+# Root boot boundary for the trusted Hand supervisor and every Tool uid.
 set -eu
 
-# A Tool shares the VM network namespace, so provider ingress authentication is not sufficient:
-# reject its packets before they can reach any supervisor listener address. Also reject replies
-# sourced from the control port: a background Tool must not impersonate the endpoint if the
-# supervisor dies and releases the listener.
-nft add table inet aex_hand
-nft 'add chain inet aex_hand output { type filter hook output priority 0; policy accept; }'
-nft add rule inet aex_hand output tcp sport 8080 meta skuid != 1001 reject
-nft add rule inet aex_hand output oifname "lo" tcp dport 8080 meta skuid != 1001 reject
-for address in $(ip -o -4 address show | awk '{print $4}' | cut -d/ -f1); do
-  nft add rule inet aex_hand output ip daddr "$address"/32 tcp dport 8080 meta skuid != 1001 reject
-done
+# Reserve the provider's fixed listener port. Only the root-owned supervisor binary carries the
+# narrow bind capability, so a background Tool cannot impersonate the endpoint after a crash.
+# Tool access to a live listener is independently rejected by its generation-scoped bearer.
+unprivileged_port_start=$(( 8080 + 1 ))
+if [ "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" != "$unprivileged_port_start" ]; then
+  printf '%s\n' "$unprivileged_port_start" > /proc/sys/net/ipv4/ip_unprivileged_port_start
+fi
+test "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "$unprivileged_port_start"
 
 # A Tool needs neither user nor network namespaces. Disable their unprivileged creation where the
-# kernel exposes the controls; the UID firewall is still authoritative when a key is unavailable.
+# kernel exposes the controls.
 if [ -w /proc/sys/kernel/unprivileged_userns_clone ]; then
   printf '0\n' > /proc/sys/kernel/unprivileged_userns_clone
 fi

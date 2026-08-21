@@ -44,7 +44,7 @@ use brain_protocol::network::network_ceiling_is_subset;
 use futures_util::StreamExt as _;
 use hand_core::connector::{ConnectorCatalog, ConnectorClass, GatewayAuthority};
 use hand_core::materialization::{
-    AcquireTarget, DurableLaunchRequest, DurableTargetRegistry, DurableTargetState,
+    AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetRegistry, DurableTargetState,
     InstalledTarget, LaunchError, MaterializationError, MaterializationLease, PhysicalTarget,
     PhysicalTargetLauncher, TargetKey, TargetMaterializer, TargetSpec,
 };
@@ -907,19 +907,19 @@ impl AwsHand {
                     &prep.request.network,
                     RESOURCE_CLASS,
                 )?;
-                Ok(InstalledTarget {
-                    key: TargetKey::default(envelope.root_id.as_str())
-                        .map_err(materialization_error)?,
-                    spec_digest: spec.digest(),
-                    spec,
-                    target_ref: target_ref.as_str().into(),
-                    generation: generation.as_str().into(),
-                    installed_at_ms: 0,
-                    // Established operation routing is deliberately registry-free. The guest's
-                    // armed target owns the authoritative receipt expiry; this synthetic value is
-                    // used only to fence a provider-gone transition.
-                    expires_at_ms: u64::MAX,
-                })
+                // The provider JWE authenticates public ingress, while the installed target row
+                // owns the generation bearer that authenticates the supervisor inside the shared
+                // guest network namespace. Resolve that durable row even for an established
+                // operation so a restarted Hand never invents or loses the bearer.
+                let installed = self
+                    .resolve_target(&default_target(envelope)?, Some(generation.as_str()))
+                    .await?;
+                if installed.target_ref != target_ref.as_str()
+                    || installed.spec_digest != spec.digest()
+                {
+                    return Err(generation_error());
+                }
+                Ok(installed)
             }
             (None, None) => {
                 let prep = self.preparation(envelope.session_id.as_str()).await?;
@@ -1052,7 +1052,7 @@ impl AwsHand {
             self.plane
                 .guest
                 .post_blob(
-                    &route.target_ref,
+                    route,
                     &format!("/internal/bundles/{}", descriptor.bundle_digest.as_str()),
                     &InstallBundleMetadata {
                         descriptor: descriptor.clone(),
@@ -1063,7 +1063,7 @@ impl AwsHand {
             self.plane
                 .guest
                 .post_json(
-                    &route.target_ref,
+                    route,
                     "/internal/bindings",
                     &InstallBindingRequest {
                         binding_ref: envelope.binding_ref.to_string(),
@@ -1095,7 +1095,7 @@ impl AwsHand {
         self.plane
             .guest
             .post_file(
-                &route.target_ref,
+                route,
                 &format!("/internal/objects/{}", object.sha256.as_str()),
                 &InstallObjectMetadata {
                     object: object.clone(),
@@ -1246,7 +1246,7 @@ impl AwsHand {
         let result = self
             .plane
             .guest
-            .post_json(&route.target_ref, "/internal/secrets", payload)
+            .post_json(route, "/internal/secrets", payload)
             .await;
         zeroize_secret_values(&mut payload.values);
         result
@@ -1407,7 +1407,7 @@ impl AwsHand {
         installed: &InstalledTarget,
         call: RequestCall,
     ) -> HandResult<ResponseReply> {
-        let result = self.plane.guest.rpc(&installed.target_ref, call).await;
+        let result = self.plane.guest.rpc(installed, call).await;
         self.settle_guest_result(installed, result).await
     }
 
@@ -1423,10 +1423,7 @@ impl AwsHand {
     ) -> HandResult<ResponseReply> {
         self.plane
             .guest
-            .rpc(
-                &installed.target_ref,
-                RequestCall::Submit(Box::new(request)),
-            )
+            .rpc(installed, RequestCall::Submit(Box::new(request)))
             .await
             .map_err(classify_submit_delivery_error)
     }
@@ -1872,12 +1869,7 @@ impl SessionPreparationPort for AwsHand {
                     let installed = match self
                         .plane
                         .registry
-                        .install(
-                            &recovered_lease,
-                            &physical.target_ref,
-                            &physical.generation,
-                            now_ms(),
-                        )
+                        .install(&recovered_lease, &physical, now_ms())
                         .await
                         .map_err(materialization_error)?
                     {
@@ -2167,11 +2159,7 @@ impl SandboxFilesPort for AwsHand {
                     ObjectTransferAuthorityMethod::Put,
                     0,
                 )?;
-                let result = self
-                    .plane
-                    .guest
-                    .export_file(&installed.target_ref, &read)
-                    .await;
+                let result = self.plane.guest.export_file(&installed, &read).await;
                 let (mut file, response) = self.settle_guest_result(&installed, result).await?;
                 let staged = stage_response(
                     response,
@@ -2436,6 +2424,11 @@ impl GenerationLauncher {
             resource_class: self.resource_class.clone(),
             resources: self.resources.clone(),
             network: self.network.clone(),
+            control_token: ControlToken::new(format!(
+                "control-{}",
+                hex::encode(rand::random::<[u8; 32]>())
+            ))
+            .expect("random control token satisfies its exact grammar"),
             allowlist_proxy,
             canary_exit_after_operation_id: None,
         };
@@ -2554,6 +2547,9 @@ fn recovery_launch_error(error_value: LaunchError) -> MaterializationError {
 impl PhysicalTargetLauncher for GenerationLauncher {
     async fn launch(&self, lease: &MaterializationLease) -> Result<PhysicalTarget, LaunchError> {
         let sealed = self.decode_launch(lease)?;
+        let control_token = serde_json::from_str::<RunPayload>(&sealed.request.run_hook_payload)
+            .map_err(|_| LaunchError::OutcomeUnknown("durable run payload is corrupt".into()))?
+            .control_token;
         admit_provider_dispatch(lease, sealed.dispatch_deadline_at_ms, now_ms())?;
         let hand = launch::launch_exact(&self.plane.control, &sealed.request)
             .await
@@ -2579,7 +2575,7 @@ impl PhysicalTargetLauncher for GenerationLauncher {
                     LaunchError::KnownNoTarget(message)
                 }
             })?;
-        PhysicalTarget::new(hand.microvm_id, lease.generation.clone())
+        PhysicalTarget::new(hand.microvm_id, lease.generation.clone(), control_token)
             .map_err(|error| LaunchError::OutcomeUnknown(error.to_string()))
     }
 

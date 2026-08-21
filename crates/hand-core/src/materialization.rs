@@ -24,6 +24,70 @@ pub const MAX_TARGET_PAGE: usize = 100;
 /// outage even though the installed target is normally visible within seconds.
 pub const MAX_MATERIALIZATION_POLL_MS: u64 = 1_000;
 pub const MAX_DURABLE_LAUNCH_REQUEST_BYTES: usize = 64 * 1024;
+const CONTROL_TOKEN_PREFIX: &str = "control-";
+const CONTROL_TOKEN_HEX_BYTES: usize = 32;
+
+/// Generation-scoped bearer for the in-guest supervisor channel. The provider JWE authenticates
+/// traffic at the public MicroVM endpoint, but an untrusted Tool shares the guest network
+/// namespace and can bypass that proxy. This second bearer is delivered only in the sealed run
+/// payload and retained with the installed routing row. It is never exposed through Brain's
+/// public Hand contract, formatting, logs, or Tool environments.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlToken(String);
+
+impl ControlToken {
+    pub fn new(value: impl Into<String>) -> Result<Self, MaterializationError> {
+        let value = value.into();
+        let Some(hex) = value.strip_prefix(CONTROL_TOKEN_PREFIX) else {
+            return Err(MaterializationError::InvalidControlToken);
+        };
+        if hex.len() != CONTROL_TOKEN_HEX_BYTES * 2
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(MaterializationError::InvalidControlToken);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ControlToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ControlToken([redacted])")
+    }
+}
+
+impl serde::Serialize for ControlToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ControlToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+impl Drop for ControlToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 /// Exact provider request retained only while a target is materializing. It can contain a
 /// short-lived private-network bearer, so formatting is always redacted and dropped storage is
@@ -203,6 +267,7 @@ pub struct InstalledTarget {
     pub spec_digest: String,
     pub target_ref: String,
     pub generation: String,
+    pub control_token: ControlToken,
     pub installed_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -236,6 +301,7 @@ pub enum DurableTargetState {
     },
     Installed {
         target_ref: String,
+        control_token: ControlToken,
         installed_at_ms: u64,
         expires_at_ms: u64,
     },
@@ -293,6 +359,7 @@ impl DurableTargetRecord {
                 target_ref,
                 installed_at_ms,
                 expires_at_ms,
+                ..
             } => {
                 validate_identifier(target_ref, "target_ref")?;
                 if *expires_at_ms == 0 || *expires_at_ms < *installed_at_ms {
@@ -309,6 +376,7 @@ impl DurableTargetRecord {
     pub fn installed(&self) -> Option<InstalledTarget> {
         let DurableTargetState::Installed {
             target_ref,
+            control_token,
             installed_at_ms,
             expires_at_ms,
         } = &self.state
@@ -321,6 +389,7 @@ impl DurableTargetRecord {
             spec_digest: self.spec_digest.clone(),
             target_ref: target_ref.clone(),
             generation: self.generation.clone(),
+            control_token: control_token.clone(),
             installed_at_ms: *installed_at_ms,
             expires_at_ms: *expires_at_ms,
         })
@@ -441,8 +510,7 @@ pub trait DurableTargetRegistry: Send + Sync {
     async fn install(
         &self,
         lease: &MaterializationLease,
-        target_ref: &str,
-        target_generation: &str,
+        target: &PhysicalTarget,
         now_ms: u64,
     ) -> Result<InstallOutcome, MaterializationError>;
 
@@ -485,12 +553,14 @@ pub trait DurableTargetRegistry: Send + Sync {
 pub struct PhysicalTarget {
     pub target_ref: String,
     pub generation: String,
+    pub control_token: ControlToken,
 }
 
 impl PhysicalTarget {
     pub fn new(
         target_ref: impl Into<String>,
         generation: impl Into<String>,
+        control_token: ControlToken,
     ) -> Result<Self, MaterializationError> {
         let target_ref = target_ref.into();
         let generation = generation.into();
@@ -499,6 +569,7 @@ impl PhysicalTarget {
         Ok(Self {
             target_ref,
             generation,
+            control_token,
         })
     }
 }
@@ -611,12 +682,7 @@ where
 
         match self
             .registry
-            .install(
-                &lease,
-                &physical.target_ref,
-                &physical.generation,
-                request.now_ms,
-            )
+            .install(&lease, &physical, request.now_ms)
             .await?
         {
             InstallOutcome::Installed(target) => Ok(target),
@@ -760,12 +826,11 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
     async fn install(
         &self,
         lease: &MaterializationLease,
-        target_ref: &str,
-        target_generation: &str,
+        target: &PhysicalTarget,
         now_ms: u64,
     ) -> Result<InstallOutcome, MaterializationError> {
-        validate_identifier(target_ref, "target_ref")?;
-        validate_identifier(target_generation, "generation")?;
+        validate_identifier(&target.target_ref, "target_ref")?;
+        validate_identifier(&target.generation, "generation")?;
         let mut records = self.records.lock().map_err(|_| poisoned())?;
         let Some(record) = records.get_mut(&lease.key) else {
             return Ok(InstallOutcome::ReservationLost);
@@ -778,11 +843,12 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
                 if reservation_id == &lease.reservation_id =>
             {
                 record.state = DurableTargetState::Installed {
-                    target_ref: target_ref.into(),
+                    target_ref: target.target_ref.clone(),
+                    control_token: target.control_token.clone(),
                     installed_at_ms: now_ms,
                     expires_at_ms: lease.target_expires_at_ms,
                 };
-                record.generation = target_generation.into();
+                record.generation = target.generation.clone();
                 record.updated_at_ms = now_ms;
                 Ok(InstallOutcome::Installed(
                     record.installed().expect("installed state projects"),
@@ -790,10 +856,16 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
             }
             DurableTargetState::Installed {
                 target_ref: existing,
+                control_token,
                 ..
-            } if existing == target_ref && record.generation == target_generation => Ok(
-                InstallOutcome::Installed(record.installed().expect("installed state projects")),
-            ),
+            } if existing == &target.target_ref
+                && control_token == &target.control_token
+                && record.generation == target.generation =>
+            {
+                Ok(InstallOutcome::Installed(
+                    record.installed().expect("installed state projects"),
+                ))
+            }
             _ => Ok(InstallOutcome::ReservationLost),
         }
     }
@@ -1075,6 +1147,8 @@ pub enum MaterializationError {
     InvalidLease,
     #[error("durable provider launch request is empty or exceeds its sealed byte bound")]
     InvalidLaunchRequest,
+    #[error("generation control token is outside its exact secret boundary")]
+    InvalidControlToken,
     #[error("only the default target may be replaced after confirmed loss")]
     InvalidReplacement,
     #[error("target materialized memory must be a positive bounded MiB value")]
@@ -1141,6 +1215,14 @@ mod tests {
         .unwrap()
     }
 
+    fn control_token() -> ControlToken {
+        ControlToken::new(format!("control-{}", "a".repeat(64))).expect("test control token")
+    }
+
+    fn physical(target_ref: impl Into<String>, generation: impl Into<String>) -> PhysicalTarget {
+        PhysicalTarget::new(target_ref, generation, control_token()).expect("test physical target")
+    }
+
     fn request(now_ms: u64, reservation: &str, generation: &str) -> AcquireTarget {
         AcquireTarget {
             key: TargetKey::default("root-1").unwrap(),
@@ -1165,8 +1247,9 @@ mod tests {
         let AcquireOutcome::Acquired(lease) = registry.acquire(&first).await.unwrap() else {
             panic!("first call must acquire")
         };
+        let target = physical("mvm-1", "guest-generation-1");
         let InstallOutcome::Installed(installed) = registry
-            .install(&lease, "mvm-1", "guest-generation-1", first.now_ms)
+            .install(&lease, &target, first.now_ms)
             .await
             .unwrap()
         else {
@@ -1192,7 +1275,7 @@ mod tests {
         let AcquireOutcome::Acquired(_old_lease) = registry.acquire(&first).await.unwrap() else {
             panic!("first worker acquires")
         };
-        let orphan = PhysicalTarget::new("mvm-idle-orphan", "guest-generation-old").unwrap();
+        let orphan = physical("mvm-idle-orphan", "guest-generation-old");
         // Crash here: RunMicrovm returned, but no install CAS and therefore no code path has the
         // InstalledTarget proof accepted by the dispatcher.
         assert_eq!(effects.load(Ordering::SeqCst), 0);
@@ -1214,13 +1297,9 @@ mod tests {
         let AcquireOutcome::Acquired(new_lease) = registry.acquire(&third).await.unwrap() else {
             panic!("guarded lease may be reclaimed only after its possible target lifetime")
         };
+        let target = physical("mvm-routable", "guest-generation-new");
         let InstallOutcome::Installed(installed) = registry
-            .install(
-                &new_lease,
-                "mvm-routable",
-                "guest-generation-new",
-                third.now_ms,
-            )
+            .install(&new_lease, &target, third.now_ms)
             .await
             .unwrap()
         else {
@@ -1254,6 +1333,7 @@ mod tests {
                 let target = PhysicalTarget::new(
                     format!("mvm-{}", self.creations.fetch_add(1, Ordering::SeqCst) + 1),
                     lease.generation.clone(),
+                    control_token(),
                 )
                 .unwrap();
                 targets.insert(
@@ -1289,12 +1369,7 @@ mod tests {
         assert_eq!(recovered_target, first_target);
         assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
         let InstallOutcome::Installed(installed) = registry
-            .install(
-                &recovery_lease,
-                &recovered_target.target_ref,
-                &recovered_target.generation,
-                retry.now_ms,
-            )
+            .install(&recovery_lease, &recovered_target, retry.now_ms)
             .await
             .unwrap()
         else {
@@ -1423,21 +1498,18 @@ mod tests {
         let AcquireOutcome::Acquired(new) = registry.acquire(&second).await.unwrap() else {
             panic!("second worker takes expired lease")
         };
+        let stale_target = physical("mvm-stale", "guest-generation-stale");
         assert_eq!(
             registry
-                .install(&old, "mvm-stale", "guest-generation-stale", second.now_ms,)
+                .install(&old, &stale_target, second.now_ms)
                 .await
                 .unwrap(),
             InstallOutcome::ReservationLost
         );
+        let current_target = physical("mvm-current", "guest-generation-current");
         assert!(matches!(
             registry
-                .install(
-                    &new,
-                    "mvm-current",
-                    "guest-generation-current",
-                    second.now_ms,
-                )
+                .install(&new, &current_target, second.now_ms)
                 .await
                 .unwrap(),
             InstallOutcome::Installed(_)
@@ -1451,8 +1523,9 @@ mod tests {
         let AcquireOutcome::Acquired(lease) = registry.acquire(&first).await.unwrap() else {
             panic!("first worker acquires")
         };
+        let target = physical("mvm-1", "guest-generation-1");
         let InstallOutcome::Installed(installed) = registry
-            .install(&lease, "mvm-1", "guest-generation-1", first.now_ms)
+            .install(&lease, &target, first.now_ms)
             .await
             .unwrap()
         else {
@@ -1478,8 +1551,9 @@ mod tests {
         let AcquireOutcome::Acquired(lease) = registry.acquire(&request).await.unwrap() else {
             panic!("first worker acquires")
         };
+        let target = physical("mvm-1", "guest-generation-1");
         let InstallOutcome::Installed(_installed) = registry
-            .install(&lease, "mvm-1", "guest-generation-1", request.now_ms)
+            .install(&lease, &target, request.now_ms)
             .await
             .unwrap()
         else {
@@ -1552,10 +1626,9 @@ mod tests {
             })
         ));
 
-        let InstallOutcome::Installed(installed) = registry
-            .install(&first_lease, "mvm-1", "guest-generation-1", 2)
-            .await
-            .unwrap()
+        let target = physical("mvm-1", "guest-generation-1");
+        let InstallOutcome::Installed(installed) =
+            registry.install(&first_lease, &target, 2).await.unwrap()
         else {
             panic!("first target installs")
         };
@@ -1589,13 +1662,9 @@ mod tests {
             let AcquireOutcome::Acquired(lease) = registry.acquire(&target).await.unwrap() else {
                 panic!("abandoned target reserves")
             };
+            let physical = physical(format!("mvm-{index}"), format!("guest-generation-{index}"));
             let InstallOutcome::Installed(installed) = registry
-                .install(
-                    &lease,
-                    &format!("mvm-{index}"),
-                    &format!("guest-generation-{index}"),
-                    target.now_ms,
-                )
+                .install(&lease, &physical, target.now_ms)
                 .await
                 .unwrap()
             else {
@@ -1632,8 +1701,9 @@ mod tests {
         let AcquireOutcome::Acquired(lease) = registry.acquire(&first).await.unwrap() else {
             panic!("first create reserves")
         };
+        let target = physical("mvm-1", "generation-1");
         registry
-            .install(&lease, "mvm-1", "generation-1", first.now_ms)
+            .install(&lease, &target, first.now_ms)
             .await
             .unwrap();
 
@@ -1676,8 +1746,9 @@ mod tests {
         let AcquireOutcome::Acquired(lease) = registry.acquire(&first).await.unwrap() else {
             panic!("first worker acquires")
         };
+        let target = physical("mvm-1", "guest-generation-1");
         let InstallOutcome::Installed(installed) = registry
-            .install(&lease, "mvm-1", "guest-generation-1", first.now_ms)
+            .install(&lease, &target, first.now_ms)
             .await
             .unwrap()
         else {
@@ -1706,8 +1777,9 @@ mod tests {
         let AcquireOutcome::Acquired(lease) = registry.acquire(&first).await.unwrap() else {
             panic!("first worker acquires")
         };
+        let target = physical("mvm-1", "guest-generation-1");
         let InstallOutcome::Installed(installed) = registry
-            .install(&lease, "mvm-1", "guest-generation-1", first.now_ms)
+            .install(&lease, &target, first.now_ms)
             .await
             .unwrap()
         else {
@@ -1733,6 +1805,25 @@ mod tests {
         assert!(TargetKey::default("A._:-9").is_ok());
         for invalid in ["", "-starts-wrong", "has space", "é", &"a".repeat(129)] {
             assert!(TargetKey::default(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn control_tokens_are_exact_and_never_debug_formatted() {
+        let raw = format!("control-{}", "c".repeat(64));
+        let token = ControlToken::new(raw.clone()).unwrap();
+        assert_eq!(token.expose(), raw);
+        assert_eq!(format!("{token:?}"), "ControlToken([redacted])");
+        for invalid in [
+            String::new(),
+            format!("control-{}", "c".repeat(63)),
+            format!("control-{}", "C".repeat(64)),
+            format!("wrong-{}", "c".repeat(64)),
+        ] {
+            assert_eq!(
+                ControlToken::new(invalid).unwrap_err(),
+                MaterializationError::InvalidControlToken
+            );
         }
     }
 }

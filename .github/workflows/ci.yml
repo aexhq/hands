@@ -139,7 +139,7 @@ jobs:
           docker run --rm --entrypoint sh --user 0:0 hand:ci -ceu '
             test -z "$(find / -xdev -type f -perm /6000 -print -quit)"
             capabilities=$(getcap -r / 2>/dev/null || true)
-            test "$capabilities" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+            test "$capabilities" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid,cap_net_bind_service=ep"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/tool-boundary.so)" = "0:0:555"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/proc-secret-static)" = "0:0:555"
             ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP
@@ -160,19 +160,22 @@ jobs:
           gzip -dc hand-ci-image/hand-ci.tar.gz | docker load
       - name: Prove Tool identities cannot reach supervisor control
         run: |
-          CID=$(docker run -d --rm --cap-add NET_ADMIN -p 8080:8080 hand:ci)
+          for uid in 1000:1000 65536:1000; do
+            docker run --rm --entrypoint node --user "$uid" \
+              --sysctl net.ipv4.ip_unprivileged_port_start=8081 \
+              -v "$PWD/scripts/test-control-boundary.mjs:/tmp/test-control-boundary.mjs:ro" \
+              hand:ci /tmp/test-control-boundary.mjs --bind
+          done
+          CID=$(docker run -d --rm \
+            --sysctl net.ipv4.ip_unprivileged_port_start=8081 \
+            -p 8080:8080 hand:ci)
           trap 'docker logs "$CID"; docker stop "$CID" >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && { exec 3>&-; sleep 1; break; }; sleep 0.5; done
-          curl --fail --silent http://127.0.0.1:8080/ >/dev/null
-          docker exec --user 0:0 "$CID" sh -ceu '
-            rules=$(nft list chain inet aex_hand output)
-            printf "%s\n" "$rules" | grep -F "tcp sport 8080"
-            printf "%s\n" "$rules" | grep -F "oifname \"lo\" tcp dport 8080"
-            printf "%s\n" "$rules" | grep -F "skuid != 1001"
-          '
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/)" = 401
           docker cp scripts/test-control-boundary.mjs "$CID":/tmp/test-control-boundary.mjs
           docker exec --user 1000:1000 "$CID" node /tmp/test-control-boundary.mjs
           docker cp scripts/test-guest-deadline.mjs "$CID":/tmp/test-guest-deadline.mjs
+          docker exec --user 0:0 "$CID" sh -c 'chown 1001:1001 /tmp/test-guest-deadline.mjs && chmod 0400 /tmp/test-guest-deadline.mjs'
           docker exec --user 1001:1000 "$CID" node /tmp/test-guest-deadline.mjs
           docker stop "$CID" >/dev/null
           trap - EXIT

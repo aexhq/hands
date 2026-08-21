@@ -122,11 +122,12 @@ mod tests {
     use hand_wire::{RunEnvelope, RunPayload};
 
     #[test]
-    fn provider_envelope_carries_a_closed_secret_free_payload() {
-        let body = r#"{"microvmId":"mvm-abc","runHookPayload":"{\"contract_digest\":\"d\",\"generation\":\"g\",\"expires_at_ms\":1,\"root_id\":\"r\",\"owner_session_id\":\"s\",\"connector\":\"none\",\"resource_class\":\"small\",\"resources\":{\"max_output_bytes\":1,\"timeout_ms\":1},\"network\":{\"kind\":\"none\"}}"}"#;
+    fn provider_envelope_carries_a_closed_cloud_credential_free_payload() {
+        let body = r#"{"microvmId":"mvm-abc","runHookPayload":"{\"contract_digest\":\"d\",\"generation\":\"g\",\"expires_at_ms\":1,\"root_id\":\"r\",\"owner_session_id\":\"s\",\"connector\":\"none\",\"resource_class\":\"small\",\"resources\":{\"max_output_bytes\":1,\"timeout_ms\":1},\"network\":{\"kind\":\"none\"},\"control_token\":\"control-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"}"#;
         let envelope: RunEnvelope = serde_json::from_str(body).expect("provider envelope");
         assert_eq!(envelope.microvm_id.as_deref(), Some("mvm-abc"));
         assert!(serde_json::from_str::<RunPayload>(&envelope.run_hook_payload).is_ok());
-        assert!(!envelope.run_hook_payload.contains("token"));
+        assert!(!envelope.run_hook_payload.contains("auth_token"));
+        assert!(!envelope.run_hook_payload.contains("access_key"));
     }
 }

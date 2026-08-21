@@ -12,7 +12,8 @@ cargo build -p hand-guest --release --target aarch64-unknown-linux-gnu
 docker build -f image/Dockerfile \
   --build-arg BIN=target/aarch64-unknown-linux-gnu/release/hand-guest \
   -t aex-hand:dev .
-docker run --rm --cap-add NET_ADMIN -p 8080:8080 aex-hand:dev
+docker run --rm --sysctl net.ipv4.ip_unprivileged_port_start=8081 \
+  -p 8080:8080 aex-hand:dev
 ```
 
 The hosted MVP has one physical shape: 0.5 baseline vCPU and exactly 1,024 MiB of provider
@@ -26,21 +27,22 @@ workspace is checkpointed or restored implicitly; system-wide installs and works
 both lost when that generation is gone unless the caller explicitly copies data to session
 storage.
 
-The Hand listens on `:8080` for its trusted external supervisor connection. `NET_ADMIN` is used
-only by the root boot process to install a kernel UID-owner firewall before it permanently drops
-to the unprivileged Hand supervisor. The rule admits only supervisor UID 1001, so both UID 1000
-additional shells and the dynamically allocated managed-binding UIDs are denied. Startup fails
-closed if that rule cannot be installed, and Tool processes never inherit the capability. Replies
-sourced from port 8080 are also supervisor-UID-only, so a background Tool cannot impersonate the
-endpoint if a supervisor crash releases the listener. The CI image smoke test proves an external
-client can connect while malicious processes under both Tool identity classes cannot reach the
-control listener and verifies both owner-rule directions.
+The Hand listens on `:8080` for its trusted external supervisor connection. Every protected HTTP
+or WebSocket request requires a random generation bearer delivered only in the sealed provider run
+payload and retained with the durable target route; it is never projected through Brain, logs,
+argv, or Tool environments. Both UID 1000 additional shells and dynamically allocated managed
+binding UIDs may share the guest network namespace, but receive only `401` from the live control
+endpoint without that bearer. Root boot also raises `ip_unprivileged_port_start` to 8081. Only the
+root-owned, group-restricted supervisor executable has `CAP_NET_BIND_SERVICE`, so a background
+Tool cannot bind or impersonate port 8080 after a supervisor crash. CI proves both Tool identity
+classes cannot authenticate to a live supervisor or bind the released control port.
 
 The build removes every package-owned setuid/setgid bit and inherited file capability before it
-adds back only `cap_kill,cap_setuid,cap_setgid=ep` on `hand-guest`. The supervisor needs the UID/GID
-pair to spawn Tool children and `CAP_KILL` to enforce their deadlines after the UID split;
-Linux does not give parents an implicit cross-UID signal right. Children clear every capability
-set and set `no_new_privs`. Each immutable managed binding receives a distinct deterministic UID
+adds back only `cap_kill,cap_setgid,cap_setuid,cap_net_bind_service=ep` on `hand-guest`. The
+supervisor needs the UID/GID pair to spawn Tool children, `CAP_KILL` to enforce their deadlines
+after the UID split, and the bind capability for the reserved provider port; Linux does not give
+parents an implicit cross-UID signal right. Children clear every capability set and set
+`no_new_privs`. Each immutable managed binding receives a distinct deterministic UID
 from a bounded 4,096-entry per-generation registry; collisions and exhaustion fail permanently
 instead of aliasing secret subsets. Parallel calls of the same binding deliberately share its UID
 because they have the same immutable environment-name subset. Additional-sandbox shells remain UID
