@@ -627,6 +627,27 @@ fn canary_execution(
     Ok(request)
 }
 
+/// Special-use IPv4 destinations whose traffic actually reaches the plane-owned VPC connector.
+/// Lambda MicroVM loopback and IMDS are provider-local sockets: they do not traverse that
+/// connector and therefore cannot prove its NACL policy. The image separately proves that the
+/// loopback control listener requires its generation bearer, and `RunMicrovm` deliberately omits
+/// an execution role so the provider-local IMDS endpoint has no AWS credentials to return.
+fn connector_routed_special_use_ipv4_fixtures() -> Vec<&'static str> {
+    brain_protocol::network::SPECIAL_USE_FIXTURES
+        .iter()
+        .filter_map(|&(address, _)| {
+            address
+                .parse::<Ipv4Addr>()
+                .ok()
+                .map(|parsed| (address, parsed))
+        })
+        .filter(|(_, address)| {
+            !address.is_loopback() && *address != Ipv4Addr::new(169, 254, 169, 254)
+        })
+        .map(|(address, _)| address)
+        .collect()
+}
+
 fn restricted_network_execution(
     operation_id: &str,
     generation: &str,
@@ -639,9 +660,8 @@ fn restricted_network_execution(
         gateway.host().parse::<Ipv4Addr>().is_ok(),
         "release canary requires the platform's fixed IPv4 gateway authority"
     );
-    let denied: Vec<&str> = brain_protocol::network::SPECIAL_USE_FIXTURES
-        .iter()
-        .filter_map(|&(address, _)| address.parse::<Ipv4Addr>().ok().map(|_| address))
+    let denied: Vec<&str> = connector_routed_special_use_ipv4_fixtures()
+        .into_iter()
         .filter(|address| *address != gateway.host())
         .collect();
     let controls: Vec<&str> = brain_protocol::network::PUBLIC_UNICAST_FIXTURES
@@ -819,10 +839,7 @@ fn public_network_execution(
     session_id: &str,
     customer_hand_hosts: &[String; 2],
 ) -> anyhow::Result<SandboxExecutionRequest> {
-    let denied: Vec<&str> = brain_protocol::network::SPECIAL_USE_FIXTURES
-        .iter()
-        .filter_map(|&(address, _)| address.parse::<Ipv4Addr>().ok().map(|_| address))
-        .collect();
+    let denied = connector_routed_special_use_ipv4_fixtures();
     let controls: Vec<&str> = brain_protocol::network::PUBLIC_UNICAST_FIXTURES
         .iter()
         .copied()
@@ -1238,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn public_network_canary_uses_every_canonical_ipv4_fixture_and_exact_digest() {
+    fn public_network_canary_uses_every_connector_routed_ipv4_fixture_and_exact_digest() {
         let request = public_network_execution(
             "network-canary-operation",
             "network-canary-generation",
@@ -1254,9 +1271,14 @@ mod tests {
             request.request_digest,
             sandbox_execution_request_digest(&request)
         );
+        let denied = connector_routed_special_use_ipv4_fixtures();
         for &(address, _) in brain_protocol::network::SPECIAL_USE_FIXTURES {
             if address.parse::<Ipv4Addr>().is_ok() {
-                assert!(request.input.command.contains(address), "{address}");
+                assert_eq!(
+                    request.input.command.contains(address),
+                    denied.contains(&address),
+                    "{address}"
+                );
             }
         }
         for &address in brain_protocol::network::PUBLIC_UNICAST_FIXTURES {
@@ -1298,9 +1320,14 @@ mod tests {
             );
             assert!(request.input.command.contains("dns.lookup"));
             assert!(request.input.command.contains("10.42.0.10"));
+            let denied = connector_routed_special_use_ipv4_fixtures();
             for &(address, _) in brain_protocol::network::SPECIAL_USE_FIXTURES {
-                if address.parse::<Ipv4Addr>().is_ok() && address != gateway.host() {
-                    assert!(request.input.command.contains(address), "{address}");
+                if address.parse::<Ipv4Addr>().is_ok() {
+                    assert_eq!(
+                        request.input.command.contains(address),
+                        denied.contains(&address) && address != gateway.host(),
+                        "{address}"
+                    );
                 }
             }
             for &address in brain_protocol::network::PUBLIC_UNICAST_FIXTURES {
