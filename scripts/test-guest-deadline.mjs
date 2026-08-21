@@ -474,7 +474,8 @@ set -u
 echo self_uid=$(id -u)
 file /usr/local/lib/hand/proc-secret-static
 for target in node:${primary.pid} static:${staticPid}; do
-  name=\${target%%:*}; pid=\${target#*:}
+  name=$(printf '%s' "$target" | cut -d: -f1)
+  pid=$(printf '%s' "$target" | cut -d: -f2)
   if cat "/proc/$pid/environ" >/dev/null 2>&1; then echo "$name-environ=readable"; else echo "$name-environ=denied"; fi
   if ls "/proc/$pid/fd" >/dev/null 2>&1; then echo "$name-fd=readable"; else echo "$name-fd=denied"; fi
   if dd if="/proc/$pid/mem" of=/dev/null bs=1 count=1 status=none 2>/dev/null; then echo "$name-mem=readable"; else echo "$name-mem=denied"; fi
