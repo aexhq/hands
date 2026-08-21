@@ -279,7 +279,8 @@ async fn run_restricted_network_on_known_target(
 /// Exercises the canonical IPv4 special-use fixtures from inside one exact immutable image.
 /// Terraform's exact NACL plan is the authoritative rule proof; connection failures here are only
 /// behavioral coverage because an unroutable destination does not identify which layer rejected
-/// it. Canonical public controls prevent a completely broken connector from producing a pass.
+/// it. At least one canonical public control must be reachable, so a completely broken connector
+/// cannot pass without making release health depend on every third-party fixture staying online.
 async fn run_public_network_canary(
     control: &Control,
     cfg: PublicNetworkCanaryConfig,
@@ -927,9 +928,9 @@ if (reachableSpecial.length !== 0) {
 const controlResults = await Promise.all(
   controls.map(async (host) => [host, await anyReachable(host, [53, 80, 443])]),
 );
-const unreachableControls = controlResults.filter(([, reachable]) => !reachable).map(([host]) => host);
-if (unreachableControls.length !== 0) {
-  throw new Error(`public controls were unreachable: ${unreachableControls.join(",")}`);
+const reachableControls = controlResults.filter(([, reachable]) => reachable).map(([host]) => host);
+if (reachableControls.length === 0) {
+  throw new Error("no public control was reachable");
 }
 
 const httpSurfaceResults = await Promise.all(httpSurfaces.map(async (surface) => ({
@@ -1287,7 +1288,12 @@ mod tests {
             }
         }
         assert!(request.input.command.contains("reachableSpecial"));
-        assert!(request.input.command.contains("unreachableControls"));
+        assert!(
+            request
+                .input
+                .command
+                .contains("reachableControls.length === 0")
+        );
         for host in [
             "aex.dev",
             "api.aex.dev",
