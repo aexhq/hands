@@ -165,8 +165,10 @@ jobs:
           for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && { exec 3>&-; sleep 1; break; }; sleep 0.5; done
           curl --fail --silent http://127.0.0.1:8080/ >/dev/null
           docker exec --user 0:0 "$CID" sh -ceu '
-            iptables -C OUTPUT -p tcp --sport 8080 -m owner ! --uid-owner 1001 -j REJECT
-            iptables -C OUTPUT -o lo -p tcp --dport 8080 -m owner ! --uid-owner 1001 -j REJECT
+            rules=$(nft list chain inet aex_hand output)
+            printf "%s\n" "$rules" | grep -F "tcp sport 8080"
+            printf "%s\n" "$rules" | grep -F "oifname \"lo\" tcp dport 8080"
+            printf "%s\n" "$rules" | grep -F "skuid != 1001"
           '
           docker cp scripts/test-control-boundary.mjs "$CID":/tmp/test-control-boundary.mjs
           docker exec --user 1000:1000 "$CID" node /tmp/test-control-boundary.mjs

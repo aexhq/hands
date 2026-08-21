@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config \
       python3 python3-venv python3-pip pipx \
       ripgrep jq unzip zip zstd xz-utils file less \
-      procps coreutils bash libcap2-bin util-linux iproute2 iptables \
+      procps coreutils bash libcap2-bin util-linux iproute2 nftables \
     && rm -rf /var/lib/apt/lists/* \
     && case "$(dpkg --print-architecture)" in \
          arm64) node_arch=arm64; node_sha=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8 ;; \
