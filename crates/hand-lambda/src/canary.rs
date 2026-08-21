@@ -19,7 +19,7 @@ use hand_wire::{
 };
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::control::{AUTH_HEADER, Control, ControlError, Microvm, is_terminated};
+use crate::control::{AUTH_HEADER, Control, ControlError, Microvm, is_gone, is_terminated};
 use crate::launch::{self, GuestConnectError, LaunchedHand};
 
 const CANARY_LIFETIME_MS: u64 = 10 * 60 * 1_000;
@@ -564,8 +564,16 @@ async fn run_on_known_target(
     drop(socket);
 
     assert_persistent_502(control, http, &hand, "after deliberate crash").await?;
-    transition_and_wait(control, &target.target_id, MicrovmState::Suspended).await?;
-    transition_and_wait(control, &target.target_id, MicrovmState::Running).await?;
+    if !transition_and_wait_or_confirm_gone(control, &target.target_id, MicrovmState::Suspended)
+        .await?
+    {
+        return Ok(());
+    }
+    if !transition_and_wait_or_confirm_gone(control, &target.target_id, MicrovmState::Running)
+        .await?
+    {
+        return Ok(());
+    }
     hand.auth_token = control.auth_token(&target.target_id).await?;
     assert_persistent_502(control, http, &hand, "after suspend/resume").await?;
 
@@ -1124,11 +1132,14 @@ async fn assert_persistent_502(
     bail!("image canary did not produce repeated endpoint 502 during {phase}")
 }
 
-async fn transition_and_wait(
+/// A provider may terminate a MicroVM whose main supervisor has exited instead of retaining it for
+/// suspend/resume. That terminal state is already definitive physical no-respawn proof. When the
+/// provider keeps the VM alive, retain the stronger suspend/resume + exact-replay coverage.
+async fn transition_and_wait_or_confirm_gone(
     control: &Control,
     target_id: &str,
     wanted: MicrovmState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let effect = match wanted {
         MicrovmState::Suspended => control.suspend(target_id).await,
         MicrovmState::Running => control.resume(target_id).await,
@@ -1136,10 +1147,20 @@ async fn transition_and_wait(
     };
     match effect {
         Ok(()) | Err(ControlError::Unknown(_)) => {}
+        Err(ControlError::Gone(_)) => return Ok(false),
         Err(error) => return Err(error.into()),
     }
-    launch::wait_for_state(control, target_id, &wanted, STATE_TIMEOUT).await?;
-    Ok(())
+    match launch::wait_for_state(control, target_id, &wanted, STATE_TIMEOUT).await {
+        Ok(_) => Ok(true),
+        Err(wait_error) => match control.get(target_id).await {
+            Ok(vm) if is_gone(&vm.state) => {
+                tracing::info!(microvm = target_id, state = ?vm.state, "no-respawn canary confirmed provider terminal state");
+                Ok(false)
+            }
+            Err(ControlError::Gone(_)) => Ok(false),
+            Ok(_) | Err(_) => Err(wait_error),
+        },
+    }
 }
 
 async fn terminate_known_target(control: &Control, target_id: &str) -> anyhow::Result<()> {
