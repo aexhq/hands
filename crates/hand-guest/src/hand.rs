@@ -2518,11 +2518,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_exact_replay_and_conflicting_digest_never_repeat_the_effect() {
         let (_directory, hand, _digest) = prepared_hand().await;
-        let first = sandbox_request(
-            "sandbox-execution-1",
-            "printf first >> /workspace/effect.txt",
-            false,
-        );
+        let first = sandbox_request("sandbox-execution-1", "printf first >> effect.txt", false);
         let receipt = hand.execute_sandbox(first.clone()).await.unwrap();
         assert_eq!(
             wait_terminal(&hand, receipt.operation.clone()).await.state,
@@ -2534,7 +2530,7 @@ mod tests {
         let conflict = hand
             .execute_sandbox(sandbox_request(
                 "sandbox-execution-1",
-                "printf second >> /workspace/effect.txt",
+                "printf second >> effect.txt",
                 false,
             ))
             .await
@@ -2552,7 +2548,7 @@ mod tests {
         let (_directory, hand, _digest) = prepared_hand().await;
         let request = sandbox_request(
             "sandbox-execution-acked",
-            "printf once >> /workspace/acked-effect.txt",
+            "printf once >> acked-effect.txt",
             false,
         );
         let receipt = hand.execute_sandbox(request.clone()).await.unwrap();
@@ -2582,7 +2578,7 @@ mod tests {
         let conflicting = hand
             .execute_sandbox(sandbox_request(
                 "sandbox-execution-acked",
-                "printf twice >> /workspace/acked-effect.txt",
+                "printf twice >> acked-effect.txt",
                 false,
             ))
             .await
@@ -2600,7 +2596,7 @@ mod tests {
         let (_directory, hand, _digest) = prepared_hand().await;
         let execution = sandbox_request(
             "sandbox-execution-stdin",
-            "IFS= read -r line; printf '%s' \"$line\" > /workspace/stdin.txt",
+            "IFS= read -r line; printf '%s' \"$line\" > stdin.txt",
             true,
         );
         let receipt = hand.execute_sandbox(execution.clone()).await.unwrap();
@@ -2654,11 +2650,7 @@ mod tests {
     #[tokio::test]
     async fn write_stdin_supports_explicit_eof_and_observation_only_poll() {
         let (_directory, hand, _digest) = prepared_hand().await;
-        let execution = sandbox_request(
-            "sandbox-execution-eof",
-            "cat > /workspace/stdin-eof.txt",
-            true,
-        );
+        let execution = sandbox_request("sandbox-execution-eof", "cat > stdin-eof.txt", true);
         let submitted = hand.execute_sandbox(execution.clone()).await.unwrap();
         let mut close: WriteStdinRequest = serde_json::from_value(serde_json::json!({
             "eof": true,
