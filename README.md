@@ -1,23 +1,36 @@
-# Hands
+<h1 align="center">Hands</h1>
 
-The default runtime for Brain tools. Hands contains the Linux guest, curated container image, and
-AWS Lambda MicroVM adapter that implement Brain's public Hand ports.
+<p align="center"><strong>The default runtime for Brain tools.</strong></p>
+<p align="center">
+  A Linux guest, curated tool image, and AWS Lambda MicroVM adapter for Brain's public Hand ports.
+</p>
+<p align="center">
+  <a href="https://aex.dev">Aex</a> ·
+  <a href="https://github.com/aexhq/brain">Brain</a> ·
+  <a href="image/README.md">Image</a> ·
+  <a href="gateway/README.md">Gateway</a> ·
+  <a href="https://discord.gg/Qk2YnHMHVb">Discord</a>
+</p>
+
+Hands implements the Hand ports owned by Brain. It consumes one immutable Brain revision, so wire
+contract changes start in [`aexhq/brain`](https://github.com/aexhq/brain) before the pin changes
+here.
 
 ## Components
 
-| Path | Purpose |
+| Component | Purpose |
 | --- | --- |
-| `crates/hand-guest` | WebSocket guest, tool runner, bounded output, jobs, file transfer, and workspace sync |
-| `crates/hand-brain-aws` | Lambda MicroVM implementation of Brain's Hand factory and adapter ports |
-| `crates/hand-lambda` | Image publication, lifecycle controls, and hosted runtime checks |
-| `image/` | Curated Linux tool image |
-| `tools/smoke.sh` | Local container build and end-to-end protocol smoke test |
+| [`hand-core`](crates/hand-core) | Contract-neutral operation, target, generation, connector, and cleanup state machines |
+| [`hand-wire`](crates/hand-wire) | Private transport framing for the production Hand |
+| [`hand-guest`](crates/hand-guest) | WebSocket guest, tool runner, bounded output, jobs, and live file access |
+| [`hand-brain-aws`](crates/hand-brain-aws) | Lambda MicroVM implementation of Brain's receipt and capability ports |
+| [`hand-lambda`](crates/hand-lambda) | Image publication, lifecycle controls, and hosted runtime checks |
+| [`hand-egress-gateway`](crates/hand-egress-gateway) | Signed-capability CONNECT and SOCKS allowlist gateway |
+| [`gateway`](gateway) | Low-privilege egress gateway image and deployment contract |
+| [`image`](image) | Curated Linux tool image |
+| [`scripts`](scripts) | Node bundle and guest security conformance fixtures |
 
-The protocol and Brain-side client come from one immutable revision of
-[`aexhq/brain`](https://github.com/aexhq/brain). Change wire contracts in Brain first, then update
-the pinned revision here.
-
-## Develop
+## Development
 
 The guest is Linux-only and uses process groups, signals, and `/proc`.
 
@@ -25,13 +38,15 @@ The guest is Linux-only and uses process groups, signals, and `/proc`.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-tools/smoke.sh
+node scripts/test-tool-runner.mjs
 ```
 
-`tools/smoke.sh` requires an ARM64 Linux host, Docker, and the
-`aarch64-unknown-linux-gnu` Rust target. CI also builds and tests the public AMD64/ARM64 image.
+CI also builds the Linux image and proves that a malicious Tool UID cannot reach the supervisor
+control listener. Production publishes only the immutable egress-gateway image and plane-local
+Lambda MicroVM images.
 
-See [image/README.md](image/README.md) for the container and
-[hosted/README.md](hosted/README.md) for the neutral AWS composition.
+Read the [tool image guide](image/README.md), [egress gateway contract](gateway/README.md), or
+[AWS adapter contract](crates/hand-brain-aws/README.md) for runtime details. Hosted Brain
+composition belongs to Aex; this repository has no standalone or hosted Brain image.
 
-Apache-2.0 licensed.
+Licensed under [Apache 2.0](LICENSE).
