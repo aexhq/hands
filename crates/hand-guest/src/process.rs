@@ -1045,7 +1045,7 @@ mod tests {
         )
         .await
         .expect("a complete frame must not wait for the still-open writer")
-        .unwrap();
+        .unwrap_or_else(|_| panic!("a complete frame must be accepted"));
         assert_eq!(result, body);
         drop(writer);
     }

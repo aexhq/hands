@@ -2620,7 +2620,10 @@ mod tests {
         // closes that gap before reserving the idempotency key or touching the pipe.
         let mut oversized = write.clone();
         oversized.operation_id = "stdin-write-oversized".parse().unwrap();
-        oversized.text = "é".repeat(brain_protocol::MAX_WRITE_STDIN_BYTES);
+        oversized.text = "é"
+            .repeat(brain_protocol::MAX_WRITE_STDIN_BYTES)
+            .parse()
+            .unwrap();
         oversized.request_digest = write_stdin_request_digest(&oversized);
         let error = hand.write_stdin(oversized).await.unwrap_err();
         assert_eq!(error.code, HandErrorCode::InvalidRequest);
@@ -2634,7 +2637,7 @@ mod tests {
         assert!(replay.replayed);
         assert!(canonical_equal(&replay.observation.operation, &receipt.operation).unwrap());
         let mut conflict = write;
-        conflict.text = "different\n".into();
+        conflict.text = "different\n".parse().unwrap();
         conflict.request_digest = write_stdin_request_digest(&conflict);
         let error = hand.write_stdin(conflict).await.unwrap_err();
         assert_eq!(error.code, HandErrorCode::OperationConflict);
