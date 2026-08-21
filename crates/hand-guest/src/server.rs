@@ -101,7 +101,10 @@ fn inherited_listener(expected: SocketAddr) -> anyhow::Result<Option<TcpListener
         let fd: RawFd = raw
             .parse()
             .map_err(|error| anyhow::anyhow!("HAND_LISTEN_FD: {error}"))?;
-        anyhow::ensure!(fd == 3, "HAND_LISTEN_FD must be the sealed descriptor 3");
+        anyhow::ensure!(
+            fd >= 3,
+            "HAND_LISTEN_FD must not replace a standard descriptor"
+        );
         // SAFETY: fcntl validates the inherited descriptor before ownership transfers below.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         anyhow::ensure!(flags >= 0, "HAND_LISTEN_FD is not an open descriptor");
@@ -112,7 +115,7 @@ fn inherited_listener(expected: SocketAddr) -> anyhow::Result<Option<TcpListener
             unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0,
             "could not seal HAND_LISTEN_FD"
         );
-        // SAFETY: the root launcher transfers unique ownership of descriptor 3 to this process.
+        // SAFETY: the root launcher transfers unique ownership of this validated descriptor.
         let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
         listener.set_nonblocking(true)?;
         anyhow::ensure!(

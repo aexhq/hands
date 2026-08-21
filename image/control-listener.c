@@ -14,7 +14,6 @@
 #include <unistd.h>
 
 enum {
-    CONTROL_FD = 3,
     CONTROL_PORT = 8080,
     SUPERVISOR_UID = 1001,
     SUPERVISOR_GID = 1001,
@@ -58,17 +57,31 @@ int main(int argc, char **argv) {
     if (listen(listener, SOMAXCONN) < 0) {
         fail("listen");
     }
-    if (listener != CONTROL_FD) {
-        if (dup2(listener, CONTROL_FD) < 0) {
-            fail("dup2");
+    /*
+     * The provider may already own descriptor 3. Preserve every inherited descriptor and pass the
+     * actual new listener number to the supervisor instead of replacing a provider control fd.
+     */
+    if (listener < 3) {
+        int replacement = fcntl(listener, F_DUPFD, 3);
+        if (replacement < 0) {
+            fail("fcntl(F_DUPFD)");
         }
         close(listener);
+        listener = replacement;
     }
-    int descriptor_flags = fcntl(CONTROL_FD, F_GETFD);
+    int descriptor_flags = fcntl(listener, F_GETFD);
     if (descriptor_flags < 0 ||
-        fcntl(CONTROL_FD, F_SETFD, descriptor_flags & ~FD_CLOEXEC) < 0) {
+        fcntl(listener, F_SETFD, descriptor_flags & ~FD_CLOEXEC) < 0) {
         fail("fcntl");
     }
+    char listener_number[32];
+    int listener_number_bytes =
+        snprintf(listener_number, sizeof(listener_number), "%d", listener);
+    require(listener_number_bytes > 0 &&
+                (size_t)listener_number_bytes < sizeof(listener_number),
+            "could not encode the control listener descriptor");
+    fprintf(stderr, "aex-control-listener: reserved port %d on descriptor %d\n",
+            CONTROL_PORT, listener);
 
     struct passwd *supervisor = getpwnam("hand");
     require(supervisor != NULL, "Hand supervisor account is unavailable");
@@ -87,7 +100,8 @@ int main(int argc, char **argv) {
             "failed to enter the Hand supervisor identity");
 
     if (setenv("HOME", "/home/agent", 1) < 0 || setenv("USER", "hand", 1) < 0 ||
-        setenv("LOGNAME", "hand", 1) < 0 || setenv("HAND_LISTEN_FD", "3", 1) < 0) {
+        setenv("LOGNAME", "hand", 1) < 0 ||
+        setenv("HAND_LISTEN_FD", listener_number, 1) < 0) {
         fail("setenv");
     }
     char *const child_argv[] = {argv[1], NULL};

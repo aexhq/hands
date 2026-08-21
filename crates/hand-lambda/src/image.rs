@@ -835,6 +835,7 @@ mod tests {
     fn the_boot_script_pins_dns_and_drops_to_the_supervisor() {
         let boot = boot_script();
         let df = dockerfile();
+        let listener = include_str!("../../../image/control-listener.c");
         assert!(boot.contains(GUEST_DNS));
         assert!(boot.contains("control-listener /usr/local/bin/hand-guest"));
         assert!(boot.contains("ip_unprivileged_port_start"));
@@ -848,6 +849,11 @@ mod tests {
         assert!(df.contains("setcap cap_kill,cap_setuid,cap_setgid=ep"));
         assert!(df.contains("control-listener.c"));
         assert!(df.contains("0:1001:750"));
+        assert!(listener.contains("setenv(\"HAND_LISTEN_FD\", listener_number, 1)"));
+        assert!(
+            !listener.contains("dup2("),
+            "the launcher must not replace a provider-owned descriptor"
+        );
         assert!(df.contains("cc -static -O2"));
         assert!(
             df.contains("! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP")
