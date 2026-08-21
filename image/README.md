@@ -111,17 +111,20 @@ an application crash is physical-generation loss, never an invitation to run the
 replacement process under the old target identity.
 
 The same dev workflow then launches and terminates the exact image sequentially through every
-connector class. The `none` target must fail DNS resolution and direct TCP to every canonical IPv4
-special-use/public fixture as well as the known-live private gateway listener. The `allowlist`
-target must fail the same direct DNS/TCP paths, reach only that fixed listener, and receive exact
-`407` and `403` responses for missing and invalid CONNECT capabilities. These negative canaries do
-not receive the KMS signing permission used by the production Hand. The `public` target attempts
-TCP connections to every canonical IPv4 special-use fixture and fails if any succeeds, then
-requires canonical public IPv4 controls to remain reachable so a broken connector cannot produce
-a pass. It also requires source denial from the website, both public API planes, and both
-customer-Hand API Gateway hosts. For each customer-Hand host it exercises a WSS `$connect`
-handshake and an unauthenticated Management API request; it does not claim that the public API
-Gateway TCP endpoint is unreachable.
+connector class. The `none` target must fail DNS resolution and direct TCP to every
+connector-routed canonical IPv4 special-use/public fixture as well as the known-live private
+gateway listener. Provider-local loopback and IMDS sockets do not traverse a VPC connector and are
+not connector-policy evidence: separate image gates require the loopback Hand endpoint's
+generation bearer, and production `RunMicrovm` requests attach no execution role from which IMDS
+could return AWS credentials. The `allowlist` target must fail the same direct DNS/TCP paths, reach
+only that fixed listener, and receive exact `407` and `403` responses for missing and invalid
+CONNECT capabilities. These negative canaries do not receive the KMS signing permission used by
+the production Hand. The `public` target attempts TCP connections to every connector-routed
+canonical IPv4 special-use fixture and fails if any succeeds, then requires canonical public IPv4
+controls to remain reachable so a broken connector cannot produce a pass. It also requires source
+denial from the website, both public API planes, and both customer-Hand API Gateway hosts. For each
+customer-Hand host it exercises a WSS `$connect` handshake and an unauthenticated Management API
+request; it does not claim that the public API Gateway TCP endpoint is unreachable.
 
 The workflow reads host-only `AEX_CUSTOMER_HAND_DEV_HOST` and
 `AEX_CUSTOMER_HAND_PRD_HOST`, the three connector identities, and the bare fixed-private
