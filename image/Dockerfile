@@ -86,6 +86,7 @@ COPY ${BIN} /usr/local/bin/hand-guest
 COPY image/tool-runner.mjs /usr/local/lib/hand/tool-runner.mjs
 COPY image/tool-boundary.c /tmp/tool-boundary.c
 COPY image/proc-secret-static.c /tmp/proc-secret-static.c
+COPY image/control-listener.c /tmp/control-listener.c
 COPY image/hand-boot.sh /usr/local/bin/hand-boot.sh
 RUN chown root:hand /usr/local/bin/hand-guest \
     && chmod 0750 /usr/local/bin/hand-guest \
@@ -94,15 +95,20 @@ RUN chown root:hand /usr/local/bin/hand-guest \
          -o /usr/local/lib/hand/tool-boundary.so /tmp/tool-boundary.c \
     && cc -static -O2 -Wl,-z,relro,-z,now \
          -o /usr/local/lib/hand/proc-secret-static /tmp/proc-secret-static.c \
-    && rm /tmp/tool-boundary.c /tmp/proc-secret-static.c \
+    && cc -O2 -Wl,-z,relro,-z,now \
+         -o /usr/local/lib/hand/control-listener /tmp/control-listener.c \
+    && rm /tmp/tool-boundary.c /tmp/proc-secret-static.c /tmp/control-listener.c \
     && chown root:root /usr/local/lib/hand/tool-boundary.so /usr/local/lib/hand/proc-secret-static \
+    && chown root:hand /usr/local/lib/hand/control-listener \
     && chmod 0555 /usr/local/lib/hand/tool-boundary.so /usr/local/lib/hand/proc-secret-static \
-    && setcap cap_kill,cap_setuid,cap_setgid,cap_net_bind_service=ep /usr/local/bin/hand-guest \
+    && chmod 0750 /usr/local/lib/hand/control-listener \
+    && setcap cap_kill,cap_setuid,cap_setgid=ep /usr/local/bin/hand-guest \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/tool-boundary.so)" = "0:0:555" \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/proc-secret-static)" = "0:0:555" \
     && ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP \
+    && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:1001:750" \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
-    && test "$(getcap -r / 2>/dev/null)" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid,cap_net_bind_service=ep"
+    && test "$(getcap -r / 2>/dev/null)" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
 
 WORKDIR /workspace
 EXPOSE 8080

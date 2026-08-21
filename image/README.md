@@ -32,16 +32,16 @@ or WebSocket request requires a random generation bearer delivered only in the s
 payload and retained with the durable target route; it is never projected through Brain, logs,
 argv, or Tool environments. Both UID 1000 additional shells and dynamically allocated managed
 binding UIDs may share the guest network namespace, but receive only `401` from the live control
-endpoint without that bearer. Root boot also raises `ip_unprivileged_port_start` to 8081. Only the
-root-owned, group-restricted supervisor executable has `CAP_NET_BIND_SERVICE`, so a background
-Tool cannot bind or impersonate port 8080 after a supervisor crash. CI proves both Tool identity
-classes cannot authenticate to a live supervisor or bind the released control port.
+endpoint without that bearer. Root boot also raises `ip_unprivileged_port_start` to 8081. A tiny
+root-owned, group-restricted launcher binds port 8080 first, drops to the supervisor identity, and
+passes only that socket descriptor to `hand-guest`; a background Tool therefore cannot bind or
+impersonate the port after a supervisor crash. CI proves both Tool identity classes cannot
+authenticate to a live supervisor or bind the released control port.
 
 The build removes every package-owned setuid/setgid bit and inherited file capability before it
-adds back only `cap_kill,cap_setgid,cap_setuid,cap_net_bind_service=ep` on `hand-guest`. The
-supervisor needs the UID/GID pair to spawn Tool children, `CAP_KILL` to enforce their deadlines
-after the UID split, and the bind capability for the reserved provider port; Linux does not give
-parents an implicit cross-UID signal right. Children clear every capability set and set
+adds back only `cap_kill,cap_setgid,cap_setuid=ep` on `hand-guest`. The supervisor needs the UID/GID
+pair to spawn Tool children and `CAP_KILL` to enforce their deadlines after the UID split; Linux
+does not give parents an implicit cross-UID signal right. Children clear every capability set and set
 `no_new_privs`. Each immutable managed binding receives a distinct deterministic UID
 from a bounded 4,096-entry per-generation registry; collisions and exhaustion fail permanently
 instead of aliasing secret subsets. Parallel calls of the same binding deliberately share its UID
