@@ -77,8 +77,9 @@ RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     && test "$(stat -c '%a' /var/hand/file-staging)" = 2700
 
 # Curated Tool code needs no package-owned privilege transition. Strip the entire distro/toolchain
-# setuid, setgid and file-capability surface before adding back the one narrowly scoped supervisor
-# executable below; CI scans the completed image so a package update cannot silently reopen it.
+# setuid, setgid and file-capability surface. The root-owned listener launcher transfers the exact
+# three process capabilities needed by the supervisor; CI scans the completed image so a package
+# update cannot silently reopen the filesystem privilege surface.
 RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
     && getcap -r /usr /bin /sbin /usr/local 2>/dev/null \
          | awk '{print $1}' | sort -u | xargs -r -n1 setcap -r
@@ -104,13 +105,12 @@ RUN chown root:hand /usr/local/bin/hand-guest \
     && chown root:hand /usr/local/lib/hand/control-listener \
     && chmod 0555 /usr/local/lib/hand/tool-boundary.so /usr/local/lib/hand/proc-secret-static \
     && chmod 0750 /usr/local/lib/hand/control-listener \
-    && setcap cap_kill,cap_setuid,cap_setgid=ep /usr/local/bin/hand-guest \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/tool-boundary.so)" = "0:0:555" \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/proc-secret-static)" = "0:0:555" \
     && ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:1001:750" \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
-    && test "$(getcap -r / 2>/dev/null)" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+    && test -z "$(getcap -r / 2>/dev/null)"
 
 WORKDIR /workspace
 EXPOSE 8080
