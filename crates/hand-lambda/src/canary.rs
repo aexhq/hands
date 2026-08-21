@@ -253,9 +253,10 @@ async fn run_restricted_network_on_known_target(
     let terminal = observation
         .terminal
         .context("restricted network canary did not reach a terminal receipt")?;
+    let diagnostic = terminal_diagnostic(terminal.inline.as_ref());
     ensure!(
         terminal.outcome == TerminalOutcome::Completed,
-        "restricted network canary command failed"
+        "restricted network canary command failed: {diagnostic}"
     );
     let stdout = terminal
         .inline
@@ -402,9 +403,10 @@ async fn run_public_network_on_known_target(
     let terminal = observation
         .terminal
         .context("network canary did not reach a terminal receipt")?;
+    let diagnostic = terminal_diagnostic(terminal.inline.as_ref());
     ensure!(
         terminal.outcome == TerminalOutcome::Completed,
-        "network canary command failed"
+        "network canary command failed: {diagnostic}"
     );
     let stdout = terminal
         .inline
@@ -1024,6 +1026,17 @@ fn validate_customer_hand_hosts(hosts: &[String; 2]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn terminal_diagnostic(inline: Option<&serde_json::Value>) -> &str {
+    inline
+        .and_then(|value| {
+            ["error", "stderr", "stdout"]
+                .into_iter()
+                .find_map(|field| value.get(field).and_then(serde_json::Value::as_str))
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or("no terminal detail")
+}
+
 async fn call(
     socket: &mut launch::GuestSocket,
     request_number: &mut u64,
@@ -1347,5 +1360,17 @@ mod tests {
         ] {
             assert!(validate_customer_hand_hosts(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn failed_network_canary_reports_the_bounded_terminal_detail() {
+        let stderr = serde_json::json!({"stdout": "", "stderr": "DNS unexpectedly resolved"});
+        let explicit = serde_json::json!({"error": "sandbox deadline", "stderr": "ignored"});
+        assert_eq!(
+            terminal_diagnostic(Some(&stderr)),
+            "DNS unexpectedly resolved"
+        );
+        assert_eq!(terminal_diagnostic(Some(&explicit)), "sandbox deadline");
+        assert_eq!(terminal_diagnostic(None), "no terminal detail");
     }
 }
