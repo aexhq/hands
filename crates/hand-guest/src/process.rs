@@ -27,7 +27,6 @@ use crate::config::ToolIdentity;
 #[cfg(unix)]
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-#[cfg(unix)]
 const MAX_TOOL_RUNNER_REQUEST_BYTES: usize = 256 * 1024;
 #[cfg(unix)]
 const RESULT_ENVELOPE_HEADROOM_BYTES: u64 = 4096;

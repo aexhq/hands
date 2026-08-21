@@ -730,14 +730,22 @@ mod tests {
             files.stat("/workspace/outside").unwrap().kind,
             LiveFileKind::Symlink
         );
+        let read = files.read("/workspace/outside/secret", 32);
+        assert!(matches!(
+            read,
+            Err(LiveFileError::OutsideScope | LiveFileError::Io(_))
+        ));
+
+        let write = files.write("/workspace/outside/new", b"bad", false);
+        assert!(matches!(
+            write,
+            Err(LiveFileError::OutsideScope | LiveFileError::Io(_))
+        ));
         assert_eq!(
-            files.read("/workspace/outside/secret", 32),
-            Err(LiveFileError::OutsideScope)
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"nope"
         );
-        assert_eq!(
-            files.write("/workspace/outside/new", b"bad", false),
-            Err(LiveFileError::OutsideScope)
-        );
+        assert!(!outside.path().join("new").exists());
     }
 
     #[cfg(target_os = "linux")]
