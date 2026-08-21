@@ -162,6 +162,8 @@ RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     && mkdir -p /workspace /var/hand/ops /var/hand/bindings /var/hand/objects /var/hand/file-staging /var/hand/tools /usr/local/lib/hand \
     && chown -R agent:agent /workspace /home/agent \
     && chmod 2770 /workspace /home/agent \
+    && chown hand:agent /var/hand \
+    && chmod 0710 /var/hand \
     && chown -R hand:hand /var/hand/ops /var/hand/bindings /var/hand/objects \
     && chmod 0700 /var/hand/ops /var/hand/bindings /var/hand/objects \
     && chown -R hand:agent /var/hand/file-staging \
@@ -849,6 +851,8 @@ mod tests {
         assert!(df.contains("setcap cap_kill,cap_setuid,cap_setgid=ep"));
         assert!(df.contains("control-listener.c"));
         assert!(df.contains("0:1001:750"));
+        assert!(df.contains("chown hand:agent /var/hand"));
+        assert!(df.contains("chmod 0710 /var/hand"));
         assert!(listener.contains("setenv(\"HAND_LISTEN_FD\", listener_number, 1)"));
         assert!(
             !listener.contains("dup2("),

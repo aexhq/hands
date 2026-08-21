@@ -65,6 +65,8 @@ RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     && mkdir -p /workspace /var/hand/ops /var/hand/bindings /var/hand/objects /var/hand/file-staging /var/hand/tools /usr/local/lib/hand \
     && chown -R agent:agent /workspace /home/agent \
     && chmod 2770 /workspace /home/agent \
+    && chown hand:agent /var/hand \
+    && chmod 0710 /var/hand \
     && chown -R hand:hand /var/hand/ops /var/hand/bindings /var/hand/objects \
     && chmod 0700 /var/hand/ops /var/hand/bindings /var/hand/objects \
     && chown -R hand:agent /var/hand/file-staging \
