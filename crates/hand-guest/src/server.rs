@@ -39,8 +39,12 @@ pub struct Server {
 
 impl Server {
     pub async fn bind(hand: Arc<Hand>) -> anyhow::Result<Self> {
+        let listener = inherited_listener(hand.cfg.listen)?;
         Ok(Self {
-            listener: TcpListener::bind(hand.cfg.listen).await?,
+            listener: match listener {
+                Some(listener) => listener,
+                None => TcpListener::bind(hand.cfg.listen).await?,
+            },
             hand,
         })
     }
@@ -75,6 +79,47 @@ impl Server {
         });
         axum::serve(listener, app).await?;
         Ok(())
+    }
+}
+
+fn inherited_listener(expected: SocketAddr) -> anyhow::Result<Option<TcpListener>> {
+    let Some(raw) = std::env::var_os("HAND_LISTEN_FD") else {
+        return Ok(None);
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = (raw, expected);
+        anyhow::bail!("HAND_LISTEN_FD is supported only on Unix");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::{FromRawFd as _, RawFd};
+
+        let raw = raw
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("HAND_LISTEN_FD is not UTF-8"))?;
+        let fd: RawFd = raw
+            .parse()
+            .map_err(|error| anyhow::anyhow!("HAND_LISTEN_FD: {error}"))?;
+        anyhow::ensure!(fd == 3, "HAND_LISTEN_FD must be the sealed descriptor 3");
+        // SAFETY: fcntl validates the inherited descriptor before ownership transfers below.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        anyhow::ensure!(flags >= 0, "HAND_LISTEN_FD is not an open descriptor");
+        // Tool children execute separate programs. Close the supervisor listener at every later
+        // exec boundary so it can never leak into an untrusted process.
+        // SAFETY: fd was validated above and F_SETFD does not access Rust-managed memory.
+        anyhow::ensure!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0,
+            "could not seal HAND_LISTEN_FD"
+        );
+        // SAFETY: the root launcher transfers unique ownership of descriptor 3 to this process.
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+        listener.set_nonblocking(true)?;
+        anyhow::ensure!(
+            listener.local_addr()? == expected,
+            "inherited control listener does not match HAND_LISTEN"
+        );
+        Ok(Some(TcpListener::from_std(listener)?))
     }
 }
 
