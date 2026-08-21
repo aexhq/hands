@@ -73,10 +73,26 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve the immutable Brain revision
+        id: brain
+        run: echo "sha=$(bash scripts/pinned-brain-revision.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: aexhq/brain
+          ref: ${{ steps.brain.outputs.sha }}
+          path: brain
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - run: node scripts/test-tool-runner.mjs
+      - name: Build the pinned Brain Tool SDK
+        working-directory: brain
+        run: |
+          npm ci
+          npm run build --workspace @aexhq/brain
+      - name: Exercise the real Brain bundle in the Hands runner
+        env:
+          AEX_BRAIN_CHECKOUT: ${{ github.workspace }}/brain
+        run: node scripts/test-tool-runner.mjs
 
   # Build the native CI image once. Static image policy and adversarial runtime tests consume the
   # same artifact in parallel; the production ARM64 image is built on an arm host separately.
