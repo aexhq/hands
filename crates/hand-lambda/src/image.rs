@@ -73,10 +73,12 @@ printf 'nameserver {GUEST_DNS}\n' > /etc/resolv.conf || true
 # The provider listener is host-reachable but must not be a control socket for any Tool uid. A
 # background Tool also cannot impersonate the endpoint after a supervisor crash: response packets
 # sourced from the control port are supervisor-only.
-iptables -w 5 -A OUTPUT -p tcp --sport {AGENT_PORT} -m owner ! --uid-owner 1001 -j REJECT
-iptables -w 5 -A OUTPUT -o lo -p tcp --dport {AGENT_PORT} -m owner ! --uid-owner 1001 -j REJECT
+nft add table inet aex_hand
+nft 'add chain inet aex_hand output {{ type filter hook output priority 0; policy accept; }}'
+nft add rule inet aex_hand output tcp sport {AGENT_PORT} meta skuid != 1001 reject
+nft add rule inet aex_hand output oifname "lo" tcp dport {AGENT_PORT} meta skuid != 1001 reject
 for address in $(ip -o -4 address show | awk '{{print $4}}' | cut -d/ -f1); do
-  iptables -w 5 -A OUTPUT -d "$address"/32 -p tcp --dport {AGENT_PORT} -m owner ! --uid-owner 1001 -j REJECT
+  nft add rule inet aex_hand output ip daddr "$address"/32 tcp dport {AGENT_PORT} meta skuid != 1001 reject
 done
 if [ -w /proc/sys/kernel/unprivileged_userns_clone ]; then
   printf '0\n' > /proc/sys/kernel/unprivileged_userns_clone
@@ -140,7 +142,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config \
       python3 python3-venv python3-pip pipx \
       ripgrep jq unzip zip zstd xz-utils file less \
-      procps coreutils bash libcap2-bin util-linux iproute2 iptables \
+      procps coreutils bash libcap2-bin util-linux iproute2 nftables \
     && rm -rf /var/lib/apt/lists/* \
     && curl --fail --location --retry 5 \
          --output /tmp/node.tar.xz \
@@ -827,9 +829,10 @@ mod tests {
         let df = dockerfile();
         assert!(boot.contains(GUEST_DNS));
         assert!(boot.contains("setpriv --reuid hand"));
-        assert!(boot.contains("! --uid-owner 1001"));
-        assert!(boot.contains(&format!("--dport {AGENT_PORT}")));
-        assert!(boot.contains(&format!("--sport {AGENT_PORT}")));
+        assert!(boot.contains("meta skuid != 1001"));
+        assert!(boot.contains(&format!("tcp dport {AGENT_PORT}")));
+        assert!(boot.contains(&format!("tcp sport {AGENT_PORT}")));
+        assert!(!boot.contains("iptables"));
         assert!(boot.contains("unprivileged_userns_clone"));
         assert!(boot.contains("max_user_namespaces"));
         assert!(boot.contains("ulimit -c 0"));

@@ -6,10 +6,12 @@ set -eu
 # reject its packets before they can reach any supervisor listener address. Also reject replies
 # sourced from the control port: a background Tool must not impersonate the endpoint if the
 # supervisor dies and releases the listener.
-iptables -w 5 -A OUTPUT -p tcp --sport 8080 -m owner ! --uid-owner 1001 -j REJECT
-iptables -w 5 -A OUTPUT -o lo -p tcp --dport 8080 -m owner ! --uid-owner 1001 -j REJECT
+nft add table inet aex_hand
+nft 'add chain inet aex_hand output { type filter hook output priority 0; policy accept; }'
+nft add rule inet aex_hand output tcp sport 8080 meta skuid != 1001 reject
+nft add rule inet aex_hand output oifname "lo" tcp dport 8080 meta skuid != 1001 reject
 for address in $(ip -o -4 address show | awk '{print $4}' | cut -d/ -f1); do
-  iptables -w 5 -A OUTPUT -d "$address"/32 -p tcp --dport 8080 -m owner ! --uid-owner 1001 -j REJECT
+  nft add rule inet aex_hand output ip daddr "$address"/32 tcp dport 8080 meta skuid != 1001 reject
 done
 
 # A Tool needs neither user nor network namespaces. Disable their unprivileged creation where the
