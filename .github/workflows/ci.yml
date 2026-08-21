@@ -171,6 +171,6 @@ jobs:
           docker cp scripts/test-control-boundary.mjs "$CID":/tmp/test-control-boundary.mjs
           docker exec --user 1000:1000 "$CID" node /tmp/test-control-boundary.mjs
           docker cp scripts/test-guest-deadline.mjs "$CID":/tmp/test-guest-deadline.mjs
-          docker exec --user 0:0 "$CID" node /tmp/test-guest-deadline.mjs
+          docker exec --user 1001:1000 "$CID" node /tmp/test-guest-deadline.mjs
           docker stop "$CID" >/dev/null
           trap - EXIT
