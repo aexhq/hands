@@ -15,7 +15,7 @@ use aws_sdk_dynamodb::types::{
 };
 use hand_core::connector::ConnectorClass;
 use hand_core::materialization::{
-    AcquireOutcome, AcquireTarget, DurableLaunchRequest, DurableTargetRecord,
+    AcquireOutcome, AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetRecord,
     DurableTargetRegistry, DurableTargetState, InstallOutcome, InstalledTarget, MAX_TARGET_PAGE,
     MaterializationError, MaterializationLease, TARGET_KEY_PREFIX, TargetKey, TargetPage,
     TargetSpec, materialization_poll_after,
@@ -29,6 +29,7 @@ const INSTALLED: &str = "installed";
 const GONE: &str = "gone";
 const TERMINATED: &str = "terminated";
 const LAUNCH_REQUEST: &str = "launch_request";
+const CONTROL_TOKEN: &str = "control_token";
 const ATTEMPT_ID: &str = "attempt_id";
 const ATTEMPT_EXPIRES_AT_MS: &str = "attempt_expires_at_ms";
 const CAPACITY_ROOT_ID: &str = "plane";
@@ -125,7 +126,7 @@ impl DynamoTargetRegistry {
                  expires_at_ms = :expires, launch_request = :launch_request, \
                  attempt_id = :attempt_id, attempt_expires_at_ms = :attempt_expires, \
                  updated_at_ms = :now \
-                 REMOVE target_ref, installed_at_ms, reason, gone_at_ms, terminated_at_ms, \
+                 REMOVE target_ref, control_token, installed_at_ms, reason, gone_at_ms, terminated_at_ms, \
                  expires_at_s",
             )
             .expression_attribute_names("#state", STATE)
@@ -243,7 +244,7 @@ impl DynamoTargetRegistry {
                  expires_at_ms = :expires, launch_request = :launch_request, \
                  attempt_id = :attempt_id, attempt_expires_at_ms = :attempt_expires, \
                  updated_at_ms = :now \
-                 REMOVE target_ref, installed_at_ms, reason, gone_at_ms, terminated_at_ms, \
+                 REMOVE target_ref, control_token, installed_at_ms, reason, gone_at_ms, terminated_at_ms, \
                  expires_at_s",
             )
             .expression_attribute_names("#state", STATE)
@@ -467,12 +468,9 @@ impl DurableTargetRegistry for DynamoTargetRegistry {
     async fn install(
         &self,
         lease: &MaterializationLease,
-        target_ref: &str,
-        target_generation: &str,
+        target: &hand_core::materialization::PhysicalTarget,
         now_ms: u64,
     ) -> Result<InstallOutcome, MaterializationError> {
-        let target =
-            hand_core::materialization::PhysicalTarget::new(target_ref, target_generation)?;
         let result = self
             .db
             .update_item()
@@ -485,7 +483,8 @@ impl DurableTargetRegistry for DynamoTargetRegistry {
             )
             .update_expression(
                 "SET #state = :installed, target_ref = :target_ref, \
-                 generation = :target_generation, installed_at_ms = :now, updated_at_ms = :now \
+                 generation = :target_generation, control_token = :control_token, \
+                 installed_at_ms = :now, updated_at_ms = :now \
                  REMOVE reservation_id, lease_expires_at_ms, reason, gone_at_ms, \
                  terminated_at_ms, expires_at_s, launch_request, attempt_id, \
                  attempt_expires_at_ms",
@@ -496,6 +495,10 @@ impl DurableTargetRegistry for DynamoTargetRegistry {
             .expression_attribute_values(":reservation", s(&lease.reservation_id))
             .expression_attribute_values(":generation", s(&lease.generation))
             .expression_attribute_values(":target_generation", s(&target.generation))
+            .expression_attribute_values(
+                ":control_token",
+                AttributeValue::B(Blob::new(target.control_token.expose().as_bytes())),
+            )
             .expression_attribute_values(":spec_digest", s(&lease.spec_digest))
             .expression_attribute_values(":target_ref", s(&target.target_ref))
             .expression_attribute_values(":now", n(now_ms))
@@ -523,6 +526,7 @@ impl DurableTargetRegistry for DynamoTargetRegistry {
                     .filter(|installed| {
                         installed.target_ref == target.target_ref
                             && installed.generation == target.generation
+                            && installed.control_token == target.control_token
                             && installed.spec_digest == lease.spec_digest
                     });
                 Ok(exact.map_or(InstallOutcome::ReservationLost, InstallOutcome::Installed))
@@ -686,7 +690,7 @@ async fn transition_terminalish(
         )
         .update_expression(format!(
             "SET #state = :new_state, reason = :reason, {timestamp_field} = :now, \
-             updated_at_ms = :now REMOVE target_ref, installed_at_ms, expires_at_ms, expires_at_s"
+             updated_at_ms = :now REMOVE target_ref, control_token, installed_at_ms, expires_at_ms, expires_at_s"
         ))
         .expression_attribute_names("#state", STATE)
         .expression_attribute_values(":installed", s(INSTALLED))
@@ -822,6 +826,13 @@ fn parse_record(
         },
         INSTALLED => DurableTargetState::Installed {
             target_ref: string("target_ref")?,
+            control_token: attrs
+                .get(CONTROL_TOKEN)
+                .and_then(|value| value.as_b().ok())
+                .map(|value| value.as_ref().to_vec())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .ok_or_else(|| corrupt("missing binary control_token"))
+                .and_then(ControlToken::new)?,
             installed_at_ms: number("installed_at_ms")?,
             expires_at_ms: number("expires_at_ms")?,
         },
@@ -1054,11 +1065,18 @@ mod tests {
         installed.remove(ATTEMPT_EXPIRES_AT_MS);
         installed.remove("lease_expires_at_ms");
         installed.insert("target_ref".into(), s("mvm-1"));
+        installed.insert(
+            CONTROL_TOKEN.into(),
+            AttributeValue::B(Blob::new(format!("control-{}", "c".repeat(64)))),
+        );
         installed.insert("installed_at_ms".into(), n(20));
-        assert!(parse_record(&installed).unwrap().installed().is_some());
+        let parsed = parse_record(&installed).unwrap();
+        assert!(parsed.installed().is_some());
+        assert!(!format!("{parsed:?}").contains(&format!("control-{}", "c".repeat(64))));
 
         installed.insert(STATE.into(), s(TERMINATED));
         installed.remove("target_ref");
+        installed.remove(CONTROL_TOKEN);
         installed.remove("installed_at_ms");
         installed.remove("expires_at_ms");
         installed.insert("reason".into(), s("session deleted"));

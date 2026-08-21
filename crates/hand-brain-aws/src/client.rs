@@ -10,10 +10,11 @@ use base64::Engine as _;
 use brain_protocol::contract::HAND_CONTRACT_DIGEST;
 use brain_protocol::hand::{HandError, HandErrorCode};
 use futures_util::{SinkExt as _, StreamExt as _};
+use hand_core::materialization::InstalledTarget;
 use hand_lambda::control::{AUTH_HEADER, Control, ControlError, is_terminated};
 use hand_lambda::launch::{self, LaunchedHand};
 use hand_wire::{
-    FILE_ENTRY_HEADER, MAX_BUNDLE_INSTALL_BYTES, MAX_INSTALL_BODY_BYTES,
+    CONTROL_AUTH_HEADER, FILE_ENTRY_HEADER, MAX_BUNDLE_INSTALL_BYTES, MAX_INSTALL_BODY_BYTES,
     MAX_INSTALL_METADATA_BYTES, MAX_WIRE_FRAME_BYTES, OBJECT_METADATA_HEADER, RequestCall,
     RequestFrame, ResponseFrame, ResponseReply,
 };
@@ -79,7 +80,8 @@ impl GuestClient {
         self.endpoints.write().await.remove(target_ref);
     }
 
-    async fn endpoint(&self, target_ref: &str) -> Result<LaunchedHand, HandError> {
+    async fn endpoint(&self, target: &InstalledTarget) -> Result<LaunchedHand, HandError> {
+        let target_ref = target.target_ref.as_str();
         if let Some(endpoint) = self.endpoints.read().await.get(target_ref)
             && endpoint.minted_at.elapsed() < AUTH_REFRESH_AFTER
         {
@@ -112,6 +114,7 @@ impl GuestClient {
             microvm_id: target_ref.into(),
             endpoint: launch::normalise_endpoint(&endpoint),
             auth_token,
+            control_token: target.control_token.clone(),
         };
         self.remember(hand.clone()).await;
         Ok(hand)
@@ -119,7 +122,7 @@ impl GuestClient {
 
     pub async fn rpc(
         &self,
-        target_ref: &str,
+        target: &InstalledTarget,
         call: RequestCall,
     ) -> Result<ResponseReply, HandError> {
         let frame = RequestFrame {
@@ -148,7 +151,7 @@ impl GuestClient {
         // the provider JWE never changes the target or connector.
         let mut saw_application_unavailable = false;
         for attempt in 0..2 {
-            let endpoint = self.endpoint(target_ref).await?;
+            let endpoint = self.endpoint(target).await?;
             let result: Result<ResponseReply, RpcAttemptError> =
                 match tokio::time::timeout(RPC_TIMEOUT, async {
                     let mut socket = match launch::connect(&endpoint).await {
@@ -207,13 +210,13 @@ impl GuestClient {
                         return Err(endpoint_application_gone());
                     }
                     if attempt == 0 {
-                        self.forget(target_ref).await;
+                        self.forget(&target.target_ref).await;
                     } else {
                         return Err(temporary("physical sandbox endpoint is unavailable"));
                     }
                 }
                 Err(RpcAttemptError::Hand(error)) if attempt == 0 && error.retryable => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Err(RpcAttemptError::Hand(error)) => return Err(error),
             }
@@ -223,7 +226,7 @@ impl GuestClient {
 
     pub async fn post_json<T: serde::Serialize>(
         &self,
-        target_ref: &str,
+        target: &InstalledTarget,
         path: &str,
         body: &T,
     ) -> Result<(), HandError> {
@@ -234,25 +237,25 @@ impl GuestClient {
                 "install body is invalid",
             )
         })?;
-        self.post_bytes(target_ref, path, bytes, "application/json")
+        self.post_bytes(target, path, bytes, "application/json")
             .await
     }
 
     pub async fn post_blob<T: serde::Serialize>(
         &self,
-        target_ref: &str,
+        target: &InstalledTarget,
         path: &str,
         metadata: &T,
         bytes: &[u8],
     ) -> Result<(), HandError> {
         let body = encode_blob_install(metadata, bytes)?;
-        self.post_bytes(target_ref, path, body, "application/octet-stream")
+        self.post_bytes(target, path, body, "application/octet-stream")
             .await
     }
 
     pub async fn post_file<T: serde::Serialize>(
         &self,
-        target_ref: &str,
+        target: &InstalledTarget,
         path: &str,
         metadata: &T,
         file_path: &Path,
@@ -268,7 +271,7 @@ impl GuestClient {
         let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(metadata);
         let mut saw_application_unavailable = false;
         for attempt in 0..2 {
-            let endpoint = self.endpoint(target_ref).await?;
+            let endpoint = self.endpoint(target).await?;
             let file = tokio::fs::File::open(file_path)
                 .await
                 .map_err(|_| temporary("staged object is unavailable"))?;
@@ -278,6 +281,7 @@ impl GuestClient {
                 .http
                 .post(format!("{}{path}", endpoint.endpoint))
                 .header(AUTH_HEADER, &endpoint.auth_token)
+                .header(CONTROL_AUTH_HEADER, target.control_token.expose())
                 .header(OBJECT_METADATA_HEADER, &metadata)
                 .header(reqwest::header::CONTENT_LENGTH, bytes)
                 .body(body)
@@ -287,20 +291,20 @@ impl GuestClient {
             match response {
                 Ok(response) if response.status().is_success() => return Ok(()),
                 Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Ok(response) if response.status().as_u16() == 502 => {
                     if record_application_failure(&mut saw_application_unavailable, attempt) {
                         return Err(endpoint_application_gone());
                     }
                     if attempt == 0 {
-                        self.forget(target_ref).await;
+                        self.forget(&target.target_ref).await;
                     } else {
                         return Err(temporary("physical sandbox endpoint is unavailable"));
                     }
                 }
                 Ok(response) if response.status().is_server_error() && attempt == 0 => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Ok(response) => {
                     return Err(endpoint_response_error(
@@ -308,7 +312,7 @@ impl GuestClient {
                         "guest object install",
                     ));
                 }
-                Err(_) if attempt == 0 => self.forget(target_ref).await,
+                Err(_) if attempt == 0 => self.forget(&target.target_ref).await,
                 Err(_) => return Err(temporary("guest object install failed")),
             }
         }
@@ -317,7 +321,7 @@ impl GuestClient {
 
     pub async fn export_file(
         &self,
-        target_ref: &str,
+        target: &InstalledTarget,
         request: &brain_protocol::hand::SandboxFileRequest,
     ) -> Result<(brain_protocol::hand::FileEntry, reqwest::Response), HandError> {
         let encoded = serde_json::to_vec(request).map_err(|_| {
@@ -329,11 +333,12 @@ impl GuestClient {
         })?;
         let mut saw_application_unavailable = false;
         for attempt in 0..2 {
-            let endpoint = self.endpoint(target_ref).await?;
+            let endpoint = self.endpoint(target).await?;
             let response = self
                 .http
                 .post(format!("{}/internal/files/export", endpoint.endpoint))
                 .header(AUTH_HEADER, &endpoint.auth_token)
+                .header(CONTROL_AUTH_HEADER, target.control_token.expose())
                 .header("content-type", "application/json")
                 .body(encoded.clone())
                 .timeout(Duration::from_secs(15 * 60))
@@ -355,20 +360,20 @@ impl GuestClient {
                     return Ok((metadata, response));
                 }
                 Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Ok(response) if response.status().as_u16() == 502 => {
                     if record_application_failure(&mut saw_application_unavailable, attempt) {
                         return Err(endpoint_application_gone());
                     }
                     if attempt == 0 {
-                        self.forget(target_ref).await;
+                        self.forget(&target.target_ref).await;
                     } else {
                         return Err(temporary("physical sandbox endpoint is unavailable"));
                     }
                 }
                 Ok(response) if response.status().is_server_error() && attempt == 0 => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Ok(response) => {
                     return Err(endpoint_response_error(
@@ -376,7 +381,7 @@ impl GuestClient {
                         "guest file export",
                     ));
                 }
-                Err(_) if attempt == 0 => self.forget(target_ref).await,
+                Err(_) if attempt == 0 => self.forget(&target.target_ref).await,
                 Err(_) => return Err(temporary("guest file export failed")),
             }
         }
@@ -385,7 +390,7 @@ impl GuestClient {
 
     async fn post_bytes(
         &self,
-        target_ref: &str,
+        target: &InstalledTarget,
         path: &str,
         body: Vec<u8>,
         content_type: &str,
@@ -399,11 +404,12 @@ impl GuestClient {
         }
         let mut saw_application_unavailable = false;
         for attempt in 0..2 {
-            let endpoint = self.endpoint(target_ref).await?;
+            let endpoint = self.endpoint(target).await?;
             let response = self
                 .http
                 .post(format!("{}{path}", endpoint.endpoint))
                 .header(AUTH_HEADER, &endpoint.auth_token)
+                .header(CONTROL_AUTH_HEADER, target.control_token.expose())
                 .header("content-type", content_type)
                 .body(body.clone())
                 .timeout(RPC_TIMEOUT)
@@ -412,25 +418,25 @@ impl GuestClient {
             match response {
                 Ok(response) if response.status().is_success() => return Ok(()),
                 Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Ok(response) if response.status().as_u16() == 502 => {
                     if record_application_failure(&mut saw_application_unavailable, attempt) {
                         return Err(endpoint_application_gone());
                     }
                     if attempt == 0 {
-                        self.forget(target_ref).await;
+                        self.forget(&target.target_ref).await;
                     } else {
                         return Err(temporary("physical sandbox endpoint is unavailable"));
                     }
                 }
                 Ok(response) if response.status().is_server_error() && attempt == 0 => {
-                    self.forget(target_ref).await;
+                    self.forget(&target.target_ref).await;
                 }
                 Ok(response) => {
                     return Err(endpoint_response_error(response.status(), "guest install"));
                 }
-                Err(_) if attempt == 0 => self.forget(target_ref).await,
+                Err(_) if attempt == 0 => self.forget(&target.target_ref).await,
                 Err(_) => return Err(temporary("guest install request failed")),
             }
         }

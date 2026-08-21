@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config \
       python3 python3-venv python3-pip pipx \
       ripgrep jq unzip zip zstd xz-utils file less \
-      procps coreutils bash libcap2-bin util-linux iproute2 nftables \
+      procps coreutils bash libcap2-bin util-linux iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && case "$(dpkg --print-architecture)" in \
          arm64) node_arch=arm64; node_sha=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8 ;; \
@@ -97,12 +97,12 @@ RUN chown root:hand /usr/local/bin/hand-guest \
     && rm /tmp/tool-boundary.c /tmp/proc-secret-static.c \
     && chown root:root /usr/local/lib/hand/tool-boundary.so /usr/local/lib/hand/proc-secret-static \
     && chmod 0555 /usr/local/lib/hand/tool-boundary.so /usr/local/lib/hand/proc-secret-static \
-    && setcap cap_kill,cap_setuid,cap_setgid=ep /usr/local/bin/hand-guest \
+    && setcap cap_kill,cap_setuid,cap_setgid,cap_net_bind_service=ep /usr/local/bin/hand-guest \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/tool-boundary.so)" = "0:0:555" \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/proc-secret-static)" = "0:0:555" \
     && ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
-    && test "$(getcap -r / 2>/dev/null)" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+    && test "$(getcap -r / 2>/dev/null)" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid,cap_net_bind_service=ep"
 
 WORKDIR /workspace
 EXPOSE 8080

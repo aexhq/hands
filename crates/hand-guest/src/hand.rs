@@ -69,6 +69,7 @@ struct ArmedTarget {
     resource_class: String,
     resources: ResourceCeiling,
     network: NetworkCeiling,
+    control_token: hand_core::materialization::ControlToken,
     proxy_environment: HashMap<String, String>,
     canary_exit_after_operation_id: Option<String>,
 }
@@ -259,6 +260,27 @@ impl Hand {
         self.target.read().await.is_some()
     }
 
+    /// Checks the generation-scoped bearer without exposing either value through formatting.
+    /// Hashing both sides gives the final comparison a fixed width even for hostile headers.
+    pub async fn control_authorized(&self, candidate: Option<&str>) -> bool {
+        let Some(candidate) = candidate else {
+            return false;
+        };
+        let target = self.target.read().await;
+        let Some(expected) = target.as_ref().map(|target| target.control_token.expose()) else {
+            return false;
+        };
+        let expected_hash = Sha256::digest(expected.as_bytes());
+        let candidate_hash = Sha256::digest(candidate.as_bytes());
+        let difference = expected_hash
+            .iter()
+            .zip(candidate_hash.iter())
+            .fold(0u8, |difference, (expected, candidate)| {
+                difference | (expected ^ candidate)
+            });
+        difference == 0 && candidate.len() == expected.len()
+    }
+
     /// Arms an unconfigured generation exactly once. An exact provider retry is harmless; a
     /// different root/generation/network/resource seal is a permanent conflict.
     pub async fn arm(&self, target_ref: String, payload: RunPayload) -> Result<bool, HandError> {
@@ -308,6 +330,7 @@ impl Hand {
             resource_class: payload.resource_class,
             resources: payload.resources,
             network: payload.network,
+            control_token: payload.control_token,
             proxy_environment,
             canary_exit_after_operation_id: payload.canary_exit_after_operation_id,
         };
@@ -322,6 +345,7 @@ impl Hand {
                 && existing.resource_class == candidate.resource_class
                 && canonical_equal(&existing.resources, &candidate.resources)?
                 && canonical_equal(&existing.network, &candidate.network)?
+                && existing.control_token == candidate.control_token
                 && existing.canary_exit_after_operation_id
                     == candidate.canary_exit_after_operation_id;
             return if exact {
@@ -2048,6 +2072,11 @@ mod tests {
                 "timeout_ms": 60000
             }))
             .unwrap(),
+            control_token: hand_core::materialization::ControlToken::new(format!(
+                "control-{}",
+                "a".repeat(64)
+            ))
+            .expect("test control token"),
             allowlist_proxy: matches!(network, NetworkCeiling::Allowlist(_)).then(|| {
                 AllowlistProxy {
                     authority: "10.0.0.10:8443".into(),
@@ -2083,6 +2112,24 @@ mod tests {
             operation_id: operation_id.into(),
             request_digest: digest.to_string().repeat(64),
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_exact_generation_control_bearer_is_authorized() {
+        let directory = tempfile::tempdir().unwrap();
+        let hand = Hand::new(Config::for_test(directory.path())).unwrap();
+        let payload = run_payload(NetworkCeiling::None);
+        let exact = payload.control_token.expose().to_owned();
+        hand.arm("target-1".into(), payload).await.unwrap();
+
+        assert!(!hand.control_authorized(None).await);
+        assert!(!hand.control_authorized(Some("")).await);
+        assert!(
+            !hand
+                .control_authorized(Some(&format!("control-{}", "b".repeat(64))))
+                .await
+        );
+        assert!(hand.control_authorized(Some(&exact)).await);
     }
 
     #[test]

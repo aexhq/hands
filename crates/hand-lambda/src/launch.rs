@@ -1,8 +1,9 @@
 //! One session's arc on a Lambda MicroVM.
 //!
-//! Launch delivers only the immutable, credential-free physical target seal in the run-hook
-//! payload. Session secret material is redeemed later over the trusted control channel, after
-//! durable target installation. The caller durably installs the MicroVM identity returned by
+//! Launch delivers the immutable physical target seal plus one generation-scoped guest-control
+//! bearer in the run-hook payload. It contains no cloud or customer credential. Session secret
+//! material is redeemed later over that authenticated control channel, after durable target
+//! installation. The caller durably installs the MicroVM identity returned by
 //! `RunMicrovm` before readiness checks, endpoint discovery, JWE minting, or any guest request.
 //!
 //! Brain's bounded observe schedule supplies endpoint traffic while an operation is live. An idle
@@ -15,7 +16,8 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use aws_sdk_lambdamicrovms::types::MicrovmState;
 use hand_core::connector::ConnectorRef;
-use hand_wire::RunPayload;
+use hand_core::materialization::ControlToken;
+use hand_wire::{CONTROL_AUTH_HEADER, RunPayload};
 
 use crate::control::{
     AUTH_HEADER, Control, ControlError, ExactRunMicrovmRequest, Microvm, is_gone,
@@ -35,6 +37,8 @@ pub struct LaunchedHand {
     pub endpoint: String,
     /// The JWE for `X-aws-proxy-auth`.
     pub auth_token: String,
+    /// The generation-scoped guest bearer. Formatting stays unavailable through ControlToken.
+    pub control_token: ControlToken,
 }
 
 /// The only provider identity needed at the durable target-install boundary. Endpoint discovery
@@ -176,6 +180,14 @@ pub async fn connect(hand: &LaunchedHand) -> Result<GuestSocket, GuestConnectErr
         .parse()
         .map_err(|_| GuestConnectError::InvalidRequest)?;
     request.headers_mut().insert(AUTH_HEADER, auth);
+    let control_auth = hand
+        .control_token
+        .expose()
+        .parse()
+        .map_err(|_| GuestConnectError::InvalidRequest)?;
+    request
+        .headers_mut()
+        .insert(CONTROL_AUTH_HEADER, control_auth);
     match tokio_tungstenite::connect_async(request).await {
         Ok((socket, _)) => Ok(socket),
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
@@ -224,7 +236,8 @@ mod tests {
             "connector": "none",
             "resource_class": "microvm-1gb",
             "resources": {"max_output_bytes": 1024, "timeout_ms": 1000},
-            "network": {"kind": "none"}
+            "network": {"kind": "none"},
+            "control_token": format!("control-{}", "a".repeat(64))
         }))
         .unwrap();
         let encoded = run_payload(&payload).unwrap();

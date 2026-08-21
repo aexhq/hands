@@ -13,6 +13,7 @@ use brain_protocol::hand::{
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use hand_core::connector::{ConnectorClass, ConnectorRef, GatewayAuthority};
+use hand_core::materialization::ControlToken;
 use hand_wire::{
     AllowlistProxy, RequestCall, RequestFrame, ResponseFrame, ResponseReply, RunPayload,
 };
@@ -86,6 +87,15 @@ struct PublicNetworkCanaryConfig {
     customer_hand_hosts: [String; 2],
 }
 
+struct KnownTargetSeal {
+    target_id: String,
+    generation: String,
+    root_id: String,
+    session_id: String,
+    operation_id: String,
+    control_token: ControlToken,
+}
+
 async fn run_restricted_network_canary(
     control: &Control,
     image_arn: &str,
@@ -131,6 +141,7 @@ async fn run_restricted_network_canary(
         authority: gateway.as_authority(),
         capability: "invalid-release-canary-capability".into(),
     });
+    let control_token = canary_control_token();
     let payload = RunPayload {
         contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
         generation: generation.clone(),
@@ -144,6 +155,7 @@ async fn run_restricted_network_canary(
             "timeout_ms": 30_000
         }))?,
         network,
+        control_token: control_token.clone(),
         allowlist_proxy,
         canary_exit_after_operation_id: None,
     };
@@ -157,19 +169,16 @@ async fn run_restricted_network_canary(
     )
     .await
     .with_context(|| format!("launching the {label} connector canary"))?;
-    let target_id = vm.id;
-    let result = run_restricted_network_on_known_target(
-        control,
-        &target_id,
-        &generation,
-        &root_id,
-        &session_id,
-        &operation_id,
-        gateway,
-        class,
-    )
-    .await;
-    let cleanup = terminate_known_target(control, &target_id).await;
+    let target = KnownTargetSeal {
+        target_id: vm.id,
+        generation,
+        root_id,
+        session_id,
+        operation_id,
+        control_token,
+    };
+    let result = run_restricted_network_on_known_target(control, &target, gateway, class).await;
+    let cleanup = terminate_known_target(control, &target.target_id).await;
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(canary), Ok(())) => Err(canary),
@@ -182,32 +191,33 @@ async fn run_restricted_network_canary(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_restricted_network_on_known_target(
     control: &Control,
-    target_id: &str,
-    generation: &str,
-    root_id: &str,
-    session_id: &str,
-    operation_id: &str,
+    target: &KnownTargetSeal,
     gateway: &GatewayAuthority,
     class: ConnectorClass,
 ) -> anyhow::Result<()> {
-    let vm =
-        launch::wait_for_state(control, target_id, &MicrovmState::Running, STATE_TIMEOUT).await?;
+    let vm = launch::wait_for_state(
+        control,
+        &target.target_id,
+        &MicrovmState::Running,
+        STATE_TIMEOUT,
+    )
+    .await?;
     let endpoint = vm
         .endpoint
         .context("restricted network canary target has no endpoint")?;
     let hand = LaunchedHand {
-        microvm_id: target_id.into(),
+        microvm_id: target.target_id.clone(),
         endpoint: launch::normalise_endpoint(&endpoint),
-        auth_token: control.auth_token(target_id).await?,
+        auth_token: control.auth_token(&target.target_id).await?,
+        control_token: target.control_token.clone(),
     };
     let request = restricted_network_execution(
-        operation_id,
-        generation,
-        root_id,
-        session_id,
+        &target.operation_id,
+        &target.generation,
+        &target.root_id,
+        &target.session_id,
         gateway,
         class,
     )?;
@@ -283,6 +293,7 @@ async fn run_public_network_canary(
         .duration_since(UNIX_EPOCH)
         .context("system clock precedes Unix epoch")?
         .as_millis() as u64;
+    let control_token = canary_control_token();
     let payload = RunPayload {
         contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
         generation: generation.clone(),
@@ -296,6 +307,7 @@ async fn run_public_network_canary(
             "timeout_ms": 30_000
         }))?,
         network: NetworkCeiling::Public,
+        control_token: control_token.clone(),
         allowlist_proxy: None,
         canary_exit_after_operation_id: None,
     };
@@ -309,18 +321,17 @@ async fn run_public_network_canary(
     )
     .await
     .context("launching the direct-public network canary")?;
-    let target_id = vm.id;
-    let result = run_public_network_on_known_target(
-        control,
-        &target_id,
-        &generation,
-        &root_id,
-        &session_id,
-        &operation_id,
-        &cfg.customer_hand_hosts,
-    )
-    .await;
-    let cleanup = terminate_known_target(control, &target_id).await;
+    let target = KnownTargetSeal {
+        target_id: vm.id,
+        generation,
+        root_id,
+        session_id,
+        operation_id,
+        control_token,
+    };
+    let result =
+        run_public_network_on_known_target(control, &target, &cfg.customer_hand_hosts).await;
+    let cleanup = terminate_known_target(control, &target.target_id).await;
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(canary), Ok(())) => Err(canary),
@@ -333,28 +344,30 @@ async fn run_public_network_canary(
 
 async fn run_public_network_on_known_target(
     control: &Control,
-    target_id: &str,
-    generation: &str,
-    root_id: &str,
-    session_id: &str,
-    operation_id: &str,
+    target: &KnownTargetSeal,
     customer_hand_hosts: &[String; 2],
 ) -> anyhow::Result<()> {
-    let vm =
-        launch::wait_for_state(control, target_id, &MicrovmState::Running, STATE_TIMEOUT).await?;
+    let vm = launch::wait_for_state(
+        control,
+        &target.target_id,
+        &MicrovmState::Running,
+        STATE_TIMEOUT,
+    )
+    .await?;
     let endpoint = vm
         .endpoint
         .context("network canary target has no endpoint")?;
     let hand = LaunchedHand {
-        microvm_id: target_id.into(),
+        microvm_id: target.target_id.clone(),
         endpoint: launch::normalise_endpoint(&endpoint),
-        auth_token: control.auth_token(target_id).await?,
+        auth_token: control.auth_token(&target.target_id).await?,
+        control_token: target.control_token.clone(),
     };
     let request = public_network_execution(
-        operation_id,
-        generation,
-        root_id,
-        session_id,
+        &target.operation_id,
+        &target.generation,
+        &target.root_id,
+        &target.session_id,
         customer_hand_hosts,
     )?;
     let mut socket = launch::connect(&hand)
@@ -422,6 +435,7 @@ pub async fn run_no_respawn_canary(
         .duration_since(UNIX_EPOCH)
         .context("system clock precedes Unix epoch")?
         .as_millis() as u64;
+    let control_token = canary_control_token();
     let payload = RunPayload {
         contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
         generation: generation.clone(),
@@ -435,6 +449,7 @@ pub async fn run_no_respawn_canary(
             "timeout_ms": 30_000
         }))?,
         network: NetworkCeiling::None,
+        control_token: control_token.clone(),
         allowlist_proxy: None,
         canary_exit_after_operation_id: Some(operation_id.clone()),
     };
@@ -448,18 +463,16 @@ pub async fn run_no_respawn_canary(
     )
     .await
     .context("launching the no-respawn image canary")?;
-    let target_id = vm.id;
-    let result = run_on_known_target(
-        control,
-        http,
-        &target_id,
-        &generation,
-        &root_id,
-        &session_id,
-        &operation_id,
-    )
-    .await;
-    let cleanup = terminate_known_target(control, &target_id).await;
+    let target = KnownTargetSeal {
+        target_id: vm.id,
+        generation,
+        root_id,
+        session_id,
+        operation_id,
+        control_token,
+    };
+    let result = run_on_known_target(control, http, &target).await;
+    let cleanup = terminate_known_target(control, &target.target_id).await;
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(canary), Ok(())) => Err(canary),
@@ -473,21 +486,28 @@ pub async fn run_no_respawn_canary(
 async fn run_on_known_target(
     control: &Control,
     http: &reqwest::Client,
-    target_id: &str,
-    generation: &str,
-    root_id: &str,
-    session_id: &str,
-    operation_id: &str,
+    target: &KnownTargetSeal,
 ) -> anyhow::Result<()> {
-    let vm =
-        launch::wait_for_state(control, target_id, &MicrovmState::Running, STATE_TIMEOUT).await?;
+    let vm = launch::wait_for_state(
+        control,
+        &target.target_id,
+        &MicrovmState::Running,
+        STATE_TIMEOUT,
+    )
+    .await?;
     let endpoint = vm.endpoint.context("canary target has no endpoint")?;
     let mut hand = LaunchedHand {
-        microvm_id: target_id.into(),
+        microvm_id: target.target_id.clone(),
         endpoint: launch::normalise_endpoint(&endpoint),
-        auth_token: control.auth_token(target_id).await?,
+        auth_token: control.auth_token(&target.target_id).await?,
+        control_token: target.control_token.clone(),
     };
-    let request = canary_execution(operation_id, generation, root_id, session_id)?;
+    let request = canary_execution(
+        &target.operation_id,
+        &target.generation,
+        &target.root_id,
+        &target.session_id,
+    )?;
     let mut socket = launch::connect(&hand)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -536,9 +556,9 @@ async fn run_on_known_target(
     drop(socket);
 
     assert_persistent_502(control, http, &hand, "after deliberate crash").await?;
-    transition_and_wait(control, target_id, MicrovmState::Suspended).await?;
-    transition_and_wait(control, target_id, MicrovmState::Running).await?;
-    hand.auth_token = control.auth_token(target_id).await?;
+    transition_and_wait(control, &target.target_id, MicrovmState::Suspended).await?;
+    transition_and_wait(control, &target.target_id, MicrovmState::Running).await?;
+    hand.auth_token = control.auth_token(&target.target_id).await?;
     assert_persistent_502(control, http, &hand, "after suspend/resume").await?;
 
     // Attempt the exact operation/digest again. Persistent provider 502 must prevent transport
@@ -1139,6 +1159,14 @@ async fn terminate_known_target(control: &Control, target_id: &str) -> anyhow::R
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn canary_control_token() -> ControlToken {
+    ControlToken::new(format!(
+        "control-{}",
+        hex::encode(rand::random::<[u8; 32]>())
+    ))
+    .expect("random canary control token satisfies its exact grammar")
 }
 
 #[cfg(test)]
