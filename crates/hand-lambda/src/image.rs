@@ -251,8 +251,8 @@ pub struct PublishConfig {
     pub build_role_arn: String,
     /// CloudWatch log group for build output.
     pub log_group: String,
-    /// Exact plane-owned connector ARNs this immutable image may use. Runtime still selects only
-    /// one sealed class for each generation.
+    /// Exact plane-owned connector ARNs accepted by the release. `RunMicrovm` selects one sealed
+    /// class for each generation; the image build itself uses one AWS-managed connector.
     pub egress_connectors: Vec<String>,
 }
 
@@ -265,7 +265,7 @@ pub struct PublishedImage {
 
 /// Bump this whenever a fixed `CreateMicrovmImage`/`UpdateMicrovmImage` request field changes.
 /// Variable request fields are hashed individually below.
-const PUBLISH_REQUEST_TOKEN_SCHEMA: &str = "hand-lambda-publish-request-v3";
+const PUBLISH_REQUEST_TOKEN_SCHEMA: &str = "hand-lambda-publish-request-v4";
 
 #[derive(Clone, Copy)]
 enum PublishOperation {
@@ -283,8 +283,9 @@ impl PublishOperation {
 }
 
 /// AWS treats a client token as an idempotency key for the complete API request, not merely the
-/// uploaded bytes. Hash every variable request identity field with unambiguous length prefixes.
-/// The schema marker represents the fixed fields (hooks, ARM64, and capabilities).
+/// uploaded bytes. Hash every variable request identity field and the validated runtime connector
+/// policy with unambiguous length prefixes. The schema marker represents the fixed fields (hooks,
+/// ARM64, image-build internet egress, and capabilities).
 fn publish_client_token(
     operation: PublishOperation,
     region: &str,
@@ -369,6 +370,10 @@ fn validated_connectors(connectors: &[String], region: &str) -> anyhow::Result<V
     Ok(connectors)
 }
 
+fn image_build_egress_connector(region: &str) -> String {
+    format!("arn:aws:lambda:{region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS")
+}
+
 /// Uploads the context and registers a new image (or a new version of an existing one), then
 /// waits for AWS's build to finish. Idempotent by exact publish request: the client token includes
 /// the artifact digest and all plane-specific request identity.
@@ -378,7 +383,8 @@ pub async fn publish(
     cfg: &PublishConfig,
     zip: Vec<u8>,
 ) -> anyhow::Result<PublishedImage> {
-    let egress_connectors = validated_connectors(&cfg.egress_connectors, control.region())?;
+    validated_connectors(&cfg.egress_connectors, control.region())?;
+    let image_build_egress = image_build_egress_connector(control.region());
     let key = artifact_key(&zip);
     let uri = format!("s3://{}/{key}", cfg.bucket);
     s3.put_object()
@@ -432,7 +438,7 @@ pub async fn publish(
             .description(format!("Hand guest ({MVP_TARGET_MEMORY_MIB} MiB shape)"))
             .code_artifact(CodeArtifact::Uri(uri))
             .logging(logging)
-            .set_egress_network_connectors(Some(egress_connectors.clone()))
+            .egress_network_connectors(image_build_egress.clone())
             .cpu_configurations(
                 CpuConfiguration::builder()
                     .architecture(Architecture::Arm64)
@@ -468,7 +474,7 @@ pub async fn publish(
             .description(format!("Hand guest ({MVP_TARGET_MEMORY_MIB} MiB shape)"))
             .code_artifact(CodeArtifact::Uri(uri))
             .logging(logging)
-            .set_egress_network_connectors(Some(egress_connectors))
+            .egress_network_connectors(image_build_egress)
             .cpu_configurations(
                 CpuConfiguration::builder()
                     .architecture(Architecture::Arm64)
@@ -684,6 +690,21 @@ mod tests {
                 &cfg,
                 &key,
             )
+        );
+    }
+
+    #[test]
+    fn image_build_uses_one_provider_connector_while_runtime_policy_keeps_all_three() {
+        let cfg = publish_config("hands-dev-1gb");
+        assert_eq!(
+            validated_connectors(&cfg.egress_connectors, "us-east-1")
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            image_build_egress_connector("us-east-1"),
+            "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
         );
     }
 
