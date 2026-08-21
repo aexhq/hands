@@ -60,10 +60,10 @@ pub const DEFAULT_SWAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MVP_TARGET_MEMORY_MIB: u32 = 1_024;
 
 /// The boot script: root sets up DNS and swap, then a root-owned launcher binds the reserved
-/// provider port and drops to the dedicated Hand supervisor before exec. The supervisor binary
-/// retains only kill/setuid/setgid capability and irreversibly drops Tool children to `agent`;
-/// arbitrary code never shares the control UID. `CAP_KILL` is required because Linux does not
-/// grant a parent a special right to signal a child after that child changes to UID 1000.
+/// provider port and drops to the dedicated Hand supervisor before exec. The launcher transfers
+/// only kill/setuid/setgid process capabilities. The supervisor irreversibly drops Tool children
+/// to `agent`; arbitrary code never shares the control UID. `CAP_KILL` is required because Linux
+/// does not grant a parent a special right to signal a child after that child changes to UID 1000.
 #[must_use]
 pub fn boot_script() -> String {
     format!(
@@ -173,8 +173,8 @@ RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     && test "$(stat -c '%d:%g' /workspace)" = "$(stat -c '%d:%g' /var/hand/file-staging)" \
     && test "$(stat -c '%a' /var/hand/file-staging)" = 2700
 
-# No Tool-visible package may retain a privilege transition. The only file capability added back
-    # is the dedicated Hand supervisor executable below.
+# No Tool-visible package may retain a privilege transition. The root-owned listener launcher
+# transfers the exact supervisor process capabilities without relying on filesystem capabilities.
 RUN find / -xdev -type f -perm /6000 -exec chmod a-s {{}} + \
     && getcap -r /usr /bin /sbin /usr/local 2>/dev/null \
          | awk '{{print $1}}' | sort -u | xargs -r -n1 setcap -r
@@ -199,13 +199,12 @@ RUN chown root:hand /usr/local/bin/hand-guest \
     && chown root:hand /usr/local/lib/hand/control-listener \
     && chmod 0555 /usr/local/lib/hand/tool-boundary.so /usr/local/lib/hand/proc-secret-static \
     && chmod 0750 /usr/local/lib/hand/control-listener \
-    && setcap cap_kill,cap_setuid,cap_setgid=ep /usr/local/bin/hand-guest \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/tool-boundary.so)" = "0:0:555" \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/proc-secret-static)" = "0:0:555" \
     && ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:1001:750" \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
-    && test "$(getcap -r / 2>/dev/null)" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+    && test -z "$(getcap -r / 2>/dev/null)"
 
 # Root on purpose: the boot script pins DNS and enables swap, then the listener launcher drops to
 # the supervisor before exec.
@@ -848,12 +847,15 @@ mod tests {
         assert!(boot.contains("max_user_namespaces"));
         assert!(boot.contains("ulimit -c 0"));
         assert!(boot.contains("umask 0002"));
-        assert!(df.contains("setcap cap_kill,cap_setuid,cap_setgid=ep"));
+        assert!(!df.contains("setcap cap_kill,cap_setuid,cap_setgid=ep"));
         assert!(df.contains("control-listener.c"));
         assert!(df.contains("0:1001:750"));
         assert!(df.contains("chown hand:agent /var/hand"));
         assert!(df.contains("chmod 0710 /var/hand"));
         assert!(listener.contains("setenv(\"HAND_LISTEN_FD\", listener_number, 1)"));
+        assert!(listener.contains("PR_SET_KEEPCAPS"));
+        assert!(listener.contains("PR_CAP_AMBIENT_RAISE"));
+        assert!(listener.contains("SYS_capset"));
         assert!(
             !listener.contains("dup2("),
             "the launcher must not replace a provider-owned descriptor"
@@ -863,9 +865,7 @@ mod tests {
             df.contains("! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP")
         );
         assert!(df.contains("find / -xdev -type f -perm /6000 -print -quit"));
-        assert!(df.contains(
-            "getcap -r / 2>/dev/null)\" = \"/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
-        ));
+        assert!(df.contains("test -z \"$(getcap -r / 2>/dev/null)\""));
         assert!(df.contains("find / -xdev -type f -perm /6000 -exec chmod a-s {} +"));
         assert!(df.contains("xargs -r -n1 setcap -r"));
         assert!(df.contains("/var/hand/file-staging"));

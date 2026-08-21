@@ -540,9 +540,17 @@ async fn run_on_known_target(
     let terminal = observation
         .terminal
         .context("canary effect did not reach a terminal receipt")?;
+    let diagnostic = terminal
+        .inline
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("no error detail");
     ensure!(
         terminal.outcome == TerminalOutcome::Completed,
-        "canary marker effect did not complete"
+        "canary marker effect ended as {} with exit code {:?}: {diagnostic}",
+        terminal.outcome,
+        terminal.exit_code
     );
     ensure!(
         terminal

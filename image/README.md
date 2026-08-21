@@ -38,10 +38,12 @@ passes only that socket descriptor to `hand-guest`; a background Tool therefore 
 impersonate the port after a supervisor crash. CI proves both Tool identity classes cannot
 authenticate to a live supervisor or bind the released control port.
 
-The build removes every package-owned setuid/setgid bit and inherited file capability before it
-adds back only `cap_kill,cap_setgid,cap_setuid=ep` on `hand-guest`. The supervisor needs the UID/GID
-pair to spawn Tool children and `CAP_KILL` to enforce their deadlines after the UID split; Linux
-does not give parents an implicit cross-UID signal right. Children clear every capability set and set
+The build removes every package-owned setuid/setgid bit and inherited file capability. The
+root-owned listener launcher carries only `CAP_KILL`, `CAP_SETGID`, and `CAP_SETUID` across its drop
+to the supervisor identity and into `hand-guest`; this does not depend on the provider honoring
+filesystem capabilities. The supervisor needs the UID/GID pair to spawn Tool children and
+`CAP_KILL` to enforce their deadlines after the UID split; Linux does not give parents an implicit
+cross-UID signal right. Children clear every capability set and set
 `no_new_privs`. Each immutable managed binding receives a distinct deterministic UID
 from a bounded 4,096-entry per-generation registry; collisions and exhaustion fail permanently
 instead of aliasing secret subsets. Parallel calls of the same binding deliberately share its UID

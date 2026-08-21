@@ -139,7 +139,7 @@ jobs:
           docker run --rm --entrypoint sh --user 0:0 hand:ci -ceu '
             test -z "$(find / -xdev -type f -perm /6000 -print -quit)"
             capabilities=$(getcap -r / 2>/dev/null || true)
-            test "$capabilities" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+            test -z "$capabilities"
             test "$(stat -c "%u:%g:%a" /var/hand)" = "1001:1000:710"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/control-listener)" = "0:1001:750"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/tool-boundary.so)" = "0:0:555"
