@@ -1,45 +1,48 @@
-//! `AbiError` constructors. Every refusal the hand sends goes through here.
+use brain_protocol::hand::{HandError, HandErrorCode};
 
-use brain_protocol::abi::{AbiError, ErrorCode};
-use serde_json::{Map, Value};
-
-pub type AbiResult<T> = Result<T, AbiError>;
-
-pub fn err(code: ErrorCode, message: impl Into<String>) -> AbiError {
-    AbiError {
+pub fn hand_error(code: HandErrorCode, retryable: bool, message: impl Into<String>) -> HandError {
+    let mut message = message.into();
+    if message.is_empty() {
+        message = "Hand request failed".into();
+    }
+    truncate_utf8(&mut message, 4096);
+    HandError {
         code,
-        message: message.into(),
-        retryable: false,
-        details: Map::new(),
+        details: serde_json::Map::new(),
+        message: message
+            .parse()
+            .unwrap_or_else(|_| "Hand request failed".parse().expect("bounded message")),
+        retryable,
     }
 }
 
-pub fn err_retryable(code: ErrorCode, message: impl Into<String>) -> AbiError {
-    AbiError {
-        code,
-        message: message.into(),
-        retryable: true,
-        details: Map::new(),
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
     }
-}
-
-pub fn err_with(
-    code: ErrorCode,
-    message: impl Into<String>,
-    details: Map<String, Value>,
-) -> AbiError {
-    AbiError {
-        code,
-        message: message.into(),
-        retryable: false,
-        details,
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
     }
+    value.truncate(boundary);
 }
 
-pub fn internal(e: impl std::fmt::Display) -> AbiError {
-    err(ErrorCode::Internal, e.to_string())
+pub fn invalid(message: impl Into<String>) -> HandError {
+    hand_error(HandErrorCode::InvalidRequest, false, message)
 }
 
-pub fn malformed(e: impl std::fmt::Display) -> AbiError {
-    err(ErrorCode::MalformedRequest, e.to_string())
+pub fn unavailable(message: impl Into<String>) -> HandError {
+    hand_error(HandErrorCode::TemporarilyUnavailable, true, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostile_unicode_diagnostics_truncate_only_on_a_character_boundary() {
+        let error = invalid("x".repeat(4095) + "🦀tail");
+        assert!(error.message.as_str().len() <= 4096);
+        assert!(error.message.as_str().ends_with('x'));
+    }
 }

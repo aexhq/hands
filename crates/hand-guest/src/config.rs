@@ -1,155 +1,145 @@
-//! Process configuration (environment-driven) and the fixed limits this hand declares.
+//! Environment-driven guest configuration and hard admission bounds.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use brain_protocol::abi::{EffectiveBounds, Limits};
-
-/// Environment variables the hand reads at start-up.
-pub const ENV_TOKEN: &str = "HAND_TOKEN";
 pub const ENV_LISTEN: &str = "HAND_LISTEN";
 pub const ENV_WORKSPACE: &str = "HAND_WORKSPACE";
-pub const ENV_HOME: &str = "HAND_HOME";
-pub const ENV_SPILL_DIR: &str = "HAND_SPILL_DIR";
+pub const ENV_STATE_DIR: &str = "HAND_STATE_DIR";
 pub const ENV_TOOL_DIR: &str = "HAND_TOOL_DIR";
 pub const ENV_TOOL_RUNNER: &str = "HAND_TOOL_RUNNER";
+pub const ENV_TOOL_BOUNDARY_LIBRARY: &str = "HAND_TOOL_BOUNDARY_LIBRARY";
+pub const ENV_SUPERVISOR_UID: &str = "HAND_SUPERVISOR_UID";
+pub const ENV_TOOL_UID: &str = "HAND_TOOL_UID";
+pub const ENV_TOOL_GID: &str = "HAND_TOOL_GID";
+
+pub const MAX_CONCURRENT_OPERATIONS: usize = 64;
+pub const MAX_RETAINED_OPERATIONS: usize = 1_024;
+pub const MAX_RETAINED_STDIN_WRITES: usize = 4_096;
+pub const MAX_RETAINED_TERMINAL_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_OPERATION_OUTPUT_BYTES: u64 = brain_protocol::MAX_TOOL_TERMINAL_INLINE_BYTES as u64;
+pub const MAX_OPERATION_TIMEOUT_MS: u64 = MAX_TARGET_LIFETIME_MS;
+pub const MAX_WAIT_MS: u64 = 30_000;
+pub const MAX_TARGET_LIFETIME_MS: u64 = 8 * 60 * 60 * 1_000;
+/// A physical generation refuses unbounded binding preparation. Managed bindings receive a
+/// distinct kernel uid from this range; the ordinary additional-sandbox shell remains
+/// `HAND_TOOL_UID` and all Tool processes share `HAND_TOOL_GID` for workspace collaboration.
+pub const MAX_PREPARED_BINDINGS: usize = 4_096;
+pub const MANAGED_BINDING_UID_MIN: u32 = 65_536;
+pub const MANAGED_BINDING_UID_SPAN: u32 = 2_000_000_000 - MANAGED_BINDING_UID_MIN;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    pub supervisor_uid: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
-    /// Per-session secret the brain must present in `hello`.
-    ///
-    /// `None` means the hand boots **unarmed**: every `hello` is refused until the platform
-    /// delivers the token through the `/run` lifecycle hook (Lambda MicroVM has no per-VM
-    /// environment, so the secret cannot arrive as an env var there).
-    pub token: Option<String>,
     pub workspace: PathBuf,
-    pub home: PathBuf,
-    pub spill_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub binding_dir: PathBuf,
     pub tool_dir: PathBuf,
+    pub object_dir: PathBuf,
     pub tool_runner: PathBuf,
-    /// Environment every lane starts from (before the session's `hello.env` overrides).
-    pub base_env: HashMap<String, String>,
-    pub limits: Limits,
+    pub tool_boundary_library: Option<PathBuf>,
+    pub tool_identity: Option<ToolIdentity>,
 }
 
 impl Config {
-    /// Read from the process environment. A missing `HAND_TOKEN` is not an error: the Hand
-    /// boots unarmed and waits for the `/run` lifecycle hook to deliver the session token. An
-    /// unarmed hand refuses every `hello`, so it never accepts an unauthenticated brain.
     pub fn from_env() -> anyhow::Result<Self> {
-        let token = std::env::var(ENV_TOKEN).ok().filter(|t| !t.is_empty());
-        let listen: SocketAddr = std::env::var(ENV_LISTEN)
+        let listen = std::env::var(ENV_LISTEN)
             .unwrap_or_else(|_| "0.0.0.0:8080".into())
             .parse()
-            .map_err(|e| anyhow::anyhow!("{ENV_LISTEN}: {e}"))?;
+            .map_err(|error| anyhow::anyhow!("{ENV_LISTEN}: {error}"))?;
         let workspace =
             PathBuf::from(std::env::var(ENV_WORKSPACE).unwrap_or_else(|_| "/workspace".into()));
-        let home = PathBuf::from(
-            std::env::var(ENV_HOME)
-                .or_else(|_| std::env::var("HOME"))
-                .unwrap_or_else(|_| "/home/agent".into()),
-        );
-        let spill_dir =
-            PathBuf::from(std::env::var(ENV_SPILL_DIR).unwrap_or_else(|_| "/var/hand/ops".into()));
-        let mut config = Self::new(listen, token, workspace, home, spill_dir);
-        config.tool_dir =
+        let state_dir =
+            PathBuf::from(std::env::var(ENV_STATE_DIR).unwrap_or_else(|_| "/var/hand".into()));
+        let tool_dir =
             PathBuf::from(std::env::var(ENV_TOOL_DIR).unwrap_or_else(|_| "/var/hand/tools".into()));
-        config.tool_runner = PathBuf::from(
+        let tool_runner = PathBuf::from(
             std::env::var(ENV_TOOL_RUNNER)
                 .unwrap_or_else(|_| "/usr/local/lib/hand/tool-runner.mjs".into()),
         );
+        let tool_boundary_library = PathBuf::from(
+            std::env::var(ENV_TOOL_BOUNDARY_LIBRARY)
+                .unwrap_or_else(|_| "/usr/local/lib/hand/tool-boundary.so".into()),
+        );
+        let parse_id = |name: &'static str| -> anyhow::Result<u32> {
+            std::env::var(name)
+                .map_err(|_| anyhow::anyhow!("{name} is required in the production Hand image"))?
+                .parse()
+                .map_err(|error| anyhow::anyhow!("{name}: {error}"))
+        };
+        let config = Self {
+            listen,
+            workspace,
+            binding_dir: state_dir.join("bindings"),
+            object_dir: state_dir.join("objects"),
+            state_dir,
+            tool_dir,
+            tool_runner,
+            tool_boundary_library: Some(tool_boundary_library),
+            tool_identity: Some(ToolIdentity {
+                supervisor_uid: parse_id(ENV_SUPERVISOR_UID)?,
+                uid: parse_id(ENV_TOOL_UID)?,
+                gid: parse_id(ENV_TOOL_GID)?,
+            }),
+        };
+        config.validate()?;
         Ok(config)
     }
 
-    pub fn new(
-        listen: SocketAddr,
-        token: Option<String>,
-        workspace: PathBuf,
-        home: PathBuf,
-        spill_dir: PathBuf,
-    ) -> Self {
-        let tool_dir = spill_dir
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("tools");
+    pub fn for_test(root: &Path) -> Self {
         Self {
-            listen,
-            token,
-            base_env: base_env_from_process(&home),
-            workspace,
-            home,
-            spill_dir,
-            tool_dir,
-            tool_runner: PathBuf::from("/usr/local/lib/hand/tool-runner.mjs"),
-            limits: default_limits(),
+            listen: "127.0.0.1:0".parse().expect("test listener"),
+            workspace: root.join("workspace"),
+            state_dir: root.join("state"),
+            binding_dir: root.join("state/bindings"),
+            tool_dir: root.join("state/tools"),
+            object_dir: root.join("state/objects"),
+            tool_runner: PathBuf::from("image/tool-runner.mjs"),
+            tool_boundary_library: None,
+            tool_identity: None,
         }
     }
-}
 
-/// The subset of the hand process's own environment that lanes inherit. Everything else
-/// (notably our own HAND_* settings) stays out of the agent's shell.
-fn base_env_from_process(home: &std::path::Path) -> HashMap<String, String> {
-    const INHERIT: &[&str] = &[
-        "PATH",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "TZ",
-        "SHELL",
-        "TMPDIR",
-        // installers redirected into the workspace (set by the image)
-        "npm_config_prefix",
-        "GOPATH",
-        "GOMODCACHE",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "PIP_CACHE_DIR",
-        "PIPX_HOME",
-        "PIPX_BIN_DIR",
-        "UV_CACHE_DIR",
-        "PNPM_HOME",
-        "YARN_CACHE_FOLDER",
-    ];
-    let mut env: HashMap<String, String> = std::env::vars()
-        .filter(|(k, _)| INHERIT.contains(&k.as_str()))
-        .collect();
-    env.entry("PATH".into())
-        .or_insert_with(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
-    env.insert("HOME".into(), home.to_string_lossy().into_owned());
-    env.insert("TERM".into(), "dumb".into());
-    env.insert("CI".into(), "1".into());
-    env.insert("DEBIAN_FRONTEND".into(), "noninteractive".into());
-    env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-    env
-}
-
-pub const MAX_LANES: u64 = 64;
-pub const MAX_CONCURRENT_OPERATIONS: u64 = 64;
-pub const MAX_FRAME_BYTES: u64 = 1024 * 1024;
-pub const MAX_SLICE_BYTES: u64 = 256 * 1024;
-pub const MAX_POLL_WAIT_MS: u64 = 30_000;
-pub const MAX_INLINE_PUT_BYTES: u64 = 256 * 1024;
-pub const MAX_PERSIST_BYTES: u64 = 1024 * 1024 * 1024;
-pub const DEFAULT_GRACE_MS: u64 = 2_000;
-pub const DEFAULT_MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
-
-pub fn default_limits() -> Limits {
-    Limits {
-        max_lanes: NonZeroU64::new(MAX_LANES).unwrap(),
-        max_concurrent_operations: NonZeroU64::new(MAX_CONCURRENT_OPERATIONS).unwrap(),
-        max_frame_bytes: MAX_FRAME_BYTES as i64,
-        max_slice_bytes: MAX_SLICE_BYTES as i64,
-        max_poll_wait_ms: MAX_POLL_WAIT_MS,
-        max_inline_put_bytes: MAX_INLINE_PUT_BYTES,
-        max_persist_bytes: MAX_PERSIST_BYTES,
-        default_bounds: EffectiveBounds {
-            timeout_ms: None,
-            grace_ms: DEFAULT_GRACE_MS,
-            max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
-        },
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let Some(identity) = self.tool_identity else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            identity.supervisor_uid != identity.uid,
+            "Hand supervisor and Tool uid must differ"
+        );
+        anyhow::ensure!(identity.uid != 0, "untrusted Tool uid must not be root");
+        anyhow::ensure!(
+            identity.uid < MANAGED_BINDING_UID_MIN
+                && identity.supervisor_uid < MANAGED_BINDING_UID_MIN,
+            "configured supervisor and sandbox uids overlap the managed-binding uid range"
+        );
+        let boundary = self
+            .tool_boundary_library
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Tool boundary library is required"))?;
+        anyhow::ensure!(
+            boundary.is_file(),
+            "Tool boundary library is unavailable: {}",
+            boundary.display()
+        );
+        #[cfg(unix)]
+        {
+            // SAFETY: this only reads the process credential.
+            let current = unsafe { libc::geteuid() };
+            anyhow::ensure!(
+                current == identity.supervisor_uid,
+                "Hand supervisor runs as uid {current}, expected {}",
+                identity.supervisor_uid
+            );
+        }
+        Ok(())
     }
 }

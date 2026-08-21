@@ -17,39 +17,26 @@ path = "src/main.rs"
 
 [dependencies]
 brain-protocol.workspace = true
+brain.workspace = true
+hand-core = { path = "../hand-core" }
+hand-wire = { path = "../hand-wire" }
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
-bytes.workspace = true
-filetime.workspace = true
 futures-util.workspace = true
-globset.workspace = true
-grep-matcher.workspace = true
-grep-regex.workspace = true
-grep-searcher.workspace = true
 hex.workspace = true
-ignore.workspace = true
-jsonschema.workspace = true
 libc.workspace = true
 rand.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
 sha2.workspace = true
-tar.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-walkdir.workspace = true
-zstd.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
-brain-hand-client.workspace = true
 tempfile.workspace = true
-
-[[example]]
-name = "smoke"
-path = "examples/smoke.rs"

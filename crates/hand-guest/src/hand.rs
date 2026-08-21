@@ -1,1269 +1,2706 @@
-//! The hand: session state, lanes, operations, and one handler per ABI operation.
+//! Physical-generation implementation of Brain's canonical receipt protocol.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use base64::Engine;
-use brain_protocol::abi::{
-    AbiError, BootId, CancelRequest, CancelResponse, Clock, EffectiveBounds, ErrorCode,
-    GenerationId, HandStatusEvent, HelloRequest, HelloResponse, LaneCloseRequest,
-    LaneCloseResponse, LaneMode, MonotonicMs, Outcome, PersistRequest, PersistResponse,
-    PersistResponsePersistedItem, PersistSource, PollRequest, PollResponse, ProtocolVersion,
-    PutRequest, PutResponse, PutResponseWrittenItem, PutSource, ReleaseRequest, ReleaseResponse,
-    Reply, Request, RequestCall, ResponseResult, SessionId, Sha256Hex, StartRequest, StartResponse,
-    Stream, SyncRequest, SyncResponse, ToolExecutableSource, ToolManifest, WallMs,
+use base64::Engine as _;
+use brain::hand::{
+    SandboxFileContent, SandboxFileList, SandboxFileListRequest, SandboxSearchRequest,
 };
-use brain_protocol::tools::manifest_digest;
-use serde_json::{Map, Value};
-use tokio::sync::Mutex as AsyncMutex;
+use brain_protocol::contract::{
+    HAND_CONTRACT_DIGEST, operation_request_digest, sandbox_execution_request_digest,
+    terminal_inline_fits, terminal_result_digest, write_stdin_request_digest,
+};
+use brain_protocol::hand::{
+    AcknowledgeTerminalRequest, Acknowledgement, BundleDescriptor, BundleRuntime, CancelRequest,
+    CancellationReceipt, Digest, ExecutionRealm, FileEntry, FileEntryKind, HandError,
+    HandErrorCode, NetworkCeiling, ObserveRequest, OperationEnvelope, OperationObservation,
+    OperationRef, OperationState as ContractOperationState, ResourceCeiling, SandboxCopyResult,
+    SandboxExecutionRequest, SandboxFileRequest, SandboxFileWriteResult, SandboxTarget,
+    SealedBinding, SubmitReceipt, SubmitRequest, TargetKind, TargetReceipt, TerminalOutcome,
+    TerminalResult, WriteStdinReceipt, WriteStdinRequest,
+};
+use brain_protocol::network::network_ceiling_is_subset;
+use hand_core::connector::ConnectorClass;
+use hand_core::files::{LiveFileEntry, LiveFileError, LiveFileKind, LiveFiles};
+use hand_core::operation::{OperationError, OperationRegistry, OperationState, Reservation};
+use hand_core::resources::{ResourceRequest, ResourceSupport};
+use hand_wire::{
+    FileEffectIdentity, FileEffectKind, FileEffectReservation, FileEffectStoredResult,
+    GuestFileWriteRequest, GuestFileWriteSource, InstallBindingRequest, InstallBundleMetadata,
+    InstallObjectMetadata, InstallReceipt, InstallSecretsRequest, MAX_INLINE_FILE_BYTES,
+    RunPayload, TargetRuntimeStatus, environment_name_is_valid, reserved_tool_environment,
+    secret_material_fits,
+};
+use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncWriteExt as _;
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize as _;
 
-use crate::config::Config;
-use crate::errors::{AbiResult, err, err_retryable, err_with, internal, malformed};
-use crate::exec::{BashSpec, NodeSpec, run_bash, run_node};
-use crate::lanes::Lanes;
-use crate::ops::{Operation, Registry};
-use crate::spill::Spill;
-use crate::status::{StatusEmitter, read_pressure};
-use crate::sync::{SyncScope, SyncState};
-use crate::tools;
-use crate::transfer::{self, Scope};
+use crate::acks::{AckStoreError, AcknowledgementStore, SubmissionFence};
+use crate::config::{
+    Config, MANAGED_BINDING_UID_MIN, MANAGED_BINDING_UID_SPAN, MAX_CONCURRENT_OPERATIONS,
+    MAX_OPERATION_OUTPUT_BYTES, MAX_OPERATION_TIMEOUT_MS, MAX_PREPARED_BINDINGS,
+    MAX_RETAINED_OPERATIONS, MAX_RETAINED_STDIN_WRITES, MAX_RETAINED_TERMINAL_BYTES,
+    MAX_TARGET_LIFETIME_MS, MAX_WAIT_MS, ToolIdentity,
+};
+use crate::errors::{hand_error, invalid, unavailable};
+use crate::file_effects::{EffectReservation, FileEffectStore, FileEffectStoreError};
+use crate::process::{
+    BundleExecution, InteractiveControl, ShellExecution, execute_bundle, execute_shell,
+};
 
-static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+// Brain reserves 4 KiB above the canonical inline value for the terminal outcome, digest, timing,
+// operation locator, and target receipt. Reserve that complete envelope before starting an effect
+// so terminal retention cannot leave an operation permanently `running` after its child exits.
+const TERMINAL_ENVELOPE_BYTES: usize = brain_protocol::MAX_TOOL_TERMINAL_INLINE_BYTES + 4 * 1024;
+const FILE_EFFECT_LOCK_SHARDS: usize = 64;
 
-/// Milliseconds since this hand process started (the guest's monotonic clock as the ABI sees it).
-pub fn monotonic_ms() -> u64 {
-    PROCESS_START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_millis() as u64
+/// No `Debug`: an allowlist target contains a bearer capability.
+struct ArmedTarget {
+    target_ref: String,
+    generation: String,
+    expires_at_ms: u64,
+    root_id: String,
+    owner_session_id: String,
+    connector: ConnectorClass,
+    resource_class: String,
+    resources: ResourceCeiling,
+    network: NetworkCeiling,
+    proxy_environment: HashMap<String, String>,
+    canary_exit_after_operation_id: Option<String>,
 }
 
-pub fn wall_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+struct InstalledBinding {
+    seal: SealedBinding,
+    bundle_path: PathBuf,
+    identity: Option<ToolIdentity>,
 }
 
-fn random_id(prefix: &str) -> String {
-    use rand::Rng;
-    let n: u128 = rand::rng().random();
-    format!("{prefix}-{n:032x}")
+/// Per-generation registry for the kernel identity assigned to each immutable binding. A hash
+/// collision is rejected instead of aliasing two secret subsets onto one uid. The very large uid
+/// range makes a collision vanishingly unlikely, while the explicit binding cap keeps the registry
+/// and collision analysis bounded.
+struct BindingIdentityRegistry {
+    by_ref: HashMap<String, Option<ToolIdentity>>,
+    by_uid: HashMap<u32, String>,
+    uid_min: u32,
+    uid_span: u32,
+    max_bindings: usize,
 }
 
-/// Sealed at the first `hello` of this generation.
-pub struct Session {
-    pub session_id: SessionId,
-    pub scope: Scope,
-    pub sync_scope: SyncScope,
-    pub heartbeat_ms: u64,
-    pub manifest: ToolManifest,
-    pub manifest_digest: Sha256Hex,
-    validators: HashMap<String, (jsonschema::Validator, jsonschema::Validator)>,
-    executables: HashMap<String, SessionExecutable>,
+impl BindingIdentityRegistry {
+    fn production() -> Self {
+        Self::with_bounds(
+            MANAGED_BINDING_UID_MIN,
+            MANAGED_BINDING_UID_SPAN,
+            MAX_PREPARED_BINDINGS,
+        )
+    }
+
+    fn with_bounds(uid_min: u32, uid_span: u32, max_bindings: usize) -> Self {
+        Self {
+            by_ref: HashMap::new(),
+            by_uid: HashMap::new(),
+            uid_min,
+            uid_span,
+            max_bindings,
+        }
+    }
+
+    fn allocate(
+        &mut self,
+        binding_ref: &str,
+        sandbox_identity: Option<ToolIdentity>,
+    ) -> Result<Option<ToolIdentity>, HandError> {
+        if let Some(identity) = self.by_ref.get(binding_ref) {
+            return Ok(*identity);
+        }
+        if self.by_ref.len() >= self.max_bindings {
+            return Err(hand_error(
+                HandErrorCode::ResourceExhausted,
+                false,
+                "physical generation has reached the prepared-binding limit",
+            ));
+        }
+        let Some(sandbox_identity) = sandbox_identity else {
+            self.by_ref.insert(binding_ref.to_owned(), None);
+            return Ok(None);
+        };
+        if self.uid_span == 0 {
+            return Err(hand_error(
+                HandErrorCode::ResourceExhausted,
+                false,
+                "managed-binding uid range is empty",
+            ));
+        }
+        let digest = Sha256::digest(binding_ref.as_bytes());
+        let hash = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
+        let uid = self.uid_min + (hash % u64::from(self.uid_span)) as u32;
+        if self.by_uid.contains_key(&uid) {
+            return Err(hand_error(
+                HandErrorCode::BindingConflict,
+                false,
+                "managed-binding uid collision",
+            ));
+        }
+        let identity = ToolIdentity {
+            uid,
+            gid: sandbox_identity.gid,
+            supervisor_uid: sandbox_identity.supervisor_uid,
+        };
+        self.by_uid.insert(uid, binding_ref.to_owned());
+        self.by_ref.insert(binding_ref.to_owned(), Some(identity));
+        Ok(Some(identity))
+    }
 }
 
-#[derive(Debug, Clone)]
-enum SessionExecutable {
-    Preinstalled(tools::Preinstalled),
-    Bundle(PathBuf),
+/// Deliberately cannot be serialized or formatted. Values are zeroized when a generation exits.
+struct SessionSecrets {
+    generation: String,
+    declared: BTreeSet<String>,
+    values: HashMap<String, String>,
 }
 
-struct BundleInvocation {
-    op: Arc<Operation>,
-    tool: String,
-    bundle: PathBuf,
-    input: Value,
-    env: HashMap<String, String>,
-    cwd: PathBuf,
-    session: Arc<Session>,
+impl Drop for SessionSecrets {
+    fn drop(&mut self) {
+        for value in self.values.values_mut() {
+            value.zeroize();
+        }
+        self.values.clear();
+    }
 }
 
+struct OperationMeta {
+    operation: OperationRef,
+    target: TargetReceipt,
+    cancellation: CancellationToken,
+    notify: Arc<Notify>,
+    stdin: Option<Arc<InteractiveControl>>,
+}
+
+struct OperationBook {
+    registry: OperationRegistry,
+    metadata: HashMap<String, OperationMeta>,
+}
+
+struct StdinBook {
+    records: HashMap<String, StdinRecord>,
+}
+
+enum StdinRecord {
+    InFlight { request_digest: Digest },
+    Complete(Box<WriteStdinReceipt>),
+}
+
+/// One Hand guest per physical sandbox generation.
 pub struct Hand {
     pub cfg: Config,
-    pub generation_id: GenerationId,
-    pub boot_id: BootId,
-    fence: AtomicU64,
-    session: RwLock<Option<Arc<Session>>>,
-    lanes: Mutex<Option<Lanes>>,
-    ops: Mutex<Registry>,
-    sync: AsyncMutex<SyncState>,
-    pub status: StatusEmitter,
-    http: reqwest::Client,
-    idle_since: Mutex<Instant>,
-    heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The armed per-session secret. `None` until the environment or the `/run` lifecycle hook
-    /// supplies it; an unarmed hand refuses every `hello`.
-    token: RwLock<Option<String>>,
-    /// Where the hand is in the provider lifecycle. Informational (probe + status); admission
-    /// is gated by the armed token, not by this.
-    pub lifecycle: RwLock<LifecyclePhase>,
-}
-
-/// The provider-lifecycle phase, as the hooks report it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LifecyclePhase {
-    /// Booted; `/run` has not completed (only reachable when the token comes from `/run`).
-    AwaitingRun,
-    /// `/run` or `/resume` completed; serving.
-    Serving,
-    /// `/suspend` completed; the platform is snapshotting (or resumed us without re-posting).
-    Suspended,
-    /// `/terminate` received; the VM is going away.
-    Terminating,
+    target: RwLock<Option<ArmedTarget>>,
+    bundles: RwLock<HashMap<String, (BundleDescriptor, PathBuf)>>,
+    bindings: RwLock<HashMap<String, InstalledBinding>>,
+    binding_identities: Mutex<BindingIdentityRegistry>,
+    secrets: RwLock<HashMap<String, SessionSecrets>>,
+    operations: Mutex<OperationBook>,
+    acknowledgements: Arc<AcknowledgementStore>,
+    file_effects: Arc<FileEffectStore>,
+    file_effect_locks: [Mutex<()>; FILE_EFFECT_LOCK_SHARDS],
+    stdin_writes: Mutex<StdinBook>,
+    operation_slots: Arc<Semaphore>,
+    files: LiveFiles,
+    shutdown: CancellationToken,
 }
 
 impl Hand {
     pub fn new(cfg: Config) -> anyhow::Result<Arc<Self>> {
-        PROCESS_START.get_or_init(Instant::now);
-        std::fs::create_dir_all(&cfg.spill_dir)?;
-        std::fs::create_dir_all(cfg.spill_dir.join("sync"))?;
         std::fs::create_dir_all(&cfg.workspace)?;
+        std::fs::create_dir_all(&cfg.state_dir)?;
+        std::fs::create_dir_all(&cfg.binding_dir)?;
         std::fs::create_dir_all(&cfg.tool_dir)?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
-        let hand = Arc::new(Self {
+        std::fs::create_dir_all(&cfg.object_dir)?;
+        let acknowledgement_dir = cfg.state_dir.join("ops");
+        std::fs::create_dir_all(&acknowledgement_dir)?;
+        let acknowledgements = Arc::new(AcknowledgementStore::open(
+            &acknowledgement_dir.join("acknowledged.jsonl"),
+        )?);
+        let file_effects = Arc::new(FileEffectStore::open(
+            &acknowledgement_dir.join("file-effects.jsonl"),
+        )?);
+        let files = LiveFiles::new(&cfg.workspace, cfg.state_dir.join("file-staging"))?;
+        Ok(Arc::new(Self {
             cfg,
-            generation_id: random_id("gen").parse().expect("id"),
-            boot_id: random_id("boot").parse().expect("id"),
-            fence: AtomicU64::new(0),
-            session: RwLock::new(None),
-            lanes: Mutex::new(None),
-            ops: Mutex::new(Registry::default()),
-            sync: AsyncMutex::new(SyncState::default()),
-            status: StatusEmitter::new(),
-            http,
-            idle_since: Mutex::new(Instant::now()),
-            heartbeat: Mutex::new(None),
-            token: RwLock::new(None),
-            lifecycle: RwLock::new(LifecyclePhase::AwaitingRun),
-        });
-        if let Some(token) = hand.cfg.token.clone() {
-            // Environment-armed (plain container): serving from boot, no run hook required.
-            *hand.token.write().unwrap() = Some(token);
-            *hand.lifecycle.write().unwrap() = LifecyclePhase::Serving;
-        }
-        Ok(hand)
-    }
-
-    /// Arms the hand with the per-session secret (from the `/run` hook). Idempotent for the
-    /// same token; refuses a different one — a hand serves exactly one session in its life.
-    pub fn arm(&self, token: &str) -> Result<(), &'static str> {
-        if token.is_empty() {
-            return Err("empty token");
-        }
-        let mut cur = self.token.write().unwrap();
-        match cur.as_deref() {
-            None => {
-                *cur = Some(token.to_owned());
-                Ok(())
-            }
-            Some(t) if t == token => Ok(()),
-            Some(_) => Err("hand is already armed with a different token"),
-        }
-    }
-
-    pub fn armed(&self) -> bool {
-        self.token.read().unwrap().is_some()
-    }
-
-    /// Forces every retained stream byte to durable storage (the `/suspend` hook).
-    pub async fn flush_spills(&self) {
-        let ops = self.ops.lock().unwrap().all();
-        for op in ops {
-            op.stdout.lock().await.flush();
-            op.stderr.lock().await.flush();
-        }
-    }
-
-    fn session(&self) -> AbiResult<Arc<Session>> {
-        self.session
-            .read()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| err(ErrorCode::Unauthorized, "hello first"))
-    }
-
-    /// Envelope checks (fence, generation, session), then dispatch. Never panics across the
-    /// boundary: an internal failure becomes an `internal` error for that request only.
-    pub async fn handle(self: &Arc<Self>, req: Request) -> ResponseResult {
-        match self.handle_inner(req).await {
-            Ok(reply) => ResponseResult::Ok { reply },
-            Err(error) => ResponseResult::Error { error },
-        }
-    }
-
-    async fn handle_inner(self: &Arc<Self>, req: Request) -> AbiResult<Reply> {
-        // Fence: a stale owner is refused with no side effect; equal or higher is accepted.
-        let cur = self.fence.load(Ordering::SeqCst);
-        if req.fence < cur {
-            return Err(err(
-                ErrorCode::FenceStale,
-                format!("fence {} < accepted {cur}", req.fence),
-            ));
-        }
-        self.fence.fetch_max(req.fence, Ordering::SeqCst);
-        if !matches!(req.call, RequestCall::Hello(_)) {
-            match &req.generation_id {
-                None => {
-                    return Err(malformed(
-                        "generation_id is required on every request except hello",
-                    ));
-                }
-                Some(g) if *g != self.generation_id => {
-                    return Err(err(
-                        ErrorCode::GenerationMismatch,
-                        format!("hand generation is {}", *self.generation_id),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        match req.call {
-            RequestCall::Hello(a) => self.hello(a).await.map(Reply::Hello),
-            RequestCall::Start(a) => self.start(a).await.map(Reply::Start),
-            RequestCall::Poll(a) => self.poll(a).await.map(Reply::Poll),
-            RequestCall::Cancel(a) => self.cancel(a).await.map(Reply::Cancel),
-            RequestCall::Release(a) => self.release(a).await.map(Reply::Release),
-            RequestCall::LaneClose(a) => self.lane_close(a).await.map(Reply::LaneClose),
-            RequestCall::Put(a) => self.put(a).await.map(Reply::Put),
-            RequestCall::Persist(a) => self.persist(a).await.map(Reply::Persist),
-            RequestCall::Sync(a) => self.sync(a).await.map(Reply::Sync),
-        }
-    }
-
-    // ----- hello -------------------------------------------------------------------------
-
-    async fn prepare_manifest(
-        &self,
-        requested: &ToolManifest,
-        expected_digest: &Sha256Hex,
-    ) -> AbiResult<(
-        ToolManifest,
-        HashMap<String, (jsonschema::Validator, jsonschema::Validator)>,
-        HashMap<String, SessionExecutable>,
-    )> {
-        let actual_digest = manifest_digest(requested);
-        if &actual_digest != expected_digest {
-            return Err(err_with(
-                ErrorCode::ToolManifestMismatch,
-                "tool manifest does not match its sealed digest",
-                [(
-                    "computed_digest".into(),
-                    Value::String(actual_digest.to_string()),
-                )]
-                .into_iter()
-                .collect(),
-            ));
-        }
-
-        let mut manifest = requested.clone();
-        let mut validators = HashMap::new();
-        let mut executables = HashMap::new();
-        for tool in &mut manifest.tools {
-            let name = tool.name.to_string();
-            if validators.contains_key(&name) {
-                return Err(err(
-                    ErrorCode::ToolManifestMismatch,
-                    format!("duplicate tool name {name}"),
-                ));
-            }
-            if tool.executable.protocol != 1 {
-                return Err(err(
-                    ErrorCode::ToolBundleInvalid,
-                    format!("tool {name} uses unsupported executable protocol"),
-                ));
-            }
-            let input = jsonschema::draft202012::new(&Value::Object(tool.input_schema.clone()))
-                .map_err(|error| {
-                    err(
-                        ErrorCode::ToolManifestMismatch,
-                        format!("tool {name} input schema: {error}"),
-                    )
-                })?;
-            let output = jsonschema::draft202012::new(&Value::Object(tool.output_schema.clone()))
-                .map_err(|error| {
-                err(
-                    ErrorCode::ToolManifestMismatch,
-                    format!("tool {name} output schema: {error}"),
-                )
-            })?;
-            validators.insert(name.clone(), (input, output));
-
-            let executable = match tool.executable.source {
-                ToolExecutableSource::Preinstalled => {
-                    if tool.executable.get_url.is_some() || tool.executable.bytes.is_some() {
-                        return Err(err(
-                            ErrorCode::ToolBundleInvalid,
-                            format!("preinstalled tool {name} carries bundle transport fields"),
-                        ));
-                    }
-                    let implementation = tools::preinstalled(&tool.executable.checksum)
-                        .ok_or_else(|| {
-                            err(
-                                ErrorCode::ToolBundleInvalid,
-                                format!(
-                                    "preinstalled checksum {} is unavailable in this Hand image",
-                                    *tool.executable.checksum
-                                ),
-                            )
-                        })?;
-                    SessionExecutable::Preinstalled(implementation)
-                }
-                ToolExecutableSource::Bundle => {
-                    let bytes =
-                        tool.executable
-                            .bytes
-                            .map(|value| value.get())
-                            .ok_or_else(|| {
-                                err(
-                                    ErrorCode::ToolBundleInvalid,
-                                    format!("bundle tool {name} is missing bytes"),
-                                )
-                            })?;
-                    if bytes > 4 * 1024 * 1024 {
-                        return Err(err(
-                            ErrorCode::ToolBundleInvalid,
-                            format!("bundle tool {name} exceeds 4 MiB"),
-                        ));
-                    }
-                    let get_url = tool.executable.get_url.as_deref().ok_or_else(|| {
-                        err(
-                            ErrorCode::ToolBundleInvalid,
-                            format!("bundle tool {name} is missing get_url"),
-                        )
-                    })?;
-                    let path = self
-                        .cfg
-                        .tool_dir
-                        .join(format!("{}.mjs", *tool.executable.checksum));
-                    let already_valid = transfer::sha256_file(&path)
-                        .map(|(existing_bytes, checksum)| {
-                            existing_bytes == bytes && checksum == tool.executable.checksum
-                        })
-                        .unwrap_or(false);
-                    if !already_valid {
-                        transfer::download_to(
-                            &self.http,
-                            get_url,
-                            &path,
-                            Some(bytes),
-                            Some(&tool.executable.checksum),
-                        )
-                        .await?;
-                    }
-                    SessionExecutable::Bundle(path)
-                }
-            };
-            // A presigned URL is bearer material. Keep only the sealed identity after staging.
-            tool.executable.get_url = None;
-            executables.insert(name, executable);
-        }
-        Ok((manifest, validators, executables))
-    }
-
-    async fn hello(self: &Arc<Self>, a: HelloRequest) -> AbiResult<HelloResponse> {
-        if a.protocol.major != ProtocolVersion::CURRENT.major {
-            return Err(err(
-                ErrorCode::ProtocolUnsupported,
-                format!(
-                    "hand speaks major {}, brain sent {}",
-                    ProtocolVersion::CURRENT.major,
-                    a.protocol.major
+            target: RwLock::new(None),
+            bundles: RwLock::new(HashMap::new()),
+            bindings: RwLock::new(HashMap::new()),
+            binding_identities: Mutex::new(BindingIdentityRegistry::production()),
+            secrets: RwLock::new(HashMap::new()),
+            operations: Mutex::new(OperationBook {
+                registry: OperationRegistry::new(
+                    MAX_RETAINED_OPERATIONS,
+                    MAX_RETAINED_TERMINAL_BYTES,
                 ),
+                metadata: HashMap::new(),
+            }),
+            acknowledgements,
+            file_effects,
+            file_effect_locks: std::array::from_fn(|_| Mutex::new(())),
+            stdin_writes: Mutex::new(StdinBook {
+                records: HashMap::new(),
+            }),
+            operation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OPERATIONS)),
+            files,
+            shutdown: CancellationToken::new(),
+        }))
+    }
+
+    pub async fn armed(&self) -> bool {
+        self.target.read().await.is_some()
+    }
+
+    /// Arms an unconfigured generation exactly once. An exact provider retry is harmless; a
+    /// different root/generation/network/resource seal is a permanent conflict.
+    pub async fn arm(&self, target_ref: String, payload: RunPayload) -> Result<bool, HandError> {
+        if payload.contract_digest != HAND_CONTRACT_DIGEST.trim() {
+            return Err(invalid("Hand contract digest does not match the image"));
+        }
+        let now = wall_ms();
+        if payload.expires_at_ms <= now
+            || payload.expires_at_ms > now.saturating_add(MAX_TARGET_LIFETIME_MS)
+        {
+            return Err(invalid(
+                "physical target expiry is outside the supported lifetime",
             ));
         }
-        match self.token.read().unwrap().as_deref() {
-            None => {
-                return Err(err(
-                    ErrorCode::Unauthorized,
-                    "hand is not armed: the run hook has not delivered a session token",
-                ));
-            }
-            Some(t) if *t != *a.session_token => {
-                return Err(err(ErrorCode::Unauthorized, "session_token mismatch"));
-            }
-            Some(_) => {}
-        }
-        let existing = self.session.read().unwrap().clone();
-        let session = match existing {
-            Some(s) => {
-                if s.session_id != a.session_id {
-                    return Err(err(
-                        ErrorCode::Unauthorized,
-                        "this hand belongs to another session",
-                    ));
-                }
-                if s.manifest_digest != a.tool_manifest_digest {
-                    return Err(err(
-                        ErrorCode::ToolManifestMismatch,
-                        "this Hand generation is already sealed to another tool manifest",
-                    ));
-                }
-                s
-            }
-            None => {
-                let (manifest, validators, executables) = self
-                    .prepare_manifest(&a.tool_manifest, &a.tool_manifest_digest)
-                    .await?;
-                let scope = Scope::new(&a.sync.roots)?;
-                let sync_scope = SyncScope::new(scope.roots.clone(), &a.sync.exclude)?;
-                let mut env = self.cfg.base_env.clone();
-                env.extend(a.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-                let s = Arc::new(Session {
-                    session_id: a.session_id.clone(),
-                    scope,
-                    sync_scope,
-                    heartbeat_ms: a.heartbeat_ms.max(1000) as u64,
-                    manifest,
-                    manifest_digest: a.tool_manifest_digest.clone(),
-                    validators,
-                    executables,
-                });
-                *self.lanes.lock().unwrap() = Some(Lanes::new(
-                    env,
-                    self.cfg.limits.max_lanes.get() as usize,
-                    monotonic_ms(),
-                ));
-                *self.session.write().unwrap() = Some(s.clone());
-                self.start_heartbeat(s.heartbeat_ms);
-                s
-            }
-        };
-        // Restore on a fresh generation that has never seen a manifest.
-        let mut restore_report = None;
-        if let Some(src) = &a.restore {
-            let mut st = self.sync.lock().await;
-            if st.last.is_none() {
-                let tmp = self.cfg.spill_dir.join("sync");
-                restore_report = Some(crate::sync::restore(&self.http, &mut st, src, &tmp).await?);
-            } else if st.last.as_ref().map(|m| &m.manifest_id) != Some(&src.manifest_id) {
-                tracing::warn!(
-                    "hello carries restore {} but this generation already holds a manifest; ignoring",
-                    &*src.manifest_id
-                );
-            }
-        }
-        let _ = session;
-        let lanes = self
-            .lanes
-            .lock()
-            .unwrap()
+        validate_connector(
+            payload.connector,
+            &payload.network,
+            payload.allowlist_proxy.is_some(),
+        )?;
+        if payload
+            .canary_exit_after_operation_id
             .as_ref()
-            .map(|l| l.summaries())
-            .unwrap_or_default();
-        let ops: Vec<Arc<Operation>> = self.ops.lock().unwrap().all();
-        let mut operations = Vec::with_capacity(ops.len());
-        for op in ops {
-            operations.push(op.view().await);
+            .is_some_and(|id| {
+                !id.starts_with("image-canary-")
+                    || id.parse::<brain_protocol::hand::Identifier>().is_err()
+            })
+        {
+            return Err(invalid("image canary operation id is invalid"));
         }
-        Ok(HelloResponse {
-            protocol: ProtocolVersion::CURRENT,
-            generation_id: self.generation_id.clone(),
-            boot_id: self.boot_id.clone(),
-            tool_manifest_digest: session.manifest_digest.clone(),
-            tools: session.manifest.tools.clone(),
-            lanes,
-            operations,
-            limits: self.cfg.limits.clone(),
-            paths: brain_protocol::abi::Paths {
-                workspace: self.cfg.workspace.to_string_lossy().into_owned(),
-                home: self.cfg.home.to_string_lossy().into_owned(),
-                spill_dir: self.cfg.spill_dir.to_string_lossy().into_owned(),
-            },
-            clock: Clock {
-                monotonic_ms: MonotonicMs(monotonic_ms()),
-                wall_ms: WallMs(wall_ms()),
-            },
-            restore: restore_report,
-        })
-    }
-
-    fn start_heartbeat(self: &Arc<Self>, heartbeat_ms: u64) {
-        let mut slot = self.heartbeat.lock().unwrap();
-        if slot.is_some() {
-            return;
-        }
-        let hand = Arc::downgrade(self);
-        *slot = Some(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(heartbeat_ms));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                match hand.upgrade() {
-                    Some(h) => h.emit_status(),
-                    None => return,
-                }
+        let proxy_environment = match payload.allowlist_proxy {
+            Some(proxy) => {
+                let proxy_url = format!("http://aex:{}@{}", proxy.capability, proxy.authority);
+                HashMap::from([
+                    ("HTTPS_PROXY".into(), proxy_url.clone()),
+                    ("https_proxy".into(), proxy_url),
+                ])
             }
-        }));
-    }
-
-    // ----- start / poll / cancel / release ---------------------------------------------------
-
-    fn effective_bounds(&self, b: Option<&brain_protocol::abi::Bounds>) -> EffectiveBounds {
-        let d = &self.cfg.limits.default_bounds;
-        EffectiveBounds {
-            timeout_ms: b.and_then(|b| b.timeout_ms).or(d.timeout_ms),
-            grace_ms: b.and_then(|b| b.grace_ms).unwrap_or(d.grace_ms),
-            max_retained_bytes: b
-                .and_then(|b| b.max_retained_bytes)
-                .unwrap_or(d.max_retained_bytes),
-        }
-    }
-
-    async fn start(self: &Arc<Self>, a: StartRequest) -> AbiResult<StartResponse> {
-        let session = self.session()?;
-        let Some((input_v, _)) = session.validators.get(&a.tool) else {
-            return Err(err(
-                ErrorCode::ToolNotFound,
-                format!("{} is not in the sealed manifest", a.tool),
-            ));
+            None => HashMap::new(),
         };
-        let executable = session
-            .executables
-            .get(&a.tool)
-            .cloned()
-            .ok_or_else(|| err(ErrorCode::ToolNotFound, "tool executable is unavailable"))?;
-        if let Some(e) = input_v.iter_errors(&a.input).next() {
-            let mut details = Map::new();
-            details.insert(
-                "schema_path".into(),
-                Value::String(e.schema_path().to_string()),
-            );
-            details.insert(
-                "instance_path".into(),
-                Value::String(e.instance_path().to_string()),
-            );
-            return Err(err_with(
-                ErrorCode::ToolInputInvalid,
-                format!("input{}: {e}", e.instance_path()),
-                details,
-            ));
-        }
-        let expected = brain_protocol::tools::call_hash(&a);
-        if expected != a.call_hash {
-            return Err(malformed(format!(
-                "call_hash {} does not match the request identity (expected {})",
-                *a.call_hash, *expected
-            )));
-        }
-        // Idempotency: an existing operation with the same identity is replayed, never re-run.
-        let existing = self.ops.lock().unwrap().get(&a.operation_id);
-        if let Some(existing) = existing {
-            if existing.call_hash != a.call_hash {
-                return Err(err(
-                    ErrorCode::OperationIdempotencyConflict,
-                    format!(
-                        "operation {} exists with a different call_hash",
-                        *a.operation_id
-                    ),
-                ));
-            }
-            let view = existing.view().await;
-            let slices = self.first_slices(&existing, a.max_bytes).await?;
-            return Ok(StartResponse {
-                view,
-                slices,
-                replayed: true,
-            });
-        }
-        let cwd = match &a.cwd {
-            Some(c) => {
-                let p = Path::new(c);
-                if !p.is_absolute() {
-                    return Err(malformed(format!("cwd {c} must be absolute")));
-                }
-                p.to_path_buf()
-            }
-            None => self.cfg.workspace.clone(),
+        let candidate = ArmedTarget {
+            target_ref,
+            generation: payload.generation,
+            expires_at_ms: payload.expires_at_ms,
+            root_id: payload.root_id,
+            owner_session_id: payload.owner_session_id,
+            connector: payload.connector,
+            resource_class: payload.resource_class,
+            resources: payload.resources,
+            network: payload.network,
+            proxy_environment,
+            canary_exit_after_operation_id: payload.canary_exit_after_operation_id,
         };
-        let bounds = self.effective_bounds(a.bounds.as_ref());
-        let now = monotonic_ms();
-
-        // Lane + registration happen under the locks, before anything runs.
-        let (env, lane_mode) = {
-            let mut ops = self.ops.lock().unwrap();
-            let running = ops.running().count() as u64;
-            if running >= self.cfg.limits.max_concurrent_operations.get() {
-                return Err(err_retryable(
-                    ErrorCode::ResourceExhausted,
-                    format!(
-                        "max_concurrent_operations = {}",
-                        self.cfg.limits.max_concurrent_operations
-                    ),
-                ));
-            }
-            let mut lanes_guard = self.lanes.lock().unwrap();
-            let lanes = lanes_guard
-                .as_mut()
-                .ok_or_else(|| err(ErrorCode::Unauthorized, "hello first"))?;
-            let lane = lanes.resolve_for_start(&a.lane, now)?;
-            if !a.detach {
-                if let Some(inflight) = &lane.inflight {
-                    return Err(err(
-                        ErrorCode::LaneBusy,
-                        format!("lane {} is held by operation {}", *lane.id, **inflight),
-                    ));
-                }
-                lane.inflight = Some(a.operation_id.clone());
-            }
-            let env = lane.env.clone();
-            let mode = lane.mode;
-            let op = Arc::new(Operation {
-                id: a.operation_id.clone(),
-                tool: a.tool.clone(),
-                lane_id: a.lane.id.clone(),
-                lane_mode: mode,
-                detach: a.detach,
-                call_hash: a.call_hash.clone(),
-                correlation: a.correlation.clone(),
-                bounds: bounds.clone(),
-                started_at: Instant::now(),
-                started_at_monotonic_ms: now,
-                stdout: AsyncMutex::new(Spill::new(
-                    &self.cfg.spill_dir,
-                    &format!("{}.stdout", *a.operation_id),
-                    bounds.max_retained_bytes,
-                )),
-                stderr: AsyncMutex::new(Spill::new(
-                    &self.cfg.spill_dir,
-                    &format!("{}.stderr", *a.operation_id),
-                    bounds.max_retained_bytes,
-                )),
-                state: Mutex::new(Default::default()),
-                version: tokio::sync::watch::channel(0).0,
-            });
-            ops.insert(op);
-            (env, mode)
-        };
-        let op = self
-            .ops
-            .lock()
-            .unwrap()
-            .get(&a.operation_id)
-            .expect("just inserted");
-        self.emit_status();
-
-        // Run it.
-        let hand = self.clone();
-        let op2 = op.clone();
-        let tool = a.tool.clone();
-        let input = a.input.clone();
-        let capture_env = lane_mode == LaneMode::Persistent
-            && !a.detach
-            && matches!(
-                executable,
-                SessionExecutable::Preinstalled(tools::Preinstalled::Bash)
-            );
-        let spill_dir = self.cfg.spill_dir.clone();
-        tokio::spawn(async move {
-            let captured = match executable {
-                SessionExecutable::Preinstalled(tools::Preinstalled::Bash) => {
-                    let command = input
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64);
-                    let spec = BashSpec {
-                        command,
-                        env,
-                        cwd,
-                        capture_env_to: if capture_env {
-                            Some(spill_dir.join(format!("{}.env", *op2.id)))
-                        } else {
-                            None
-                        },
-                        timeout_ms,
-                    };
-                    run_bash(op2.clone(), spec).await.captured_env
-                }
-                SessionExecutable::Preinstalled(implementation) => {
-                    hand.run_typed_tool(&op2, &tool, implementation, input, cwd, &session)
-                        .await;
-                    None
-                }
-                SessionExecutable::Bundle(bundle) => {
-                    hand.run_bundle_tool(BundleInvocation {
-                        op: op2.clone(),
-                        tool,
-                        bundle,
-                        input,
-                        env,
-                        cwd,
-                        session,
-                    })
-                    .await;
-                    None
-                }
+        let mut target = self.target.write().await;
+        if let Some(existing) = target.as_ref() {
+            let exact = existing.target_ref == candidate.target_ref
+                && existing.generation == candidate.generation
+                && existing.expires_at_ms == candidate.expires_at_ms
+                && existing.root_id == candidate.root_id
+                && existing.owner_session_id == candidate.owner_session_id
+                && existing.connector == candidate.connector
+                && existing.resource_class == candidate.resource_class
+                && canonical_equal(&existing.resources, &candidate.resources)?
+                && canonical_equal(&existing.network, &candidate.network)?
+                && existing.canary_exit_after_operation_id
+                    == candidate.canary_exit_after_operation_id;
+            return if exact {
+                Ok(true)
+            } else {
+                Err(hand_error(
+                    HandErrorCode::GenerationConflict,
+                    false,
+                    "physical generation is already armed with a different immutable seal",
+                ))
             };
-            hand.on_op_terminal(&op2, captured);
-        });
-        let _ = session;
-
-        if !a.detach && a.wait_ms > 0 {
-            let wait = Duration::from_millis(a.wait_ms.min(self.cfg.limits.max_poll_wait_ms));
-            op.wait_for(&[], wait).await;
         }
-        let view = op.view().await;
-        let slices = self.first_slices(&op, a.max_bytes).await?;
-        Ok(StartResponse {
-            view,
-            slices,
+        *target = Some(candidate);
+        Ok(false)
+    }
+
+    pub async fn runtime_status(&self) -> Option<TargetRuntimeStatus> {
+        self.target
+            .read()
+            .await
+            .as_ref()
+            .map(|target| TargetRuntimeStatus {
+                target_ref: target.target_ref.clone(),
+                generation: target.generation.clone(),
+                root_id: target.root_id.clone(),
+                owner_session_id: target.owner_session_id.clone(),
+                connector: target.connector,
+                resource_class: target.resource_class.clone(),
+                armed: true,
+            })
+    }
+
+    pub async fn should_exit_after_canary_receipt(&self, operation_id: &str) -> bool {
+        self.target
+            .read()
+            .await
+            .as_ref()
+            .and_then(|target| target.canary_exit_after_operation_id.as_deref())
+            == Some(operation_id)
+    }
+
+    pub async fn install_bundle(
+        &self,
+        metadata: InstallBundleMetadata,
+        bytes: &[u8],
+    ) -> Result<InstallReceipt, HandError> {
+        if metadata.descriptor.runtime != BundleRuntime::Node22 {
+            return Err(invalid(
+                "the default Hand supports only the Node22 Tool runtime",
+            ));
+        }
+        if metadata.descriptor.bytes.get() > brain_protocol::MAX_TOOL_BUNDLE_BYTES as u64
+            || metadata.descriptor.bytes.get() != bytes.len() as u64
+            || metadata.descriptor.object.bytes != bytes.len() as u64
+            || metadata.descriptor.object.sha256 != metadata.descriptor.bundle_digest
+            || hex::encode(Sha256::digest(bytes)) != metadata.descriptor.bundle_digest.as_str()
+        {
+            return Err(invalid(
+                "bundle bytes do not match the immutable descriptor",
+            ));
+        }
+        let required_env = metadata
+            .descriptor
+            .required_env
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<BTreeSet<_>>();
+        if metadata.descriptor.required_env.len() > brain_protocol::MAX_SESSION_SECRET_NAMES
+            || required_env.len() != metadata.descriptor.required_env.len()
+            || metadata.descriptor.required_env.iter().any(|name| {
+                !environment_name_is_valid(name.as_str())
+                    || reserved_tool_environment(name.as_str())
+            })
+        {
+            return Err(invalid(
+                "bundle descriptor contains an invalid or reserved environment name",
+            ));
+        }
+        let digest = metadata.descriptor.bundle_digest.to_string();
+        let mut bundles = self.bundles.write().await;
+        if let Some((existing, _)) = bundles.get(&digest) {
+            return if canonical_equal(existing, &metadata.descriptor)? {
+                Ok(InstallReceipt {
+                    installed: true,
+                    replayed: true,
+                })
+            } else {
+                Err(hand_error(
+                    HandErrorCode::BindingConflict,
+                    false,
+                    "bundle digest is already installed with a different descriptor",
+                ))
+            };
+        }
+        let path = self.cfg.tool_dir.join(format!("{digest}.mjs"));
+        let temporary = self.cfg.tool_dir.join(format!(".{digest}.install"));
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            // Every managed binding may read the verified module through the shared Tool group,
+            // but no untrusted Tool process may rewrite code after digest verification.
+            options.mode(0o640);
+        }
+        let mut file = options
+            .open(&temporary)
+            .await
+            .map_err(|_| unavailable("could not stage the Tool bundle"))?;
+        if file.write_all(bytes).await.is_err()
+            || file.flush().await.is_err()
+            || file.sync_all().await.is_err()
+        {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(unavailable("could not stage the Tool bundle"));
+        }
+        drop(file);
+        tokio::fs::rename(&temporary, &path)
+            .await
+            .map_err(|_| unavailable("could not install the Tool bundle"))?;
+        bundles.insert(digest, (metadata.descriptor, path));
+        Ok(InstallReceipt {
+            installed: true,
             replayed: false,
         })
     }
 
-    /// The preview slices returned by `start` (and replay): each stream from the earliest byte it
-    /// still retains, so a head that already rolled off never fails the call.
-    async fn first_slices(
+    pub async fn install_binding(
         &self,
-        op: &Operation,
-        max_bytes: u64,
-    ) -> AbiResult<Vec<brain_protocol::abi::OutputSlice>> {
-        if max_bytes == 0 {
-            return Ok(Vec::new());
+        request: InstallBindingRequest,
+    ) -> Result<InstallReceipt, HandError> {
+        let target = self.require_target().await?;
+        if request.binding.root_id.as_str() != target.root_id
+            || request.binding.realm != ExecutionRealm::AexManaged
+        {
+            return Err(hand_error(
+                HandErrorCode::BindingConflict,
+                false,
+                "binding is outside this target root or execution realm",
+            ));
         }
-        let out_from = op.stdout.lock().await.retained_from();
-        let err_from = op.stderr.lock().await.retained_from();
-        op.slices(
-            &[(Stream::Stdout, out_from), (Stream::Stderr, err_from)],
-            max_bytes,
-            self.cfg.limits.max_slice_bytes as u64,
-        )
+        let descriptor = request.binding.bundle.as_ref().ok_or_else(|| {
+            hand_error(
+                HandErrorCode::CapabilityUnavailable,
+                false,
+                "managed execution requires an immutable Tool bundle",
+            )
+        })?;
+        if descriptor.contract_digest != request.binding.contract_digest {
+            return Err(hand_error(
+                HandErrorCode::BindingConflict,
+                false,
+                "bundle and binding contract digests differ",
+            ));
+        }
+        let bundles = self.bundles.read().await;
+        let bundle_path = match bundles.get(descriptor.bundle_digest.as_str()) {
+            Some((installed, path)) if canonical_equal(installed, descriptor)? => path.clone(),
+            _ => return Err(invalid("binding references a bundle that is not installed")),
+        };
+        drop(bundles);
+        let requires_undeclared_secret = self
+            .secrets
+            .read()
+            .await
+            .get(request.binding.session_id.as_str())
+            .is_some_and(|secrets| {
+                descriptor
+                    .required_env
+                    .iter()
+                    .any(|name| !secrets.declared.contains(name.as_str()))
+            });
+        if requires_undeclared_secret {
+            return Err(hand_error(
+                HandErrorCode::BindingConflict,
+                false,
+                "binding requires environment outside the prepared session secret union",
+            ));
+        }
+        let mut bindings = self.bindings.write().await;
+        if let Some(existing) = bindings.get(request.binding_ref.as_str()) {
+            return if canonical_equal(&existing.seal, &request.binding)? {
+                Ok(InstallReceipt {
+                    installed: true,
+                    replayed: true,
+                })
+            } else {
+                Err(hand_error(
+                    HandErrorCode::BindingConflict,
+                    false,
+                    "binding_ref is already installed with a different seal",
+                ))
+            };
+        }
+        let identity = self
+            .binding_identities
+            .lock()
+            .await
+            .allocate(request.binding_ref.as_str(), self.cfg.tool_identity)?;
+        bindings.insert(
+            request.binding_ref.to_string(),
+            InstalledBinding {
+                seal: request.binding,
+                bundle_path,
+                identity,
+            },
+        );
+        Ok(InstallReceipt {
+            installed: true,
+            replayed: false,
+        })
+    }
+
+    pub async fn install_object_file(
+        &self,
+        metadata: InstallObjectMetadata,
+        temporary: PathBuf,
+        actual_bytes: u64,
+        actual_sha256: &str,
+    ) -> Result<InstallReceipt, HandError> {
+        if metadata.object.bytes != actual_bytes || actual_sha256 != metadata.object.sha256.as_str()
+        {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(invalid("object bytes do not match the immutable reference"));
+        }
+        let digest = metadata.object.sha256.as_str();
+        let path = self.cfg.object_dir.join(digest);
+        if path.exists() {
+            let existing = tokio::fs::metadata(&path)
+                .await
+                .map_err(|_| unavailable("installed object is unavailable"))?;
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return if existing.is_file() && existing.len() == actual_bytes {
+                Ok(InstallReceipt {
+                    installed: true,
+                    replayed: true,
+                })
+            } else {
+                Err(invalid("object digest is installed with different bytes"))
+            };
+        }
+        if tokio::fs::rename(&temporary, &path).await.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            let existing = tokio::fs::metadata(&path)
+                .await
+                .map_err(|_| unavailable("could not atomically install object input"))?;
+            if !existing.is_file() || existing.len() != actual_bytes {
+                return Err(unavailable("could not atomically install object input"));
+            }
+            return Ok(InstallReceipt {
+                installed: true,
+                replayed: true,
+            });
+        }
+        Ok(InstallReceipt {
+            installed: true,
+            replayed: false,
+        })
+    }
+
+    pub async fn open_file_export(
+        &self,
+        request: SandboxFileRequest,
+    ) -> Result<(FileEntry, std::fs::File), HandError> {
+        self.fence(&request.target, request.expected_generation.as_str())
+            .await?;
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let reader = blocking_file(move || files.open_reader(&path)).await?;
+        Ok((file_entry(&reader.entry)?, reader.file))
+    }
+
+    pub async fn install_secrets(
+        &self,
+        request: InstallSecretsRequest,
+    ) -> Result<InstallReceipt, HandError> {
+        let target = self.require_target().await?;
+        if request.generation != target.generation {
+            return Err(generation_conflict());
+        }
+        let declared = request.env_names.iter().cloned().collect::<BTreeSet<_>>();
+        if !secret_material_fits(&request.env_names, &request.values) {
+            return Err(invalid(
+                "secret material is outside the canonical bounded environment union",
+            ));
+        }
+        if declared.iter().any(|name| reserved_tool_environment(name)) {
+            return Err(invalid(
+                "secret environment name conflicts with the trusted Tool runtime boundary",
+            ));
+        }
+        let installed_requirements_are_declared = self
+            .bindings
+            .read()
+            .await
+            .values()
+            .filter(|binding| binding.seal.session_id.as_str() == request.session_id)
+            .flat_map(|binding| {
+                binding
+                    .seal
+                    .bundle
+                    .iter()
+                    .flat_map(|bundle| bundle.required_env.iter())
+            })
+            .all(|name| declared.contains(name.as_str()));
+        if !installed_requirements_are_declared {
+            return Err(invalid(
+                "prepared environment-name union omits an installed binding requirement",
+            ));
+        }
+        let mut secrets = self.secrets.write().await;
+        if let Some(existing) = secrets.get(&request.session_id) {
+            return if existing.generation == request.generation
+                && existing.declared == declared
+                && existing.values == request.values
+            {
+                Ok(InstallReceipt {
+                    installed: true,
+                    replayed: true,
+                })
+            } else {
+                Err(hand_error(
+                    HandErrorCode::GenerationConflict,
+                    false,
+                    "secret material conflicts with the installed generation",
+                ))
+            };
+        }
+        secrets.insert(
+            request.session_id,
+            SessionSecrets {
+                generation: request.generation,
+                declared,
+                values: request.values,
+            },
+        );
+        Ok(InstallReceipt {
+            installed: true,
+            replayed: false,
+        })
+    }
+
+    pub async fn submit(
+        self: &Arc<Self>,
+        request: SubmitRequest,
+    ) -> Result<SubmitReceipt, HandError> {
+        validate_wait(request.wait_up_to_ms)?;
+        if operation_request_digest(&request.envelope) != request.envelope.request_digest {
+            return Err(invalid("operation request_digest is not canonical"));
+        }
+        self.fence_acknowledged_submission(
+            request.envelope.operation_id.as_str(),
+            request.envelope.request_digest.as_str(),
+        )?;
+        let execution = self.validate_operation(&request.envelope).await?;
+        let operation = operation_ref(&request.envelope, &execution.target)?;
+        let target = target_receipt(&execution.target)?;
+        let reservation_bytes = TERMINAL_ENVELOPE_BYTES;
+        let notify = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
+        let reservation = {
+            let mut operations = self.operations.lock().await;
+            let reservation = operations
+                .registry
+                .reserve(
+                    request.envelope.operation_id.as_str(),
+                    request.envelope.request_digest.as_str(),
+                    reservation_bytes,
+                )
+                .map_err(operation_error)?;
+            if reservation == Reservation::New {
+                operations.metadata.insert(
+                    request.envelope.operation_id.to_string(),
+                    OperationMeta {
+                        operation: operation.clone(),
+                        target: target.clone(),
+                        cancellation: cancellation.clone(),
+                        notify: notify.clone(),
+                        stdin: None,
+                    },
+                );
+                operations
+                    .registry
+                    .mark_running(request.envelope.operation_id.as_str())
+                    .map_err(operation_error)?;
+            } else {
+                validate_operation_ref(
+                    operations
+                        .metadata
+                        .get(request.envelope.operation_id.as_str()),
+                    &operation,
+                )?;
+            }
+            reservation
+        };
+        if reservation == Reservation::New {
+            let hand = self.clone();
+            tokio::spawn(async move {
+                let _slot = match hand.operation_slots.clone().acquire_owned().await {
+                    Ok(slot) => slot,
+                    Err(_) => return,
+                };
+                let result = execute_bundle(BundleExecution {
+                    bundle_path: execution.bundle_path,
+                    descriptor: execution.descriptor,
+                    envelope: request.envelope.clone(),
+                    workspace: hand.cfg.workspace.clone(),
+                    runner: hand.cfg.tool_runner.clone(),
+                    environment: execution.environment,
+                    proxy_environment: execution.target.proxy_environment,
+                    identity: execution.identity,
+                    boundary_library: hand.cfg.tool_boundary_library.clone(),
+                    target_expires_at_ms: execution.target.expires_at_ms,
+                    cancellation,
+                })
+                .await;
+                hand.finish(request.envelope.operation_id.as_str(), result)
+                    .await;
+            });
+        }
+        let observation = self
+            .observe_inner(operation.clone(), request.wait_up_to_ms)
+            .await?;
+        Ok(SubmitReceipt {
+            observation,
+            operation,
+            replayed: reservation == Reservation::Existing,
+        })
+    }
+
+    pub async fn observe(
+        &self,
+        request: ObserveRequest,
+    ) -> Result<OperationObservation, HandError> {
+        validate_wait(request.wait_ms)?;
+        self.observe_inner(request.operation, request.wait_ms).await
+    }
+
+    pub async fn cancel(&self, request: CancelRequest) -> Result<CancellationReceipt, HandError> {
+        let (accepted, cancellation) = {
+            let mut operations = self.operations.lock().await;
+            validate_operation_ref(
+                operations
+                    .metadata
+                    .get(request.operation.operation_id.as_str()),
+                &request.operation,
+            )?;
+            let accepted = operations
+                .registry
+                .request_cancel(request.operation.operation_id.as_str())
+                .map_err(operation_error)?;
+            let cancellation = operations
+                .metadata
+                .get(request.operation.operation_id.as_str())
+                .map(|meta| meta.cancellation.clone());
+            (accepted, cancellation)
+        };
+        if accepted && let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+        let observation = self.observe_inner(request.operation.clone(), 0).await?;
+        Ok(CancellationReceipt {
+            accepted,
+            observation,
+            operation: request.operation,
+        })
+    }
+
+    pub async fn acknowledge_terminal(
+        &self,
+        request: AcknowledgeTerminalRequest,
+    ) -> Result<Acknowledgement, HandError> {
+        let acknowledgements = self.acknowledgements.clone();
+        let replay_operation = request.operation.clone();
+        let replay_digest = request.terminal_digest.clone();
+        let replayed = tokio::task::spawn_blocking(move || {
+            acknowledgements.acknowledgement_exists(&replay_operation, &replay_digest)
+        })
+        .await
+        .map_err(|_| unavailable("acknowledgement storage task failed"))?
+        .map_err(ack_store_error)?;
+        if replayed {
+            self.release_acknowledged_terminal(&request.operation, &request.terminal_digest)
+                .await?;
+            return Ok(Acknowledgement { acknowledged: true });
+        }
+
+        {
+            let operations = self.operations.lock().await;
+            validate_operation_ref(
+                operations
+                    .metadata
+                    .get(request.operation.operation_id.as_str()),
+                &request.operation,
+            )?;
+            operations
+                .registry
+                .validate_terminal_ack(
+                    request.operation.operation_id.as_str(),
+                    request.terminal_digest.as_str(),
+                )
+                .map_err(operation_error)?;
+        }
+
+        let acknowledgements = self.acknowledgements.clone();
+        let operation = request.operation.clone();
+        let terminal_digest = request.terminal_digest.clone();
+        tokio::task::spawn_blocking(move || acknowledgements.retain(&operation, &terminal_digest))
+            .await
+            .map_err(|_| unavailable("acknowledgement storage task failed"))?
+            .map_err(ack_store_error)?;
+
+        // Concurrent exact acknowledgements may race after the durable tombstone. The first one
+        // releases the payload; all others replay success from the same tombstone.
+        self.release_acknowledged_terminal(&request.operation, &request.terminal_digest)
+            .await?;
+        Ok(Acknowledgement { acknowledged: true })
+    }
+
+    async fn release_acknowledged_terminal(
+        &self,
+        operation: &OperationRef,
+        terminal_digest: &Digest,
+    ) -> Result<(), HandError> {
+        let mut operations = self.operations.lock().await;
+        match operations
+            .registry
+            .acknowledge_terminal(operation.operation_id.as_str(), terminal_digest.as_str())
+        {
+            Ok(()) => {
+                operations.metadata.remove(operation.operation_id.as_str());
+            }
+            // Exact replay after an earlier release or guest reconstruction needs no payload.
+            Err(OperationError::Unknown) => {}
+            Err(error) => return Err(operation_error(error)),
+        }
+        drop(operations);
+        // Once Brain has durably committed and acknowledged the execution terminal, stdin
+        // receipts for that execution no longer need generation-lifetime retention. Exact ACK
+        // replay remains fenced by the durable payload-free acknowledgement log.
+        self.stdin_writes.lock().await.records.retain(|_, record| {
+            !matches!(
+                record,
+                StdinRecord::Complete(receipt)
+                    if receipt.observation.operation.operation_id == operation.operation_id
+            )
+        });
+        Ok(())
+    }
+
+    fn workspace_files(&self) -> Result<LiveFiles, HandError> {
+        self.files
+            .try_clone()
+            .map_err(|_| unavailable("workspace capability cannot be cloned"))
+    }
+
+    pub async fn list_files(
+        &self,
+        request: SandboxFileListRequest,
+    ) -> Result<SandboxFileList, HandError> {
+        self.fence(&request.target, &request.expected_generation)
+            .await?;
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let cursor = request.cursor.map(|cursor| cursor.to_string());
+        let limit = request.limit as usize;
+        let page = blocking_file(move || files.list(&path, cursor.as_deref(), limit)).await?;
+        Ok(SandboxFileList {
+            entries: page
+                .entries
+                .iter()
+                .map(file_entry)
+                .collect::<Result<_, _>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    pub async fn stat_file(&self, request: SandboxFileRequest) -> Result<FileEntry, HandError> {
+        self.fence(&request.target, request.expected_generation.as_str())
+            .await?;
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let entry = blocking_file(move || files.stat(&path)).await?;
+        file_entry(&entry)
+    }
+
+    pub async fn read_file(
+        &self,
+        request: SandboxFileRequest,
+    ) -> Result<SandboxFileContent, HandError> {
+        self.fence(&request.target, request.expected_generation.as_str())
+            .await?;
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let content = blocking_file(move || files.read(&path, MAX_INLINE_FILE_BYTES)).await?;
+        Ok(SandboxFileContent {
+            entry: file_entry(&content.entry)?,
+            content_base64: base64::engine::general_purpose::STANDARD.encode(content.bytes),
+        })
+    }
+
+    pub async fn write_file(
+        &self,
+        request: GuestFileWriteRequest,
+    ) -> Result<FileEffectStoredResult, HandError> {
+        self.fence(&request.target, request.expected_generation.as_str())
+            .await?;
+        if request.effect.kind == FileEffectKind::CopyExport {
+            return Err(invalid("copy export cannot use the workspace write path"));
+        }
+        let lock = file_effect_lock_index(&request.effect.operation_id);
+        let _guard = self.file_effect_locks[lock].lock().await;
+        match self.claim_file_effect_inner(request.effect.clone()).await? {
+            FileEffectReservation::Replay(result) => return Ok(*result),
+            FileEffectReservation::New => {}
+        }
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let overwrite = request.overwrite;
+        let entry = match request.source {
+            GuestFileWriteSource::Inline { content_base64 } => {
+                blocking_hand(move || {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(content_base64.as_bytes())
+                        .map_err(|_| invalid("inline file content is not padded base64"))?;
+                    if bytes.len() > 1024 * 1024 {
+                        return Err(invalid("inline file content exceeds 1 MiB"));
+                    }
+                    files.write(&path, &bytes, overwrite).map_err(file_error)
+                })
+                .await?
+            }
+            GuestFileWriteSource::InstalledObject { object } => {
+                let source = self.cfg.object_dir.join(object.sha256.as_str());
+                let bytes = object.bytes;
+                let digest = object.sha256.to_string();
+                blocking_hand(move || {
+                    if !source.is_file() {
+                        return Err(invalid(
+                            "object file write was not staged by the trusted Hand adapter",
+                        ));
+                    }
+                    files
+                        .write_from_file(&path, &source, bytes, &digest, overwrite)
+                        .map_err(file_error)
+                })
+                .await?
+            }
+        };
+        let file = file_entry(&entry)?;
+        let result = match request.effect.kind {
+            FileEffectKind::Write => FileEffectStoredResult::Write(SandboxFileWriteResult {
+                file,
+                operation_id: request
+                    .effect
+                    .operation_id
+                    .parse()
+                    .map_err(|_| invalid("file operation_id is invalid"))?,
+                replayed: false,
+                request_digest: request
+                    .effect
+                    .request_digest
+                    .parse()
+                    .map_err(|_| invalid("file request_digest is invalid"))?,
+            }),
+            FileEffectKind::CopyImport => FileEffectStoredResult::Copy(SandboxCopyResult {
+                file,
+                object: None,
+                operation_id: request
+                    .effect
+                    .operation_id
+                    .parse()
+                    .map_err(|_| invalid("copy operation_id is invalid"))?,
+                replayed: false,
+                request_digest: request
+                    .effect
+                    .request_digest
+                    .parse()
+                    .map_err(|_| invalid("copy request_digest is invalid"))?,
+            }),
+            FileEffectKind::CopyExport => unreachable!("checked above"),
+        };
+        self.complete_file_effect_inner(request.effect, result)
+            .await
+    }
+
+    pub async fn reserve_file_effect(
+        &self,
+        identity: FileEffectIdentity,
+    ) -> Result<FileEffectReservation, HandError> {
+        self.reserve_file_effect_inner(identity).await
+    }
+
+    pub async fn claim_file_effect(
+        &self,
+        identity: FileEffectIdentity,
+    ) -> Result<FileEffectReservation, HandError> {
+        self.claim_file_effect_inner(identity).await
+    }
+
+    pub async fn complete_file_effect(
+        &self,
+        result: FileEffectStoredResult,
+    ) -> Result<FileEffectStoredResult, HandError> {
+        let identity = file_effect_result_identity(&result)?;
+        let lock = file_effect_lock_index(&identity.operation_id);
+        let _guard = self.file_effect_locks[lock].lock().await;
+        self.complete_file_effect_inner(identity, result).await
+    }
+
+    async fn reserve_file_effect_inner(
+        &self,
+        identity: FileEffectIdentity,
+    ) -> Result<FileEffectReservation, HandError> {
+        let store = self.file_effects.clone();
+        blocking_hand(move || {
+            store
+                .reserve(&identity)
+                .map(|reservation| match reservation {
+                    EffectReservation::New => FileEffectReservation::New,
+                    EffectReservation::Replay(result) => FileEffectReservation::Replay(result),
+                })
+                .map_err(file_effect_store_error)
+        })
         .await
     }
 
-    async fn run_typed_tool(
+    async fn claim_file_effect_inner(
         &self,
-        op: &Arc<Operation>,
-        tool: &str,
-        implementation: tools::Preinstalled,
-        input: Value,
-        cwd: PathBuf,
-        session: &Session,
-    ) {
-        let res =
-            tokio::task::spawn_blocking(move || tools::run(implementation, &input, &cwd)).await;
-        let outcome = match res {
-            Ok(o) => o,
-            Err(e) => {
-                let info = op.terminal_info(
-                    Outcome::Failed,
-                    None,
-                    None,
-                    None,
-                    Some(internal(format!("tool task: {e}"))),
-                );
-                op.set_terminal(info);
-                return;
-            }
-        };
-        let _ = op.append(Stream::Stdout, &outcome.stdout).await;
-        let _ = op.append(Stream::Stderr, &outcome.stderr).await;
-        let (exit_code, output, error, result_outcome): (
-            Option<i32>,
-            Option<Value>,
-            Option<AbiError>,
-            Outcome,
-        ) = match (&outcome.output, session.validators.get(tool)) {
-            (Some(out), Some((_, output_v))) => match output_v.iter_errors(out).next() {
-                None => (
-                    Some(outcome.exit_code),
-                    outcome.output.clone(),
-                    None,
-                    Outcome::Completed,
-                ),
-                Some(e) => (
-                    None,
-                    None,
-                    Some(err(
-                        ErrorCode::ToolOutputInvalid,
-                        format!("{tool} output{}: {e}", e.instance_path()),
-                    )),
-                    Outcome::Failed,
-                ),
-            },
-            _ => (Some(outcome.exit_code), None, None, Outcome::Completed),
-        };
-        let info = op.terminal_info(
-            result_outcome,
-            exit_code.map(i64::from),
-            None,
-            output,
-            error,
-        );
-        op.set_terminal(info);
+        identity: FileEffectIdentity,
+    ) -> Result<FileEffectReservation, HandError> {
+        let store = self.file_effects.clone();
+        blocking_hand(move || {
+            store
+                .claim(&identity)
+                .map(|reservation| match reservation {
+                    EffectReservation::New => FileEffectReservation::New,
+                    EffectReservation::Replay(result) => FileEffectReservation::Replay(result),
+                })
+                .map_err(file_effect_store_error)
+        })
+        .await
     }
 
-    async fn run_bundle_tool(&self, invocation: BundleInvocation) {
-        let BundleInvocation {
-            op,
-            tool,
-            bundle,
-            input,
-            env,
-            cwd,
-            session,
-        } = invocation;
-        let Some(spec) = session
-            .manifest
-            .tools
-            .iter()
-            .find(|spec| *spec.name == tool)
-        else {
-            let info = op.terminal_info(
-                Outcome::Failed,
-                None,
-                None,
-                None,
-                Some(err(
-                    ErrorCode::ToolNotFound,
-                    "sealed Tool definition is missing",
-                )),
-            );
-            op.set_terminal(info);
+    async fn complete_file_effect_inner(
+        &self,
+        identity: FileEffectIdentity,
+        result: FileEffectStoredResult,
+    ) -> Result<FileEffectStoredResult, HandError> {
+        let store = self.file_effects.clone();
+        blocking_hand(move || {
+            store
+                .complete(&identity, result)
+                .map_err(file_effect_store_error)
+        })
+        .await
+    }
+
+    pub async fn find_files(
+        &self,
+        request: SandboxSearchRequest,
+    ) -> Result<SandboxFileList, HandError> {
+        self.fence(&request.target, &request.expected_generation)
+            .await?;
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let expression = request.expression.to_string();
+        let cursor = request.cursor.map(|cursor| cursor.to_string());
+        let limit = request.limit as usize;
+        let page =
+            blocking_file(move || files.find(&path, &expression, cursor.as_deref(), limit)).await?;
+        Ok(SandboxFileList {
+            entries: page
+                .entries
+                .iter()
+                .map(file_entry)
+                .collect::<Result<_, _>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    pub async fn grep_files(
+        &self,
+        request: SandboxSearchRequest,
+    ) -> Result<SandboxFileList, HandError> {
+        self.fence(&request.target, &request.expected_generation)
+            .await?;
+        let files = self.workspace_files()?;
+        let path = request.path.to_string();
+        let expression = request.expression.to_string();
+        let cursor = request.cursor.map(|cursor| cursor.to_string());
+        let limit = request.limit as usize;
+        let page =
+            blocking_file(move || files.grep(&path, &expression, cursor.as_deref(), limit)).await?;
+        Ok(SandboxFileList {
+            entries: page
+                .entries
+                .iter()
+                .map(file_entry)
+                .collect::<Result<_, _>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    pub async fn execute_sandbox(
+        self: &Arc<Self>,
+        request: SandboxExecutionRequest,
+    ) -> Result<SubmitReceipt, HandError> {
+        if sandbox_execution_request_digest(&request) != request.request_digest {
+            return Err(invalid("sandbox execution request_digest is not canonical"));
+        }
+        self.fence_acknowledged_submission(
+            request.execution_id.as_str(),
+            request.request_digest.as_str(),
+        )?;
+        let target = self
+            .fence(&request.target, request.expected_generation.as_str())
+            .await?;
+        validate_resource_subset(&request.resources, &target.resources)?;
+        if !network_ceiling_is_subset(&request.network, &target.network) {
+            return Err(hand_error(
+                HandErrorCode::GenerationConflict,
+                false,
+                "sandbox execution network policy widens the immutable root target seal",
+            ));
+        }
+        let cwd = request
+            .input
+            .cwd
+            .as_ref()
+            .map_or("/workspace", |cwd| cwd.as_str());
+        if cwd.is_empty() {
+            return Err(invalid(
+                "sandbox execution cwd must be /workspace or a child path",
+            ));
+        }
+        let files = self.workspace_files()?;
+        let cwd = cwd.to_owned();
+        let cwd = blocking_file(move || files.open_directory(&cwd)).await?;
+        let operation = OperationRef {
+            generation: target
+                .generation
+                .parse()
+                .map_err(|_| invalid("generation is not a canonical operation locator"))?,
+            operation_id: request.execution_id.clone(),
+            receipt_ref: operation_receipt_ref(
+                request.execution_id.as_str(),
+                request.request_digest.as_str(),
+                target.target_ref.as_str(),
+                target.generation.as_str(),
+            )?,
+            request_digest: request.request_digest.clone(),
+            target: request.target.clone(),
+            target_ref: target
+                .target_ref
+                .parse()
+                .map_err(|_| invalid("target_ref is not a canonical operation locator"))?,
+        };
+        let target_receipt = target_receipt(&target)?;
+        let reservation_bytes = TERMINAL_ENVELOPE_BYTES;
+        let notify = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
+        let control = request
+            .input
+            .interactive
+            .then(|| Arc::new(InteractiveControl::default()));
+        let reservation = {
+            let mut operations = self.operations.lock().await;
+            let reservation = operations
+                .registry
+                .reserve(
+                    request.execution_id.as_str(),
+                    request.request_digest.as_str(),
+                    reservation_bytes,
+                )
+                .map_err(operation_error)?;
+            if reservation == Reservation::New {
+                operations.metadata.insert(
+                    request.execution_id.to_string(),
+                    OperationMeta {
+                        operation: operation.clone(),
+                        target: target_receipt.clone(),
+                        cancellation: cancellation.clone(),
+                        notify: notify.clone(),
+                        stdin: control.clone(),
+                    },
+                );
+                operations
+                    .registry
+                    .mark_running(request.execution_id.as_str())
+                    .map_err(operation_error)?;
+            } else {
+                validate_operation_ref(
+                    operations.metadata.get(request.execution_id.as_str()),
+                    &operation,
+                )?;
+            }
+            reservation
+        };
+        if reservation == Reservation::New {
+            let hand = self.clone();
+            let execution_id = request.execution_id.to_string();
+            let command = request.input.command.to_string();
+            let timeout_ms = request.resources.timeout_ms.get();
+            let max_output_bytes = request.resources.max_output_bytes.get();
+            let interactive = request.input.interactive;
+            tokio::spawn(async move {
+                let _slot = match hand.operation_slots.clone().acquire_owned().await {
+                    Ok(slot) => slot,
+                    Err(_) => return,
+                };
+                let result = execute_shell(ShellExecution {
+                    command,
+                    cwd,
+                    workspace: hand.cfg.workspace.clone(),
+                    timeout_ms,
+                    max_output_bytes,
+                    interactive,
+                    proxy_environment: target.proxy_environment,
+                    identity: hand.cfg.tool_identity,
+                    boundary_library: hand.cfg.tool_boundary_library.clone(),
+                    target_expires_at_ms: target.expires_at_ms,
+                    cancellation,
+                    control,
+                })
+                .await;
+                hand.finish(&execution_id, result).await;
+            });
+        }
+        let observation = self.observe_inner(operation.clone(), 0).await?;
+        Ok(SubmitReceipt {
+            observation,
+            operation,
+            replayed: reservation == Reservation::Existing,
+        })
+    }
+
+    pub async fn write_stdin(
+        &self,
+        request: WriteStdinRequest,
+    ) -> Result<WriteStdinReceipt, HandError> {
+        if write_stdin_request_digest(&request) != request.request_digest {
+            return Err(invalid("write_stdin request_digest is not canonical"));
+        }
+        if request.text.len() > brain_protocol::MAX_WRITE_STDIN_BYTES {
+            return Err(invalid(
+                "stdin text exceeds the atomic 4096-byte pipe-write bound",
+            ));
+        }
+        let target = self
+            .fence(&request.target, request.expected_generation.as_str())
+            .await?;
+        let (control, execution_operation) = {
+            let operations = self.operations.lock().await;
+            let meta = operations
+                .metadata
+                .get(request.execution_id.as_str())
+                .ok_or_else(|| operation_error(OperationError::Unknown))?;
+            if meta.operation.operation_id != request.execution_id
+                || !canonical_equal(&meta.operation.target, &request.target)?
+                || meta.operation.generation.as_str() != target.generation
+                || meta.operation.target_ref.as_str() != target.target_ref
+                || meta.target.target_ref.as_str() != target.target_ref
+                || meta.target.generation.as_str() != target.generation
+            {
+                return Err(hand_error(
+                    HandErrorCode::OperationConflict,
+                    false,
+                    "stdin target does not match the reserved sandbox execution",
+                ));
+            }
+            (meta.stdin.clone(), meta.operation.clone())
+        };
+        // Reserve globally, then release the book lock before touching a potentially full pipe.
+        // Exact concurrent retries wait on the short bounded write; unrelated executions never
+        // queue behind a hostile shell that refuses to read stdin.
+        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut writes = self.stdin_writes.lock().await;
+            match writes.records.get(request.operation_id.as_str()) {
+                Some(StdinRecord::Complete(existing)) => {
+                    if existing.request_digest == request.request_digest {
+                        let mut receipt = existing.as_ref().clone();
+                        receipt.replayed = true;
+                        drop(writes);
+                        receipt.observation =
+                            self.observe_inner(execution_operation.clone(), 0).await?;
+                        return Ok(receipt);
+                    } else {
+                        return Err(stdin_conflict());
+                    }
+                }
+                Some(StdinRecord::InFlight { request_digest }) => {
+                    if request_digest != &request.request_digest {
+                        return Err(stdin_conflict());
+                    }
+                }
+                None => {
+                    if writes.records.len() >= MAX_RETAINED_STDIN_WRITES {
+                        return Err(hand_error(
+                            HandErrorCode::ResourceExhausted,
+                            false,
+                            "stdin idempotency retention is full for this sandbox generation",
+                        ));
+                    }
+                    writes.records.insert(
+                        request.operation_id.to_string(),
+                        StdinRecord::InFlight {
+                            request_digest: request.request_digest.clone(),
+                        },
+                    );
+                    break;
+                }
+            }
+            drop(writes);
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(unavailable(
+                    "an exact stdin write is still completing; observe and retry",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Empty text without EOF is an observation-only poll. Otherwise the byte bound is
+        // PIPE_BUF on supported Linux images, so the one append is all-or-nothing; EOF closes the
+        // same pipe only after that append succeeds.
+        let accepted = if request.text.is_empty() && !request.eof {
+            false
+        } else {
+            match control {
+                Some(control) => {
+                    control
+                        .send_atomic(request.text.as_bytes(), request.eof)
+                        .await
+                }
+                None => false,
+            }
+        };
+        let observation = self.observe_inner(execution_operation, 0).await?;
+        let receipt = WriteStdinReceipt {
+            accepted,
+            observation,
+            operation_id: request.operation_id.clone(),
+            replayed: false,
+            request_digest: request.request_digest.clone(),
+        };
+        let mut writes = self.stdin_writes.lock().await;
+        match writes.records.get(request.operation_id.as_str()) {
+            Some(StdinRecord::InFlight { request_digest })
+                if request_digest == &request.request_digest =>
+            {
+                writes.records.insert(
+                    request.operation_id.to_string(),
+                    StdinRecord::Complete(Box::new(receipt.clone())),
+                );
+            }
+            _ => return Err(stdin_conflict()),
+        }
+        Ok(receipt)
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        // Refuse every queued operation before collecting active cancellations. Existing tasks
+        // retain their permits until their process group has been killed, reaped, and projected
+        // terminal; queued tasks never spawn a child after shutdown begins.
+        self.operation_slots.close();
+        let cancellations = self
+            .operations
+            .lock()
+            .await
+            .metadata
+            .values()
+            .map(|meta| meta.cancellation.clone())
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+        // `terminate_process_group` allows two seconds for TERM and one second for the final KILL
+        // reap. Keep the supervisor (and therefore CAP_KILL) alive across that complete bounded
+        // cleanup path instead of dropping Tokio while cross-UID children can still be running.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        while self.operation_slots.available_permits() != MAX_CONCURRENT_OPERATIONS
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn require_target(&self) -> Result<TargetSnapshot, HandError> {
+        let target = self
+            .target
+            .read()
+            .await
+            .as_ref()
+            .map(TargetSnapshot::from)
+            .ok_or_else(|| {
+                hand_error(
+                    HandErrorCode::SandboxNotMaterialized,
+                    false,
+                    "physical generation has not been armed",
+                )
+            })?;
+        if wall_ms() >= target.expires_at_ms {
+            return Err(hand_error(
+                HandErrorCode::SandboxGone,
+                false,
+                "physical sandbox generation reached its hard deadline",
+            ));
+        }
+        Ok(target)
+    }
+
+    async fn fence(
+        &self,
+        target: &brain_protocol::hand::SandboxTarget,
+        generation: &str,
+    ) -> Result<TargetSnapshot, HandError> {
+        let physical = self.require_target().await?;
+        if target.root_id.as_str() != physical.root_id || generation != physical.generation {
+            return Err(generation_conflict());
+        }
+        Ok(physical)
+    }
+
+    async fn validate_operation(
+        &self,
+        envelope: &OperationEnvelope,
+    ) -> Result<ValidatedExecution, HandError> {
+        let target = self.require_target().await?;
+        if envelope.root_id.as_str() != target.root_id
+            || envelope
+                .generation
+                .as_ref()
+                .is_some_and(|generation| generation.as_str() != target.generation)
+            || envelope
+                .target_ref
+                .as_ref()
+                .is_some_and(|target_ref| target_ref.as_str() != target.target_ref)
+        {
+            return Err(generation_conflict());
+        }
+        validate_resource_subset(&envelope.resources, &target.resources)?;
+        if !network_ceiling_is_subset(&envelope.network, &target.network) {
+            return Err(hand_error(
+                HandErrorCode::GenerationConflict,
+                false,
+                "operation network policy widens the immutable root target seal",
+            ));
+        }
+        let bindings = self.bindings.read().await;
+        let binding = bindings.get(envelope.binding_ref.as_str()).ok_or_else(|| {
+            hand_error(
+                HandErrorCode::BindingConflict,
+                false,
+                "binding_ref is not installed",
+            )
+        })?;
+        if binding.seal.root_id != envelope.root_id
+            || binding.seal.session_id != envelope.session_id
+            || binding.seal.capability != envelope.capability
+            || binding.seal.realm != ExecutionRealm::AexManaged
+        {
+            return Err(hand_error(
+                HandErrorCode::BindingConflict,
+                false,
+                "operation does not match the immutable binding seal",
+            ));
+        }
+        let descriptor = binding.seal.bundle.clone().ok_or_else(|| {
+            hand_error(
+                HandErrorCode::CapabilityUnavailable,
+                false,
+                "managed binding has no Tool bundle",
+            )
+        })?;
+        let secrets = self.secrets.read().await;
+        let values = secrets.get(envelope.session_id.as_str());
+        let mut environment = HashMap::new();
+        for name in &descriptor.required_env {
+            let value = values
+                .and_then(|values| values.values.get(name.as_str()))
+                .ok_or_else(|| unavailable("required Tool environment has not been delivered"))?;
+            environment.insert(name.to_string(), value.clone());
+        }
+        Ok(ValidatedExecution {
+            bundle_path: binding.bundle_path.clone(),
+            descriptor,
+            environment,
+            identity: binding.identity,
+            target,
+        })
+    }
+
+    fn fence_acknowledged_submission(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<(), HandError> {
+        match self
+            .acknowledgements
+            .fence_submission(operation_id, request_digest)
+            .map_err(ack_store_error)?
+        {
+            SubmissionFence::Clear => Ok(()),
+            SubmissionFence::Acknowledged => Err(hand_error(
+                HandErrorCode::OperationUnknown,
+                false,
+                "operation terminal was already committed and released",
+            )),
+        }
+    }
+
+    async fn finish(&self, operation_id: &str, mut result: crate::process::ExecutionResult) {
+        // The child boundary already enforces the operation's narrower output ceiling. Keep this
+        // final check at the receipt boundary as defense in depth: a future executor must never
+        // retain a success that Brain cannot journal after the effect has happened.
+        if !terminal_inline_fits(&result.inline) {
+            result.inline = serde_json::json!({
+                "error": "execution may have completed, but its inline result exceeded the Brain terminal limit; store large data in session storage or the sandbox and return a key/path"
+            });
+            result.is_error = true;
+            result.outcome = TerminalOutcome::Failed;
+        }
+        let mut terminal = TerminalResult {
+            duration_ms: Some(result.duration_ms),
+            exit_code: result.exit_code,
+            inline: Some(result.inline),
+            is_error: result.is_error,
+            object: None,
+            outcome: result.outcome,
+            terminal_digest: "0".repeat(64).parse().expect("digest placeholder"),
+        };
+        terminal.terminal_digest = terminal_result_digest(&terminal);
+        let mut operations = self.operations.lock().await;
+        let Some(meta) = operations.metadata.get(operation_id) else {
             return;
         };
-        let timeout_ms = op
-            .bounds
-            .timeout_ms
-            .map(|value| value.get())
-            .unwrap_or(24 * 60 * 60 * 1000);
-        let request_path = self
-            .cfg
-            .spill_dir
-            .join(format!("{}.tool-request.json", *op.id));
-        let result_path = self
-            .cfg
-            .spill_dir
-            .join(format!("{}.tool-result.json", *op.id));
-        let request = serde_json::json!({
-            "call_id": op.id.to_string(),
-            "definition": {
-                "name": spec.name.to_string(),
-                "description": spec.description,
-            },
-            "required_env": spec.executable.required_env.iter().map(|name| name.to_string()).collect::<Vec<_>>(),
-            "input": input,
-            "workspace": self.cfg.workspace.to_string_lossy(),
-            "deadline_ms": wall_ms().saturating_add(timeout_ms),
-        });
-        let finished = run_node(
-            op.clone(),
-            NodeSpec {
-                runner: self.cfg.tool_runner.clone(),
-                bundle,
-                request,
-                env,
-                cwd,
-                request_path,
-                result_path,
-            },
-        )
-        .await;
-        let mut outcome = finished.outcome;
-        let mut output = finished.output;
-        let mut error = finished
-            .infrastructure_error
-            .map(|message| err(ErrorCode::Internal, message));
-        let validation_error = output.as_ref().and_then(|value| {
-            session.validators.get(&tool).and_then(|(_, validator)| {
-                validator.iter_errors(value).next().map(|validation| {
-                    format!("{tool} output{}: {validation}", validation.instance_path())
-                })
-            })
-        });
-        if let Some(validation_error) = validation_error {
-            outcome = Outcome::Failed;
-            output = None;
-            error = Some(err(ErrorCode::ToolOutputInvalid, validation_error));
-        }
-        let info = op.terminal_info(outcome, finished.exit_code, finished.signal, output, error);
-        op.set_terminal(info);
-    }
-
-    fn on_op_terminal(&self, op: &Arc<Operation>, captured_env: Option<HashMap<String, String>>) {
-        if let Some(lanes) = self.lanes.lock().unwrap().as_mut() {
-            lanes.on_operation_terminal(&op.lane_id, &op.id, captured_env);
-        }
-        let none_running = self.ops.lock().unwrap().running().next().is_none();
-        if none_running {
-            *self.idle_since.lock().unwrap() = Instant::now();
-        }
-        self.emit_status();
-    }
-
-    async fn poll(&self, a: PollRequest) -> AbiResult<PollResponse> {
-        self.session()?;
-        let op = self
-            .ops
-            .lock()
-            .unwrap()
-            .get(&a.operation_id)
-            .ok_or_else(|| {
-                err(
-                    ErrorCode::OperationNotFound,
-                    format!("operation {} is unknown or released", *a.operation_id),
-                )
-            })?;
-        let cursors: Vec<(Stream, u64)> = a.cursors.iter().map(|c| (c.stream, c.offset)).collect();
-        if a.wait_ms > 0 {
-            op.wait_for(
-                &cursors,
-                Duration::from_millis(a.wait_ms.min(self.cfg.limits.max_poll_wait_ms)),
-            )
-            .await;
-        }
-        let view = op.view().await;
-        let slices = op
-            .slices(
-                &cursors,
-                a.max_bytes,
-                self.cfg.limits.max_slice_bytes as u64,
-            )
-            .await?;
-        Ok(PollResponse { view, slices })
-    }
-
-    async fn cancel(&self, a: CancelRequest) -> AbiResult<CancelResponse> {
-        self.session()?;
-        let op = self
-            .ops
-            .lock()
-            .unwrap()
-            .get(&a.operation_id)
-            .ok_or_else(|| {
-                err(
-                    ErrorCode::OperationNotFound,
-                    format!("operation {} is unknown or released", *a.operation_id),
-                )
-            })?;
-        let accepted = self.cancel_op(&op, a.grace_ms);
-        Ok(CancelResponse {
-            accepted,
-            view: op.view().await,
-        })
-    }
-
-    /// TERM -> grace -> KILL. Returns false if the operation was already terminal.
-    fn cancel_op(&self, op: &Arc<Operation>, grace_ms: Option<u64>) -> bool {
-        {
-            let mut st = op.state.lock().unwrap();
-            if st.terminal.is_some() {
-                return false;
-            }
-            st.cancel_requested = true;
-        }
-        op.signal(libc::SIGTERM);
-        let grace = Duration::from_millis(grace_ms.unwrap_or(op.bounds.grace_ms));
-        let op2 = op.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(grace).await;
-            if !op2.is_terminal() {
-                op2.signal(libc::SIGKILL);
-            }
-        });
-        true
-    }
-
-    async fn release(&self, a: ReleaseRequest) -> AbiResult<ReleaseResponse> {
-        self.session()?;
-        let mut released = Vec::new();
-        let mut unknown = Vec::new();
-        for id in a.operation_ids {
-            let removed = self.ops.lock().unwrap().remove(&id);
-            match removed {
-                Some(op) => {
-                    if !op.is_terminal() {
-                        // Releasing a running operation: it is forgotten from the registry; the
-                        // process (if any) is cancelled so nothing runs unaccounted.
-                        self.cancel_op(&op, None);
-                    }
-                    op.state.lock().unwrap().released = true;
-                    op.remove_spill().await;
-                    released.push(id);
-                }
-                None => unknown.push(id),
-            }
-        }
-        self.emit_status();
-        Ok(ReleaseResponse { released, unknown })
-    }
-
-    async fn lane_close(&self, a: LaneCloseRequest) -> AbiResult<LaneCloseResponse> {
-        self.session()?;
-        let (closed, inflight) = {
-            let mut lanes = self.lanes.lock().unwrap();
-            let lanes = lanes
-                .as_mut()
-                .ok_or_else(|| err(ErrorCode::Unauthorized, "hello first"))?;
-            lanes.close(&a.lane_id)?
+        let operation = meta.operation.clone();
+        let target = meta.target.clone();
+        let notify = meta.notify.clone();
+        let observation = OperationObservation {
+            next_cursor: "1".parse().expect("cursor"),
+            operation: operation.clone(),
+            output: Vec::new(),
+            state: ContractOperationState::Terminal,
+            target: Some(target.clone()),
+            terminal: Some(terminal.clone()),
         };
-        let mut cancelled = Vec::new();
-        if let Some(op_id) = inflight
-            && let Some(op) = self.ops.lock().unwrap().get(&op_id)
-            && self.cancel_op(&op, a.grace_ms)
+        let completed = serde_json::to_vec(&observation).is_ok_and(|payload| {
+            operations
+                .registry
+                .complete(operation_id, terminal.terminal_digest.as_str(), payload)
+                .is_ok()
+        });
+        if completed {
+            notify.notify_waiters();
+            return;
+        }
+
+        // This should be unreachable after admission reserves output plus worst-case encoded
+        // diagnostics. Still fail terminally instead of retaining a fictitious `running` state if
+        // a future contract shape grows beyond that calculation.
+        let mut fallback = TerminalResult {
+            duration_ms: Some(result.duration_ms),
+            exit_code: result.exit_code,
+            inline: Some(serde_json::json!({
+                "error": "terminal result could not be retained within its reserved capacity"
+            })),
+            is_error: true,
+            object: None,
+            outcome: TerminalOutcome::Interrupted,
+            terminal_digest: "0".repeat(64).parse().expect("digest placeholder"),
+        };
+        fallback.terminal_digest = terminal_result_digest(&fallback);
+        let fallback_observation = OperationObservation {
+            next_cursor: "1".parse().expect("cursor"),
+            operation,
+            output: Vec::new(),
+            state: ContractOperationState::Terminal,
+            target: Some(target),
+            terminal: Some(fallback.clone()),
+        };
+        if let Ok(payload) = serde_json::to_vec(&fallback_observation)
+            && operations
+                .registry
+                .complete(operation_id, fallback.terminal_digest.as_str(), payload)
+                .is_ok()
         {
-            cancelled.push(op_id);
+            notify.notify_waiters();
         }
-        self.emit_status();
-        Ok(LaneCloseResponse {
-            closed,
-            cancelled_operations: cancelled,
-        })
     }
 
-    // ----- files ---------------------------------------------------------------------------
-
-    async fn put(&self, a: PutRequest) -> AbiResult<PutResponse> {
-        let session = self.session()?;
-        let mut written = Vec::new();
-        for f in a.files {
-            let dest = session.scope.resolve(&f.path)?;
-            let mode = f.mode.unwrap_or(0o644) as u32;
-            let (bytes, sha) = match f.source {
-                PutSource::Url {
-                    get_url,
-                    bytes,
-                    sha256,
-                } => {
-                    transfer::download_to(&self.http, &get_url, &dest, Some(bytes), Some(&sha256))
-                        .await?
-                }
-                PutSource::Inline { data_base64 } => {
-                    let data = base64::engine::general_purpose::STANDARD
-                        .decode(data_base64.as_bytes())
-                        .map_err(|e| malformed(format!("inline data_base64: {e}")))?;
-                    if data.len() as u64 > self.cfg.limits.max_inline_put_bytes {
-                        return Err(err(
-                            ErrorCode::TooLarge,
-                            format!(
-                                "inline payload {} > max_inline_put_bytes {}",
-                                data.len(),
-                                self.cfg.limits.max_inline_put_bytes
-                            ),
-                        ));
-                    }
-                    if let Some(parent) = dest.parent() {
-                        tokio::fs::create_dir_all(parent).await.map_err(internal)?;
-                    }
-                    let tmp = dest.with_extension("aex-tmp");
-                    tokio::fs::write(&tmp, &data).await.map_err(internal)?;
-                    tokio::fs::rename(&tmp, &dest).await.map_err(internal)?;
-                    (data.len() as u64, transfer::sha256_hex(&data))
-                }
+    async fn observe_inner(
+        &self,
+        operation: OperationRef,
+        wait_ms: u64,
+    ) -> Result<OperationObservation, HandError> {
+        let notify = {
+            let operations = self.operations.lock().await;
+            validate_operation_ref(
+                operations.metadata.get(operation.operation_id.as_str()),
+                &operation,
+            )?;
+            operations
+                .registry
+                .observe(operation.operation_id.as_str())
+                .ok_or_else(|| operation_error(OperationError::Unknown))?;
+            operations
+                .metadata
+                .get(operation.operation_id.as_str())
+                .map(|meta| meta.notify.clone())
+                .ok_or_else(|| operation_error(OperationError::Unknown))?
+        };
+        if wait_ms > 0 {
+            // Enable the owned notification before the second state check. `notify_waiters`
+            // does not retain a permit for a future waiter, so checking once and then creating a
+            // waiter has a race that can add the entire 30-second observe window after terminal.
+            let notified = notify.notified_owned();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let terminal = {
+                let operations = self.operations.lock().await;
+                matches!(
+                    operations
+                        .registry
+                        .observe(operation.operation_id.as_str())
+                        .map(|record| &record.state),
+                    Some(OperationState::Terminal { .. })
+                )
             };
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
+            if !terminal {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(wait_ms.min(MAX_WAIT_MS)),
+                    notified,
+                )
+                .await;
+            }
+        }
+        let operations = self.operations.lock().await;
+        let record = operations
+            .registry
+            .observe(operation.operation_id.as_str())
+            .ok_or_else(|| operation_error(OperationError::Unknown))?;
+        let meta = operations
+            .metadata
+            .get(operation.operation_id.as_str())
+            .ok_or_else(|| operation_error(OperationError::Unknown))?;
+        match &record.state {
+            OperationState::Terminal { payload, .. } => serde_json::from_slice(payload)
+                .map_err(|_| unavailable("retained terminal observation is unavailable")),
+            OperationState::Accepted | OperationState::Running => Ok(OperationObservation {
+                next_cursor: "0".parse().expect("cursor"),
+                operation,
+                output: Vec::new(),
+                state: match record.state {
+                    OperationState::Accepted => ContractOperationState::Accepted,
+                    OperationState::Running => ContractOperationState::Running,
+                    OperationState::Terminal { .. } => unreachable!(),
+                },
+                target: Some(meta.target.clone()),
+                terminal: None,
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TargetSnapshot {
+    target_ref: String,
+    generation: String,
+    expires_at_ms: u64,
+    root_id: String,
+    resources: ResourceCeiling,
+    network: NetworkCeiling,
+    proxy_environment: HashMap<String, String>,
+}
+
+impl From<&ArmedTarget> for TargetSnapshot {
+    fn from(target: &ArmedTarget) -> Self {
+        Self {
+            target_ref: target.target_ref.clone(),
+            generation: target.generation.clone(),
+            expires_at_ms: target.expires_at_ms,
+            root_id: target.root_id.clone(),
+            resources: target.resources.clone(),
+            network: target.network.clone(),
+            proxy_environment: target.proxy_environment.clone(),
+        }
+    }
+}
+
+struct ValidatedExecution {
+    bundle_path: PathBuf,
+    descriptor: BundleDescriptor,
+    environment: HashMap<String, String>,
+    identity: Option<ToolIdentity>,
+    target: TargetSnapshot,
+}
+
+fn operation_ref(
+    envelope: &OperationEnvelope,
+    physical: &TargetSnapshot,
+) -> Result<OperationRef, HandError> {
+    Ok(OperationRef {
+        generation: physical
+            .generation
+            .as_str()
+            .parse()
+            .map_err(|_| invalid("generation is not a canonical operation locator"))?,
+        operation_id: envelope.operation_id.clone(),
+        receipt_ref: operation_receipt_ref(
+            envelope.operation_id.as_str(),
+            envelope.request_digest.as_str(),
+            physical.target_ref.as_str(),
+            physical.generation.as_str(),
+        )?,
+        request_digest: envelope.request_digest.clone(),
+        target: SandboxTarget {
+            binding_ref: envelope.binding_ref.clone(),
+            kind: TargetKind::Default,
+            root_id: envelope.root_id.clone(),
+            sandbox_id: None,
+            session_id: envelope.session_id.clone(),
+        },
+        target_ref: physical
+            .target_ref
+            .as_str()
+            .parse()
+            .map_err(|_| invalid("target_ref is not a canonical operation locator"))?,
+    })
+}
+
+/// The target reference routes later work to one physical filesystem; the receipt reference names
+/// one reserved operation on that target. It is deterministic so a lost submit response can be
+/// reconstructed without adding a hot-path registry write, but distinct operations cannot alias.
+fn operation_receipt_ref(
+    operation_id: &str,
+    request_digest: &str,
+    target_ref: &str,
+    generation: &str,
+) -> Result<brain_protocol::hand::Identifier, HandError> {
+    let mut hasher = Sha256::new();
+    for part in [operation_id, request_digest, target_ref, generation] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("receipt:{}", hex::encode(hasher.finalize()))
+        .parse()
+        .map_err(|_| invalid("operation receipt locator is invalid"))
+}
+
+fn target_receipt(target: &TargetSnapshot) -> Result<TargetReceipt, HandError> {
+    Ok(TargetReceipt {
+        expires_at_ms: std::num::NonZeroU64::new(target.expires_at_ms)
+            .ok_or_else(|| invalid("target expiry is invalid"))?,
+        generation: target
+            .generation
+            .parse()
+            .map_err(|_| invalid("generation is invalid"))?,
+        target_ref: target
+            .target_ref
+            .parse()
+            .map_err(|_| invalid("target_ref is invalid"))?,
+    })
+}
+
+fn validate_operation_ref(
+    meta: Option<&OperationMeta>,
+    operation: &OperationRef,
+) -> Result<(), HandError> {
+    match meta {
+        Some(meta) if canonical_equal(&meta.operation, operation)? => Ok(()),
+        Some(_) => Err(hand_error(
+            HandErrorCode::OperationConflict,
+            false,
+            "operation locator does not match the reserved receipt",
+        )),
+        None => Err(operation_error(OperationError::Unknown)),
+    }
+}
+
+fn validate_wait(wait_ms: u64) -> Result<(), HandError> {
+    if wait_ms > MAX_WAIT_MS {
+        Err(invalid(format!("wait exceeds the {MAX_WAIT_MS} ms bound")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_connector(
+    connector: ConnectorClass,
+    network: &NetworkCeiling,
+    has_proxy: bool,
+) -> Result<(), HandError> {
+    let exact = matches!(
+        (connector, network, has_proxy),
+        (ConnectorClass::None, NetworkCeiling::None, false)
+            | (ConnectorClass::Public, NetworkCeiling::Public, false)
+            | (
+                ConnectorClass::Allowlist,
+                NetworkCeiling::Allowlist(_),
+                true
+            )
+    );
+    if exact {
+        Ok(())
+    } else {
+        Err(invalid(
+            "connector class does not exactly match the root network seal",
+        ))
+    }
+}
+
+fn validate_resource_subset(
+    request: &ResourceCeiling,
+    physical: &ResourceCeiling,
+) -> Result<(), HandError> {
+    ResourceSupport {
+        max_timeout_ms: physical.timeout_ms.get().min(MAX_OPERATION_TIMEOUT_MS),
+        max_output_bytes: physical
+            .max_output_bytes
+            .get()
+            .min(MAX_OPERATION_OUTPUT_BYTES),
+    }
+    .validate(ResourceRequest {
+        timeout_ms: request.timeout_ms.get(),
+        max_output_bytes: request.max_output_bytes.get(),
+    })
+    .map_err(|error| invalid(error.to_string()))?;
+    let within = request.timeout_ms <= physical.timeout_ms
+        && request.max_output_bytes <= physical.max_output_bytes;
+    if within {
+        Ok(())
+    } else {
+        Err(invalid(
+            "operation resources widen the immutable root target seal",
+        ))
+    }
+}
+
+async fn blocking_file<T, F>(work: F) -> Result<T, HandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LiveFileError> + Send + 'static,
+{
+    blocking_hand(move || work().map_err(file_error)).await
+}
+
+async fn blocking_hand<T, F>(work: F) -> Result<T, HandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, HandError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| unavailable("bounded file worker failed"))?
+}
+
+fn canonical_equal<T: serde::Serialize>(left: &T, right: &T) -> Result<bool, HandError> {
+    let left =
+        serde_jcs::to_vec(left).map_err(|_| invalid("sealed value is not canonicalizable"))?;
+    let right =
+        serde_jcs::to_vec(right).map_err(|_| invalid("sealed value is not canonicalizable"))?;
+    Ok(left == right)
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn operation_error(error: OperationError) -> HandError {
+    let code = match error {
+        OperationError::IdempotencyConflict | OperationError::TerminalConflict => {
+            HandErrorCode::OperationConflict
+        }
+        OperationError::Unknown => HandErrorCode::OperationUnknown,
+        OperationError::Capacity | OperationError::TerminalCapacity => {
+            HandErrorCode::ResourceExhausted
+        }
+        OperationError::InvalidIdentity(_)
+        | OperationError::AlreadyTerminal
+        | OperationError::NotTerminal
+        | OperationError::TerminalDigestMismatch => HandErrorCode::InvalidRequest,
+    };
+    hand_error(code, false, error.to_string())
+}
+
+fn stdin_conflict() -> HandError {
+    hand_error(
+        HandErrorCode::OperationConflict,
+        false,
+        "stdin operation_id is already reserved for a different request digest",
+    )
+}
+
+fn ack_store_error(error: AckStoreError) -> HandError {
+    let (code, retryable) = match error {
+        AckStoreError::Conflict => (HandErrorCode::OperationConflict, false),
+        AckStoreError::Capacity => (HandErrorCode::ResourceExhausted, false),
+        AckStoreError::Invalid(_) => (HandErrorCode::InvalidRequest, false),
+        AckStoreError::Io(_) => (HandErrorCode::TemporarilyUnavailable, true),
+        AckStoreError::Corrupt(_) => (HandErrorCode::TemporarilyUnavailable, false),
+    };
+    hand_error(code, retryable, error.to_string())
+}
+
+fn file_effect_store_error(error: FileEffectStoreError) -> HandError {
+    let (code, retryable) = match error {
+        FileEffectStoreError::Conflict => (HandErrorCode::BindingConflict, false),
+        FileEffectStoreError::Ambiguous => (HandErrorCode::OperationUnknown, false),
+        FileEffectStoreError::Capacity => (HandErrorCode::ResourceExhausted, false),
+        FileEffectStoreError::Invalid(_) => (HandErrorCode::InvalidRequest, false),
+        FileEffectStoreError::Io(_) => (HandErrorCode::TemporarilyUnavailable, true),
+        FileEffectStoreError::Corrupt(_) => (HandErrorCode::CapabilityUnavailable, false),
+    };
+    hand_error(code, retryable, error.to_string())
+}
+
+fn file_effect_lock_index(operation_id: &str) -> usize {
+    let digest = Sha256::digest(operation_id.as_bytes());
+    let prefix = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
+    prefix as usize % FILE_EFFECT_LOCK_SHARDS
+}
+
+fn file_effect_result_identity(
+    result: &FileEffectStoredResult,
+) -> Result<FileEffectIdentity, HandError> {
+    let (kind, operation_id, request_digest) = match result {
+        FileEffectStoredResult::Write(result) => (
+            FileEffectKind::Write,
+            result.operation_id.to_string(),
+            result.request_digest.to_string(),
+        ),
+        FileEffectStoredResult::Copy(result) => {
+            // Only export is completed as a separate trusted-adapter phase. Import is committed
+            // atomically by `write_file` around the workspace mutation.
+            (
+                FileEffectKind::CopyExport,
+                result.operation_id.to_string(),
+                result.request_digest.to_string(),
+            )
+        }
+    };
+    Ok(FileEffectIdentity {
+        kind,
+        operation_id,
+        request_digest,
+    })
+}
+
+fn file_error(error: LiveFileError) -> HandError {
+    let code = match error {
+        LiveFileError::NotFound => HandErrorCode::FileNotFound,
+        LiveFileError::TooLarge | LiveFileError::SearchBoundExceeded => {
+            HandErrorCode::ResourceExhausted
+        }
+        LiveFileError::Io(_) => HandErrorCode::TemporarilyUnavailable,
+        _ => HandErrorCode::InvalidRequest,
+    };
+    hand_error(
+        code,
+        matches!(error, LiveFileError::Io(_)),
+        error.to_string(),
+    )
+}
+
+fn file_entry(entry: &LiveFileEntry) -> Result<FileEntry, HandError> {
+    Ok(FileEntry {
+        bytes: entry.bytes,
+        kind: match entry.kind {
+            LiveFileKind::File => FileEntryKind::File,
+            LiveFileKind::Directory => FileEntryKind::Directory,
+            LiveFileKind::Symlink => FileEntryKind::Symlink,
+        },
+        modified_at_ms: entry.modified_at_ms,
+        path: entry
+            .path
+            .parse()
+            .map_err(|_| invalid("file path is invalid"))?,
+        sha256: entry
+            .sha256
+            .as_deref()
+            .map(str::parse::<Digest>)
+            .transpose()
+            .map_err(|_| invalid("file digest is invalid"))?,
+    })
+}
+
+fn generation_conflict() -> HandError {
+    hand_error(
+        HandErrorCode::GenerationConflict,
+        false,
+        "request does not match the live physical generation",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use brain_protocol::contract::{sandbox_execution_request_digest, write_stdin_request_digest};
+    #[cfg(unix)]
+    use brain_protocol::hand::{ObserveRequest, SandboxExecutionRequest, WriteStdinRequest};
+    use hand_wire::{AllowlistProxy, InstallBundleMetadata, RunPayload};
+
+    fn run_payload(network: NetworkCeiling) -> RunPayload {
+        RunPayload {
+            contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
+            generation: "generation-1".into(),
+            expires_at_ms: wall_ms() + MAX_TARGET_LIFETIME_MS,
+            root_id: "root-1".into(),
+            owner_session_id: "session-1".into(),
+            connector: match network {
+                NetworkCeiling::None => ConnectorClass::None,
+                NetworkCeiling::Public => ConnectorClass::Public,
+                NetworkCeiling::Allowlist(_) => ConnectorClass::Allowlist,
+            },
+            resource_class: "microvm-1gb".into(),
+            resources: serde_json::from_value(serde_json::json!({
+                "max_output_bytes": 65536,
+                "timeout_ms": 60000
+            }))
+            .unwrap(),
+            allowlist_proxy: matches!(network, NetworkCeiling::Allowlist(_)).then(|| {
+                AllowlistProxy {
+                    authority: "10.0.0.10:8443".into(),
+                    capability: "opaque-capability".into(),
+                }
+            }),
+            canary_exit_after_operation_id: None,
+            network,
+        }
+    }
+
+    fn sandbox_identity() -> ToolIdentity {
+        ToolIdentity {
+            uid: 1_000,
+            gid: 1_000,
+            supervisor_uid: 1_001,
+        }
+    }
+
+    fn default_file_target() -> SandboxTarget {
+        serde_json::from_value(serde_json::json!({
+            "binding_ref": "file-binding-1",
+            "kind": "default",
+            "root_id": "root-1",
+            "session_id": "session-1"
+        }))
+        .unwrap()
+    }
+
+    fn file_effect_identity(operation_id: &str, digest: char) -> FileEffectIdentity {
+        FileEffectIdentity {
+            kind: FileEffectKind::Write,
+            operation_id: operation_id.into(),
+            request_digest: digest.to_string().repeat(64),
+        }
+    }
+
+    #[test]
+    fn managed_binding_uids_are_bounded_exact_and_never_alias() {
+        let mut registry = BindingIdentityRegistry::with_bounds(65_536, 1_000_000, 2);
+        let first = registry
+            .allocate("binding-a", Some(sandbox_identity()))
+            .unwrap()
+            .unwrap();
+        assert!((65_536..1_065_536).contains(&first.uid));
+        assert_eq!(
+            registry
+                .allocate("binding-a", Some(sandbox_identity()))
+                .unwrap(),
+            Some(first),
+        );
+
+        // A one-element uid range makes a distinct hash collision deterministic. It is a
+        // permanent binding conflict and never aliases the two secret subsets.
+        let mut collision = BindingIdentityRegistry::with_bounds(65_536, 1, 2);
+        collision
+            .allocate("binding-a", Some(sandbox_identity()))
+            .unwrap();
+        let error = collision
+            .allocate("binding-b", Some(sandbox_identity()))
+            .unwrap_err();
+        assert_eq!(error.code, HandErrorCode::BindingConflict);
+        assert!(!error.retryable);
+
+        let mut exhausted = BindingIdentityRegistry::with_bounds(65_536, 1_000_000, 1);
+        exhausted
+            .allocate("binding-a", Some(sandbox_identity()))
+            .unwrap();
+        let error = exhausted
+            .allocate("binding-b", Some(sandbox_identity()))
+            .unwrap_err();
+        assert_eq!(error.code, HandErrorCode::ResourceExhausted);
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn operation_receipts_are_stable_per_operation_and_distinct_from_target_identity() {
+        let digest = "a".repeat(64);
+        let first =
+            operation_receipt_ref("operation-1", &digest, "target-1", "generation-1").unwrap();
+        let replay =
+            operation_receipt_ref("operation-1", &digest, "target-1", "generation-1").unwrap();
+        let second =
+            operation_receipt_ref("operation-2", &digest, "target-1", "generation-1").unwrap();
+
+        assert_eq!(first, replay);
+        assert_ne!(first, second);
+        assert_ne!(first.as_str(), "target-1");
+    }
+
+    #[tokio::test]
+    async fn file_write_lost_success_replays_and_conflict_never_mutates_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path());
+        let workspace = config.workspace.clone();
+        let hand = Hand::new(config).unwrap();
+        hand.arm("target-1".into(), run_payload(NetworkCeiling::None))
+            .await
+            .unwrap();
+
+        let identity = file_effect_identity("file-operation-1", 'a');
+        assert!(matches!(
+            hand.reserve_file_effect(identity.clone()).await.unwrap(),
+            FileEffectReservation::New
+        ));
+        let mut request = GuestFileWriteRequest {
+            effect: identity.clone(),
+            expected_generation: "generation-1".into(),
+            overwrite: false,
+            path: "/workspace/result.txt".into(),
+            source: GuestFileWriteSource::Inline {
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"first"),
+            },
+            target: default_file_target(),
+        };
+        let FileEffectStoredResult::Write(first) = hand.write_file(request.clone()).await.unwrap()
+        else {
+            panic!("file write returned a copy result");
+        };
+        assert!(!first.replayed);
+        assert_eq!(
+            std::fs::read(workspace.join("result.txt")).unwrap(),
+            b"first"
+        );
+
+        // Model a successful mutation whose response was lost. Even a different private-wire
+        // payload carrying the retained exact identity cannot enter the mutation body again.
+        request.overwrite = true;
+        request.source = GuestFileWriteSource::Inline {
+            content_base64: base64::engine::general_purpose::STANDARD.encode(b"second"),
+        };
+        let FileEffectStoredResult::Write(replayed) = hand.write_file(request).await.unwrap()
+        else {
+            panic!("file write replay returned a copy result");
+        };
+        assert!(replayed.replayed);
+        assert_eq!(
+            std::fs::read(workspace.join("result.txt")).unwrap(),
+            b"first"
+        );
+
+        let conflict = hand
+            .reserve_file_effect(file_effect_identity("file-operation-1", 'b'))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, HandErrorCode::BindingConflict);
+        assert!(!conflict.retryable);
+        assert_eq!(
+            std::fs::read(workspace.join("result.txt")).unwrap(),
+            b"first"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_intent_only_restart_is_unknown_and_never_mutates_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::for_test(directory.path());
+        let workspace = config.workspace.clone();
+        let identity = file_effect_identity("file-operation-restart", 'a');
+        {
+            let hand = Hand::new(config.clone()).unwrap();
+            hand.arm("target-1".into(), run_payload(NetworkCeiling::None))
                 .await
-                .map_err(internal)?;
-            written.push(PutResponseWrittenItem {
-                path: dest.to_string_lossy().into_owned(),
-                bytes,
-                sha256: sha,
-            });
+                .unwrap();
+            assert!(matches!(
+                hand.reserve_file_effect(identity.clone()).await.unwrap(),
+                FileEffectReservation::New
+            ));
         }
-        Ok(PutResponse { written })
+
+        let restarted = Hand::new(config).unwrap();
+        restarted
+            .arm("target-1".into(), run_payload(NetworkCeiling::None))
+            .await
+            .unwrap();
+        let error = restarted.reserve_file_effect(identity).await.unwrap_err();
+        assert_eq!(error.code, HandErrorCode::OperationUnknown);
+        assert!(!error.retryable);
+        assert!(!workspace.join("result.txt").exists());
     }
 
-    async fn persist(&self, a: PersistRequest) -> AbiResult<PersistResponse> {
-        let session = self.session()?;
-        let mut persisted = Vec::new();
-        for item in a.items {
-            let (bytes, sha, media_type) = match &item.source {
-                PersistSource::Path { path } => {
-                    let p = session.scope.resolve(path)?;
-                    let md = tokio::fs::metadata(&p)
-                        .await
-                        .map_err(|e| err(ErrorCode::PathNotFound, format!("{path}: {e}")))?;
-                    if !md.is_file() {
-                        return Err(err(
-                            ErrorCode::PathNotFound,
-                            format!("{path}: not a regular file"),
-                        ));
-                    }
-                    if md.len() > self.cfg.limits.max_persist_bytes {
-                        return Err(err(
-                            ErrorCode::TooLarge,
-                            format!(
-                                "{path}: {} bytes > max_persist_bytes {}",
-                                md.len(),
-                                self.cfg.limits.max_persist_bytes
-                            ),
-                        ));
-                    }
-                    let media_type = item
-                        .media_type
-                        .clone()
-                        .unwrap_or_else(|| guess_media_type(&p).to_string());
-                    let (b, s) =
-                        transfer::upload_file(&self.http, &item.put_url, &p, &media_type).await?;
-                    (b, s, media_type)
-                }
-                PersistSource::OperationStream {
-                    operation_id,
-                    stream,
-                } => {
-                    let op = self.ops.lock().unwrap().get(operation_id).ok_or_else(|| {
-                        err(
-                            ErrorCode::OperationNotFound,
-                            format!("operation {} is unknown or released", **operation_id),
-                        )
-                    })?;
-                    let data = match stream {
-                        Stream::Stdout => op.stdout.lock().await.read_retained(),
-                        Stream::Stderr => op.stderr.lock().await.read_retained(),
-                    }
-                    .map_err(internal)?;
-                    if data.len() as u64 > self.cfg.limits.max_persist_bytes {
-                        return Err(err(ErrorCode::TooLarge, "stream exceeds max_persist_bytes"));
-                    }
-                    let media_type = item
-                        .media_type
-                        .clone()
-                        .unwrap_or_else(|| "text/plain".to_string());
-                    let (b, s) =
-                        transfer::upload_bytes(&self.http, &item.put_url, data, &media_type)
-                            .await?;
-                    (b, s, media_type)
-                }
-            };
-            persisted.push(PersistResponsePersistedItem {
-                name: item.name.to_string(),
-                bytes,
-                sha256: sha,
-                media_type,
-            });
-        }
-        Ok(PersistResponse { persisted })
+    #[test]
+    fn exact_max_inline_terminal_fits_the_reserved_full_observation() {
+        let inline = serde_json::Value::String(
+            "x".repeat(brain_protocol::MAX_TOOL_TERMINAL_INLINE_BYTES - 2),
+        );
+        assert!(terminal_inline_fits(&inline));
+        let mut terminal = TerminalResult {
+            duration_ms: Some(u64::MAX),
+            exit_code: Some(i64::MIN),
+            inline: Some(inline),
+            is_error: false,
+            object: None,
+            outcome: TerminalOutcome::Completed,
+            terminal_digest: "0".repeat(64).parse().unwrap(),
+        };
+        terminal.terminal_digest = terminal_result_digest(&terminal);
+        let observation: OperationObservation = serde_json::from_value(serde_json::json!({
+            "next_cursor": "c".repeat(256),
+            "operation": {
+                "generation": "g".repeat(128),
+                "operation_id": "o".repeat(128),
+                "receipt_ref": "r".repeat(128),
+                "request_digest": "a".repeat(64),
+                "target": {
+                    "binding_ref": "b".repeat(128),
+                    "kind": "default",
+                    "root_id": "t".repeat(128),
+                    "session_id": "s".repeat(128)
+                },
+                "target_ref": "p".repeat(128)
+            },
+            "output": [],
+            "state": "terminal",
+            "target": {
+                "expires_at_ms": u64::MAX,
+                "generation": "g".repeat(128),
+                "target_ref": "p".repeat(128)
+            },
+            "terminal": terminal
+        }))
+        .unwrap();
+        let bytes = serde_json::to_vec(&observation).unwrap();
+        assert!(
+            bytes.len() <= TERMINAL_ENVELOPE_BYTES,
+            "max canonical inline plus maximum receipt fields encoded to {} bytes, above the {}-byte reservation",
+            bytes.len(),
+            TERMINAL_ENVELOPE_BYTES
+        );
     }
 
-    async fn sync(&self, a: SyncRequest) -> AbiResult<SyncResponse> {
-        let session = self.session()?;
-        let mut st = self.sync.lock().await;
-        let tmp = self.cfg.spill_dir.join("sync");
-        crate::sync::sync(
-            &self.http,
-            &session.sync_scope,
-            &mut st,
-            &a,
-            &self.generation_id,
-            &tmp,
+    async fn prepared_hand() -> (tempfile::TempDir, Arc<Hand>, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let hand = Hand::new(Config::for_test(directory.path())).unwrap();
+        hand.arm("mvm-1".into(), run_payload(NetworkCeiling::None))
+            .await
+            .unwrap();
+        let bytes = br#"export default {kind:'brain.tool-runtime',name:'fixture',contractDigest:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',input:null,requiredEnv:['FIXTURE_SECRET'],execute: async () => ({ok:true})};"#;
+        let digest = hex::encode(Sha256::digest(bytes));
+        let descriptor: BundleDescriptor = serde_json::from_value(serde_json::json!({
+            "bundle_digest": digest,
+            "bytes": bytes.len(),
+            "contract_digest": "a".repeat(64),
+            "object": {
+                "bytes": bytes.len(),
+                "object_id": "object-1",
+                "sha256": digest
+            },
+            "required_env": ["FIXTURE_SECRET"],
+            "runtime": "node22",
+            "tool_name": "fixture"
+        }))
+        .unwrap();
+        hand.install_bundle(
+            InstallBundleMetadata {
+                descriptor: descriptor.clone(),
+            },
+            bytes,
         )
         .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let installed =
+                std::fs::metadata(hand.cfg.tool_dir.join(format!("{digest}.mjs"))).unwrap();
+            assert_eq!(installed.permissions().mode() & 0o777, 0o640);
+        }
+        let binding: SealedBinding = serde_json::from_value(serde_json::json!({
+            "binding_id": "binding-1",
+            "bundle": descriptor,
+            "capability": "fixture",
+            "contract_digest": "a".repeat(64),
+            "implementation_identity": "b".repeat(64),
+            "policy_digest": "c".repeat(64),
+            "realm": "aex_managed",
+            "realm_id": "aex",
+            "required_capabilities": ["execution"],
+            "root_id": "root-1",
+            "session_id": "session-1"
+        }))
+        .unwrap();
+        hand.install_binding(InstallBindingRequest {
+            binding_ref: "binding-ref-1".into(),
+            binding,
+        })
+        .await
+        .unwrap();
+        (directory, hand, digest)
     }
 
-    // ----- status ------------------------------------------------------------------------
-
-    pub fn emit_status(&self) {
-        let ev = self.status_event();
-        self.status.publish(ev);
+    #[tokio::test]
+    async fn root_network_and_resource_seals_cannot_be_widened() {
+        let directory = tempfile::tempdir().unwrap();
+        let hand = Hand::new(Config::for_test(directory.path())).unwrap();
+        hand.arm("mvm-1".into(), run_payload(NetworkCeiling::None))
+            .await
+            .unwrap();
+        let error = hand
+            .arm("mvm-1".into(), run_payload(NetworkCeiling::Public))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, HandErrorCode::GenerationConflict);
+        let status = hand.runtime_status().await.unwrap();
+        assert_eq!(status.connector, ConnectorClass::None);
     }
 
-    pub fn status_event(&self) -> HandStatusEvent {
-        let (inflight, live_jobs, retained, retained_bytes) = {
-            let ops = self.ops.lock().unwrap();
-            let mut inflight = Vec::new();
-            let mut live_jobs = Vec::new();
-            let mut retained = 0u64;
-            for op in ops.all() {
-                if op.is_terminal() {
-                    retained += 1;
-                } else if op.detach {
-                    live_jobs.push(op.id.clone());
-                } else {
-                    inflight.push(op.id.clone());
-                }
-            }
-            // retained_bytes is best-effort without awaiting the spill locks: use try_lock.
-            let mut bytes = 0u64;
-            for op in ops.all() {
-                if let Ok(s) = op.stdout.try_lock() {
-                    bytes += s.retained_bytes();
-                }
-                if let Ok(s) = op.stderr.try_lock() {
-                    bytes += s.retained_bytes();
-                }
-            }
-            (inflight, live_jobs, retained, bytes)
+    #[tokio::test]
+    async fn secrets_are_declared_exact_replay_only_and_absent_from_receipts() {
+        let (_directory, hand, _digest) = prepared_hand().await;
+        let secret = "never-print-this-value";
+        let request = || InstallSecretsRequest {
+            session_id: "session-1".into(),
+            generation: "generation-1".into(),
+            env_names: vec!["FIXTURE_SECRET".into(), "FUTURE_SECRET".into()],
+            values: HashMap::from([
+                ("FIXTURE_SECRET".into(), secret.into()),
+                ("FUTURE_SECRET".into(), "future-value".into()),
+            ]),
         };
-        let idle_for_ms = if inflight.is_empty() && live_jobs.is_empty() {
-            self.idle_since.lock().unwrap().elapsed().as_millis() as u64
-        } else {
-            0
+        let first = hand.install_secrets(request()).await.unwrap();
+        assert!(!first.replayed);
+        assert!(hand.install_secrets(request()).await.unwrap().replayed);
+        let conflict = hand
+            .install_secrets(InstallSecretsRequest {
+                session_id: "session-1".into(),
+                generation: "generation-1".into(),
+                env_names: vec!["FIXTURE_SECRET".into(), "FUTURE_SECRET".into()],
+                values: HashMap::from([
+                    ("FIXTURE_SECRET".into(), "different".into()),
+                    ("FUTURE_SECRET".into(), "future-value".into()),
+                ]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, HandErrorCode::GenerationConflict);
+        let status = serde_json::to_string(&hand.runtime_status().await).unwrap();
+        let receipt = serde_json::to_string(&first).unwrap();
+        assert!(!status.contains(secret));
+        assert!(!receipt.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn guest_repeats_the_exact_brain_secret_document_boundary() {
+        let exact_directory = tempfile::tempdir().unwrap();
+        let exact_hand = Hand::new(Config::for_test(exact_directory.path())).unwrap();
+        exact_hand
+            .arm("mvm-exact".into(), run_payload(NetworkCeiling::None))
+            .await
+            .unwrap();
+        let exact_value = format!("{}aaaaaaaa", "é".repeat(2040));
+        let exact = InstallSecretsRequest {
+            session_id: "session-exact".into(),
+            generation: "generation-1".into(),
+            env_names: vec!["A".into()],
+            values: HashMap::from([("A".into(), exact_value)]),
         };
-        let lanes_live = self
-            .lanes
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|l| l.live_count())
-            .unwrap_or(0) as u64;
-        HandStatusEvent {
-            generation_id: self.generation_id.clone(),
-            boot_id: self.boot_id.clone(),
-            seq: self.status.next_seq(),
-            at_monotonic_ms: MonotonicMs(monotonic_ms()),
-            at_wall_ms: WallMs(wall_ms()),
-            inflight,
-            live_jobs,
-            lanes_live,
-            operations_retained: retained,
-            retained_bytes,
-            idle_for_ms,
-            pressure: read_pressure(),
+        assert_eq!(
+            serde_jcs::to_vec(&exact.values).unwrap().len(),
+            brain_protocol::MAX_SESSION_SECRET_DOCUMENT_BYTES
+        );
+        exact_hand.install_secrets(exact).await.unwrap();
+
+        let oversized_directory = tempfile::tempdir().unwrap();
+        let oversized_hand = Hand::new(Config::for_test(oversized_directory.path())).unwrap();
+        oversized_hand
+            .arm("mvm-oversized".into(), run_payload(NetworkCeiling::None))
+            .await
+            .unwrap();
+        let oversized_value = format!("{}aaaaaaaa€", "é".repeat(2039));
+        let oversized = InstallSecretsRequest {
+            session_id: "session-oversized".into(),
+            generation: "generation-1".into(),
+            env_names: vec!["A".into()],
+            values: HashMap::from([("A".into(), oversized_value)]),
+        };
+        assert_eq!(
+            serde_jcs::to_vec(&oversized.values).unwrap().len(),
+            brain_protocol::MAX_SESSION_SECRET_DOCUMENT_BYTES + 1
+        );
+        assert_eq!(
+            oversized_hand
+                .install_secrets(oversized)
+                .await
+                .unwrap_err()
+                .code,
+            HandErrorCode::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclared_secret_names_are_refused_without_installing_values() {
+        let (_directory, hand, _digest) = prepared_hand().await;
+        let error = hand
+            .install_secrets(InstallSecretsRequest {
+                session_id: "session-1".into(),
+                generation: "generation-1".into(),
+                env_names: vec!["FIXTURE_SECRET".into()],
+                values: HashMap::from([("NOT_DECLARED".into(), "secret".into())]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, HandErrorCode::InvalidRequest);
+        assert!(hand.secrets.read().await.is_empty());
+    }
+
+    #[test]
+    fn customer_environment_cannot_replace_runtime_or_connector_authority() {
+        for name in [
+            "LD_PRELOAD",
+            "node_options",
+            "HTTPS_PROXY",
+            "AEX_WORKSPACE",
+            "HAND_TOOL_RUNNER",
+            "OPENSSL_MODULES",
+        ] {
+            assert!(reserved_tool_environment(name), "{name}");
+        }
+        for name in ["OPENAI_API_KEY", "PROC_SECRET", "DATABASE_URL"] {
+            assert!(!reserved_tool_environment(name), "{name}");
         }
     }
 
-    /// Cancels everything (session end / shutdown).
-    pub async fn shutdown(&self) {
-        let ops = self.ops.lock().unwrap().all();
-        for op in ops {
-            self.cancel_op(&op, Some(2000));
-        }
-        if let Some(h) = self.heartbeat.lock().unwrap().take() {
-            h.abort();
-        }
+    #[cfg(unix)]
+    fn sandbox_request(
+        execution_id: &str,
+        command: &str,
+        interactive: bool,
+    ) -> SandboxExecutionRequest {
+        let mut request: SandboxExecutionRequest = serde_json::from_value(serde_json::json!({
+            "execution_id": execution_id,
+            "expected_generation": "generation-1",
+            "input": {
+                "command": command,
+                "cwd": "/workspace",
+                "interactive": interactive
+            },
+            "network": {"kind": "none"},
+            "request_digest": "0".repeat(64),
+            "resources": {
+                "max_output_bytes": 65536,
+                "timeout_ms": 5000
+            },
+            "target": {
+                "binding_ref": "sandbox-binding-1",
+                "kind": "default",
+                "root_id": "root-1",
+                "session_id": "session-1"
+            }
+        }))
+        .unwrap();
+        request.request_digest = sandbox_execution_request_digest(&request);
+        request
     }
-}
 
-fn guess_media_type(p: &Path) -> &'static str {
-    match p
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("txt") | Some("log") => "text/plain",
-        Some("md") => "text/markdown",
-        Some("json") => "application/json",
-        Some("csv") => "text/csv",
-        Some("html") | Some("htm") => "text/html",
-        Some("pdf") => "application/pdf",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("svg") => "image/svg+xml",
-        Some("zip") => "application/zip",
-        Some("gz") | Some("tgz") => "application/gzip",
-        Some("zst") => "application/zstd",
-        Some("tar") => "application/x-tar",
-        Some("py") | Some("rs") | Some("js") | Some("ts") | Some("go") | Some("sh")
-        | Some("toml") | Some("yaml") | Some("yml") => "text/plain",
-        _ => "application/octet-stream",
+    #[cfg(unix)]
+    async fn wait_terminal(hand: &Hand, operation: OperationRef) -> OperationObservation {
+        hand.observe(ObserveRequest {
+            cursor: "0".parse().unwrap(),
+            operation,
+            wait_ms: 5_000,
+        })
+        .await
+        .unwrap()
     }
-}
 
-/// Errors after which the connection is closed (the peer is not our brain, or cannot talk v1).
-pub fn is_fatal_for_connection(e: &AbiError) -> bool {
-    matches!(
-        e.code,
-        ErrorCode::Unauthorized | ErrorCode::ProtocolUnsupported
-    )
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_exact_replay_and_conflicting_digest_never_repeat_the_effect() {
+        let (_directory, hand, _digest) = prepared_hand().await;
+        let first = sandbox_request("sandbox-execution-1", "printf first >> effect.txt", false);
+        let receipt = hand.execute_sandbox(first.clone()).await.unwrap();
+        assert_eq!(
+            wait_terminal(&hand, receipt.operation.clone()).await.state,
+            ContractOperationState::Terminal
+        );
+
+        let replay = hand.execute_sandbox(first).await.unwrap();
+        assert!(replay.replayed);
+        let conflict = hand
+            .execute_sandbox(sandbox_request(
+                "sandbox-execution-1",
+                "printf second >> effect.txt",
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, HandErrorCode::OperationConflict);
+        assert_eq!(
+            std::fs::read_to_string(hand.cfg.workspace.join("effect.txt")).unwrap(),
+            "first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_ack_replays_and_permanently_fences_resubmission() {
+        let (_directory, hand, _digest) = prepared_hand().await;
+        let request = sandbox_request(
+            "sandbox-execution-acked",
+            "printf once >> acked-effect.txt",
+            false,
+        );
+        let receipt = hand.execute_sandbox(request.clone()).await.unwrap();
+        let terminal = wait_terminal(&hand, receipt.operation.clone())
+            .await
+            .terminal
+            .expect("terminal result");
+        let acknowledgement = AcknowledgeTerminalRequest {
+            operation: receipt.operation.clone(),
+            terminal_digest: terminal.terminal_digest,
+        };
+        assert!(
+            hand.acknowledge_terminal(acknowledgement.clone())
+                .await
+                .unwrap()
+                .acknowledged
+        );
+        assert!(
+            hand.acknowledge_terminal(acknowledgement)
+                .await
+                .unwrap()
+                .acknowledged
+        );
+
+        let exact = hand.execute_sandbox(request).await.unwrap_err();
+        assert_eq!(exact.code, HandErrorCode::OperationUnknown);
+        let conflicting = hand
+            .execute_sandbox(sandbox_request(
+                "sandbox-execution-acked",
+                "printf twice >> acked-effect.txt",
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflicting.code, HandErrorCode::OperationConflict);
+        assert_eq!(
+            std::fs::read_to_string(hand.cfg.workspace.join("acked-effect.txt")).unwrap(),
+            "once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_stdin_is_exact_pair_idempotent() {
+        let (_directory, hand, _digest) = prepared_hand().await;
+        let execution = sandbox_request(
+            "sandbox-execution-stdin",
+            "IFS= read -r line; printf '%s' \"$line\" > stdin.txt",
+            true,
+        );
+        let receipt = hand.execute_sandbox(execution.clone()).await.unwrap();
+        let mut write: WriteStdinRequest = serde_json::from_value(serde_json::json!({
+            "execution_id": execution.execution_id.clone(),
+            "expected_generation": "generation-1",
+            "eof": false,
+            "operation_id": "stdin-write-1",
+            "request_digest": "0".repeat(64),
+            "target": execution.target.clone(),
+            "text": "hello\n"
+        }))
+        .unwrap();
+        write.request_digest = write_stdin_request_digest(&write);
+        // JSON Schema counts Unicode scalar values, while Linux PIPE_BUF is bytes. The runtime
+        // closes that gap before reserving the idempotency key or touching the pipe.
+        let mut oversized = write.clone();
+        oversized.operation_id = "stdin-write-oversized".parse().unwrap();
+        oversized.text = "é"
+            .repeat(brain_protocol::MAX_WRITE_STDIN_BYTES)
+            .parse()
+            .unwrap();
+        oversized.request_digest = write_stdin_request_digest(&oversized);
+        let error = hand.write_stdin(oversized).await.unwrap_err();
+        assert_eq!(error.code, HandErrorCode::InvalidRequest);
+
+        let first = hand.write_stdin(write.clone()).await.unwrap();
+        assert!(first.accepted);
+        assert!(!first.replayed);
+        assert!(canonical_equal(&first.observation.operation, &receipt.operation).unwrap());
+        let replay = hand.write_stdin(write.clone()).await.unwrap();
+        assert!(replay.accepted);
+        assert!(replay.replayed);
+        assert!(canonical_equal(&replay.observation.operation, &receipt.operation).unwrap());
+        let mut conflict = write;
+        conflict.text = "different\n".parse().unwrap();
+        conflict.request_digest = write_stdin_request_digest(&conflict);
+        let error = hand.write_stdin(conflict).await.unwrap_err();
+        assert_eq!(error.code, HandErrorCode::OperationConflict);
+        assert_eq!(
+            wait_terminal(&hand, receipt.operation).await.state,
+            ContractOperationState::Terminal
+        );
+        assert_eq!(
+            std::fs::read_to_string(hand.cfg.workspace.join("stdin.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_stdin_supports_explicit_eof_and_observation_only_poll() {
+        let (_directory, hand, _digest) = prepared_hand().await;
+        let execution = sandbox_request("sandbox-execution-eof", "cat > stdin-eof.txt", true);
+        let submitted = hand.execute_sandbox(execution.clone()).await.unwrap();
+        let mut close: WriteStdinRequest = serde_json::from_value(serde_json::json!({
+            "eof": true,
+            "execution_id": execution.execution_id.clone(),
+            "expected_generation": "generation-1",
+            "operation_id": "stdin-close-1",
+            "request_digest": "0".repeat(64),
+            "target": execution.target.clone(),
+            "text": "without-newline"
+        }))
+        .unwrap();
+        close.request_digest = write_stdin_request_digest(&close);
+        let first = hand.write_stdin(close.clone()).await.unwrap();
+        assert!(first.accepted);
+        assert!(!first.replayed);
+        assert!(canonical_equal(&first.observation.operation, &submitted.operation).unwrap());
+
+        let terminal = wait_terminal(&hand, submitted.operation.clone()).await;
+        assert_eq!(terminal.state, ContractOperationState::Terminal);
+        assert_eq!(
+            std::fs::read_to_string(hand.cfg.workspace.join("stdin-eof.txt")).unwrap(),
+            "without-newline"
+        );
+
+        let replay = hand.write_stdin(close).await.unwrap();
+        assert!(replay.accepted);
+        assert!(replay.replayed);
+        assert_eq!(replay.observation.state, ContractOperationState::Terminal);
+
+        let mut poll: WriteStdinRequest = serde_json::from_value(serde_json::json!({
+            "eof": false,
+            "execution_id": execution.execution_id,
+            "expected_generation": "generation-1",
+            "operation_id": "stdin-poll-1",
+            "request_digest": "0".repeat(64),
+            "target": execution.target,
+            "text": ""
+        }))
+        .unwrap();
+        poll.request_digest = write_stdin_request_digest(&poll);
+        let polled = hand.write_stdin(poll).await.unwrap();
+        assert!(!polled.accepted);
+        assert_eq!(polled.observation.state, ContractOperationState::Terminal);
+        assert_eq!(hand.stdin_writes.lock().await.records.len(), 2);
+        hand.acknowledge_terminal(AcknowledgeTerminalRequest {
+            operation: submitted.operation,
+            terminal_digest: terminal.terminal.unwrap().terminal_digest,
+        })
+        .await
+        .unwrap();
+        assert!(hand.stdin_writes.lock().await.records.is_empty());
+    }
 }

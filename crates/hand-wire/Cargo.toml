@@ -1,0 +1,21 @@
+[package]
+name = "hand-wire"
+version = "0.1.0"
+description = "Private transport framing for the Aex production Hand"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+brain.workspace = true
+brain-protocol.workspace = true
+hand-core = { path = "../hand-core" }
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+zeroize.workspace = true
