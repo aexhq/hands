@@ -916,6 +916,45 @@ function requestStatus(module, options) {
   });
 }
 
+function requestText(module, options, maxBytes) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const request = module.request(options);
+    const timer = setTimeout(() => {
+      request.destroy();
+      finish(null);
+    }, 3000);
+    request.once("response", (response) => {
+      if (response.statusCode !== 200) {
+        response.resume();
+        finish(null);
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > maxBytes) {
+          response.destroy();
+          finish(null);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.once("end", () => finish(Buffer.concat(chunks).toString("utf8").trim()));
+      response.once("error", () => finish(null));
+    });
+    request.once("error", () => finish(null));
+    request.end();
+  });
+}
+
 const specialResults = await Promise.all(
   denied.map(async (host) => [host, await anyReachable(host, [80, 443])]),
 );
@@ -932,6 +971,16 @@ if (reachableControls.length === 0) {
   throw new Error("no public control was reachable");
 }
 
+const rawPublicSource = await requestText(https, {
+  hostname: "checkip.amazonaws.com",
+  path: "/",
+  port: 443,
+  method: "GET",
+}, 64);
+const observedPublicSource = net.isIP(rawPublicSource ?? "") === 4
+  ? rawPublicSource
+  : "unavailable";
+
 const aexSurfaceResults = await Promise.all(httpSurfaces.map(async (surface) => ({
   surface,
   status: await requestStatus(https, {
@@ -944,7 +993,7 @@ const aexSurfaceResults = await Promise.all(httpSurfaces.map(async (surface) => 
 for (const { surface, status } of aexSurfaceResults) {
   if (status !== 403) {
     throw new Error(
-      `Aex HTTPS surface did not return the expected source denial: ${surface.host} status=${status}`,
+      `Aex HTTPS surface did not return the expected source denial: ${surface.host} status=${status} source=${observedPublicSource}`,
     );
   }
 }
@@ -980,7 +1029,7 @@ for (const { host, websocketStatus, managementStatus } of customerHandResults) {
   }
 }
 
-process.stdout.write(`network_canary=ok denied=${denied.length} controls=${controls.length} surfaces=${httpSurfaces.length + customerHandHosts.length}\n`);
+process.stdout.write(`network_canary=ok denied=${denied.length} controls=${controls.length} surfaces=${httpSurfaces.length + customerHandHosts.length} source=${observedPublicSource}\n`);
 AEX_NETWORK_CANARY"#
         .replace("__DENIED__", &serde_json::to_string(&denied)?)
         .replace("__CONTROLS__", &serde_json::to_string(&controls)?)
@@ -1297,6 +1346,8 @@ mod tests {
         );
         assert!(!request.input.command.contains("from \"node:http\";"));
         assert!(request.input.command.contains("Aex HTTPS surface"));
+        assert!(request.input.command.contains("checkip.amazonaws.com"));
+        assert!(request.input.command.contains("observedPublicSource"));
         for host in [
             "aex.dev",
             "api.aex.dev",
