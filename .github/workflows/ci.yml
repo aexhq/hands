@@ -140,6 +140,7 @@ jobs:
             test -z "$(find / -xdev -type f -perm /6000 -print -quit)"
             capabilities=$(getcap -r / 2>/dev/null || true)
             test "$capabilities" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+            test "$(stat -c "%u:%g:%a" /var/hand)" = "1001:1000:710"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/control-listener)" = "0:1001:750"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/tool-boundary.so)" = "0:0:555"
             test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/proc-secret-static)" = "0:0:555"
@@ -178,6 +179,12 @@ jobs:
           trap 'docker logs "$CID"; docker stop "$CID" >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && { exec 3>&-; sleep 1; break; }; sleep 0.5; done
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/)" = 401
+          test "$(curl --silent --output /tmp/hand-ready.json --write-out '%{http_code}' --request POST \
+            http://127.0.0.1:8080/aws/lambda-microvms/runtime/v1/ready)" = 200
+          jq --exit-status '.ok == true' /tmp/hand-ready.json >/dev/null
+          test "$(curl --silent --output /tmp/hand-validate.json --write-out '%{http_code}' --request POST \
+            http://127.0.0.1:8080/aws/lambda-microvms/runtime/v1/validate)" = 200
+          jq --exit-status '.ok == true' /tmp/hand-validate.json >/dev/null
           docker cp scripts/test-control-boundary.mjs "$CID":/tmp/test-control-boundary.mjs
           docker exec --user 1000:1000 "$CID" node /tmp/test-control-boundary.mjs
           docker cp scripts/test-guest-deadline.mjs "$CID":/tmp/test-guest-deadline.mjs
