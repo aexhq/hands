@@ -215,7 +215,7 @@ impl LiveFiles {
             file.sync_all().map_err(io_error)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt as _;
+                use cap_std::fs::PermissionsExt as _;
                 file.set_permissions(cap_std::fs::Permissions::from_mode(0o660))
                     .map_err(io_error)?;
             }
@@ -278,7 +278,7 @@ impl LiveFiles {
             destination.sync_all().map_err(io_error)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt as _;
+                use cap_std::fs::PermissionsExt as _;
                 destination
                     .set_permissions(cap_std::fs::Permissions::from_mode(0o660))
                     .map_err(io_error)?;
