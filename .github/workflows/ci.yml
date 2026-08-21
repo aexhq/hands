@@ -161,6 +161,11 @@ jobs:
           gzip -dc hand-ci-image/hand-ci.tar.gz | docker load
       - name: Prove Tool identities cannot reach supervisor control
         run: |
+          chmod 0555 scripts/test-control-listener-fd.sh
+          preserved=$(docker run --rm --entrypoint sh \
+            -v "$PWD/scripts/test-control-listener-fd.sh:/tmp/test-control-listener-fd.sh:ro" \
+            hand:ci -ceu 'exec 3>&1; exec /usr/local/lib/hand/control-listener /tmp/test-control-listener-fd.sh')
+          test "$preserved" = provider-fd-preserved
           for uid in 1000:1000 65536:1000; do
             docker run --rm --entrypoint node --user "$uid" \
               --sysctl net.ipv4.ip_unprivileged_port_start=8081 \
