@@ -8,40 +8,204 @@ on:
         required: true
         type: choice
         options: [dev, prd]
+      expected_commit:
+        description: Full source SHA selected by release/sha-<sha>
+        required: true
+        type: string
 
 permissions:
   contents: read
-  id-token: write
 
-concurrency: hand-image-${{ inputs.plane }}
+concurrency:
+  group: hand-image-${{ inputs.plane }}
+  cancel-in-progress: false
 
 jobs:
-  test-and-publish:
-    runs-on: ubuntu-24.04-arm
-    environment: ${{ inputs.plane }}
+  format:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.1"
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Verify source
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+        with:
+          shared-key: release-clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-test
+      - run: cargo test --workspace
+
+  node-runtime:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: node scripts/test-tool-runner.mjs
+
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-aarch64-build
       - name: Build aarch64 guest and publisher
         run: cargo build -p hand-guest -p hand-lambda --release
+      - name: Seal release binaries
+        run: |
+          mkdir hand-image-binaries
+          install -m 0755 target/release/hand-guest hand-image-binaries/hand-guest
+          install -m 0755 target/release/hand-lambda hand-image-binaries/hand-lambda
+          cd hand-image-binaries
+          sha256sum hand-guest hand-lambda > SHA256SUMS
+      - uses: actions/upload-artifact@v6
+        with:
+          name: hand-image-binaries-${{ inputs.expected_commit }}
+          path: hand-image-binaries/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [format, clippy, test, node-runtime, build]
+    runs-on: ubuntu-24.04-arm
+    environment: ${{ inputs.plane }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_arn: ${{ steps.publish.outputs.image_arn }}
+      image_version: ${{ steps.publish.outputs.image_version }}
+      source_sha: ${{ steps.publish.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify immutable release source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
+      - uses: actions/download-artifact@v7
+        with:
+          name: hand-image-binaries-${{ inputs.expected_commit }}
+          path: hand-image-binaries
+      - name: Verify release binaries
+        run: |
+          cd hand-image-binaries
+          sha256sum --check SHA256SUMS
+          chmod 0755 hand-guest hand-lambda
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::522921482290:role/aex-hands-${{ inputs.plane }}-use1-image-publisher
           aws-region: us-east-1
       - name: Publish isolated plane image
+        id: publish
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          HAND_NETWORK_CONNECTOR_ALLOWLIST: ${{ vars.HAND_NETWORK_CONNECTOR_ALLOWLIST }}
+          HAND_NETWORK_CONNECTOR_NONE: ${{ vars.HAND_NETWORK_CONNECTOR_NONE }}
+          HAND_NETWORK_CONNECTOR_PUBLIC: ${{ vars.HAND_NETWORK_CONNECTOR_PUBLIC }}
         run: |
-          target/release/hand-lambda --region us-east-1 image publish \
-            --binary target/release/hand-guest \
+          published="$(hand-image-binaries/hand-lambda --region us-east-1 image publish \
+            --binary hand-image-binaries/hand-guest \
             --name aex-hands-${{ inputs.plane }}-1gb \
             --bucket aex-hands-${{ inputs.plane }}-use1-artifacts-522921482290 \
             --build-role arn:aws:iam::522921482290:role/aex-hands-${{ inputs.plane }}-use1-image-build \
-            --log-group /aex/${{ inputs.plane }}-use1/hands/image-build
+            --log-group /aex/${{ inputs.plane }}-use1/hands/image-build \
+            --egress-connector "$HAND_NETWORK_CONNECTOR_NONE" \
+            --egress-connector "$HAND_NETWORK_CONNECTOR_ALLOWLIST" \
+            --egress-connector "$HAND_NETWORK_CONNECTOR_PUBLIC")"
+          read -r image_arn image_version <<<"$(printf '%s\n' "$published" | tail -n 1)"
+          test -n "$image_arn" && test -n "$image_version"
+          echo "image_arn=$image_arn" >> "$GITHUB_OUTPUT"
+          echo "image_version=$image_version" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$EXPECTED_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Published immutable image $image_arn version $image_version from source $EXPECTED_COMMIT"
+          printf 'Hand image: `%s` version `%s` from `%s`\n' "$image_arn" "$image_version" "$EXPECTED_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+      - name: Prove dev image does not rearm after guest crash
+        if: inputs.plane == 'dev'
+        env:
+          HAND_NETWORK_CONNECTOR_NONE: ${{ vars.HAND_NETWORK_CONNECTOR_NONE }}
+        run: |
+          hand-image-binaries/hand-lambda --region us-east-1 image canary \
+            --image-arn '${{ steps.publish.outputs.image_arn }}' \
+            --image-version '${{ steps.publish.outputs.image_version }}' \
+            --none-connector "$HAND_NETWORK_CONNECTOR_NONE" \
+            --confirm-dev-image-canary
+      - name: Prove dev image connector boundaries
+        if: inputs.plane == 'dev'
+        env:
+          AEX_CUSTOMER_HAND_DEV_HOST: ${{ vars.AEX_CUSTOMER_HAND_DEV_HOST }}
+          AEX_CUSTOMER_HAND_PRD_HOST: ${{ vars.AEX_CUSTOMER_HAND_PRD_HOST }}
+          HAND_EGRESS_GATEWAY_AUTHORITY: ${{ vars.HAND_EGRESS_GATEWAY_AUTHORITY }}
+          HAND_NETWORK_CONNECTOR_ALLOWLIST: ${{ vars.HAND_NETWORK_CONNECTOR_ALLOWLIST }}
+          HAND_NETWORK_CONNECTOR_NONE: ${{ vars.HAND_NETWORK_CONNECTOR_NONE }}
+          HAND_NETWORK_CONNECTOR_PUBLIC: ${{ vars.HAND_NETWORK_CONNECTOR_PUBLIC }}
+        run: |
+          test -n "$AEX_CUSTOMER_HAND_DEV_HOST" && test -n "$AEX_CUSTOMER_HAND_PRD_HOST" && test -n "$HAND_EGRESS_GATEWAY_AUTHORITY"
+          hand-image-binaries/hand-lambda --region us-east-1 image network-canary \
+            --image-arn '${{ steps.publish.outputs.image_arn }}' \
+            --image-version '${{ steps.publish.outputs.image_version }}' \
+            --none-connector "$HAND_NETWORK_CONNECTOR_NONE" \
+            --allowlist-connector "$HAND_NETWORK_CONNECTOR_ALLOWLIST" \
+            --public-connector "$HAND_NETWORK_CONNECTOR_PUBLIC" \
+            --gateway-authority "$HAND_EGRESS_GATEWAY_AUTHORITY" \
+            --customer-hand-host "$AEX_CUSTOMER_HAND_DEV_HOST" \
+            --customer-hand-host "$AEX_CUSTOMER_HAND_PRD_HOST" \
+            --confirm-dev-network-canary

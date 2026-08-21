@@ -1,0 +1,574 @@
+//! Authenticated, reconnecting client for one installed guest generation.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use base64::Engine as _;
+use brain_protocol::contract::HAND_CONTRACT_DIGEST;
+use brain_protocol::hand::{HandError, HandErrorCode};
+use futures_util::{SinkExt as _, StreamExt as _};
+use hand_lambda::control::{AUTH_HEADER, Control, ControlError, is_terminated};
+use hand_lambda::launch::{self, LaunchedHand};
+use hand_wire::{
+    FILE_ENTRY_HEADER, MAX_BUNDLE_INSTALL_BYTES, MAX_INSTALL_BODY_BYTES,
+    MAX_INSTALL_METADATA_BYTES, MAX_WIRE_FRAME_BYTES, OBJECT_METADATA_HEADER, RequestCall,
+    RequestFrame, ResponseFrame, ResponseReply,
+};
+use tokio::io::AsyncReadExt as _;
+use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_util::io::ReaderStream;
+
+const AUTH_REFRESH_AFTER: Duration = Duration::from_secs(50 * 60);
+const RPC_TIMEOUT: Duration = Duration::from_secs(45);
+
+enum RpcAttemptError {
+    EndpointApplicationUnavailable,
+    Hand(HandError),
+}
+
+impl From<HandError> for RpcAttemptError {
+    fn from(value: HandError) -> Self {
+        Self::Hand(value)
+    }
+}
+
+struct CachedEndpoint {
+    hand: LaunchedHand,
+    minted_at: Instant,
+}
+
+/// Clone shares the provider connection pools and endpoint/JWE cache.
+#[derive(Clone)]
+pub struct GuestClient {
+    control: Control,
+    http: reqwest::Client,
+    endpoints: Arc<RwLock<HashMap<String, CachedEndpoint>>>,
+    next_request: Arc<AtomicU64>,
+}
+
+impl GuestClient {
+    pub fn new(control: Control, http: reqwest::Client) -> Self {
+        Self {
+            control,
+            http,
+            endpoints: Arc::new(RwLock::new(HashMap::new())),
+            next_request: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Shared bounded HTTP pool used only for one-purpose bundle/object authorities.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub async fn remember(&self, hand: LaunchedHand) {
+        self.endpoints.write().await.insert(
+            hand.microvm_id.clone(),
+            CachedEndpoint {
+                hand,
+                minted_at: Instant::now(),
+            },
+        );
+    }
+
+    pub async fn forget(&self, target_ref: &str) {
+        self.endpoints.write().await.remove(target_ref);
+    }
+
+    async fn endpoint(&self, target_ref: &str) -> Result<LaunchedHand, HandError> {
+        if let Some(endpoint) = self.endpoints.read().await.get(target_ref)
+            && endpoint.minted_at.elapsed() < AUTH_REFRESH_AFTER
+        {
+            return Ok(endpoint.hand.clone());
+        }
+        let vm = self.control.get(target_ref).await.map_err(control_error)?;
+        if is_terminated(&vm.state) {
+            return Err(error(
+                HandErrorCode::SandboxGone,
+                false,
+                "physical sandbox generation is gone",
+            ));
+        }
+        if vm.state == aws_sdk_lambdamicrovms::types::MicrovmState::Terminating {
+            return Err(temporary("physical sandbox generation is terminating"));
+        }
+        let endpoint = vm.endpoint.ok_or_else(|| {
+            error(
+                HandErrorCode::TemporarilyUnavailable,
+                true,
+                "physical sandbox endpoint is not ready",
+            )
+        })?;
+        let auth_token = self
+            .control
+            .auth_token(target_ref)
+            .await
+            .map_err(control_error)?;
+        let hand = LaunchedHand {
+            microvm_id: target_ref.into(),
+            endpoint: launch::normalise_endpoint(&endpoint),
+            auth_token,
+        };
+        self.remember(hand.clone()).await;
+        Ok(hand)
+    }
+
+    pub async fn rpc(
+        &self,
+        target_ref: &str,
+        call: RequestCall,
+    ) -> Result<ResponseReply, HandError> {
+        let frame = RequestFrame {
+            request_id: format!(
+                "request-{}",
+                self.next_request.fetch_add(1, Ordering::Relaxed)
+            ),
+            contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
+            call,
+        };
+        let encoded = serde_json::to_string(&frame).map_err(|_| {
+            error(
+                HandErrorCode::InvalidRequest,
+                false,
+                "request cannot be encoded",
+            )
+        })?;
+        if encoded.len() > MAX_WIRE_FRAME_BYTES {
+            return Err(error(
+                HandErrorCode::ResourceExhausted,
+                false,
+                "request exceeds the Hand wire bound",
+            ));
+        }
+        // Exact operation/digest requests are safe to replay after a transport break. Refreshing
+        // the provider JWE never changes the target or connector.
+        let mut saw_application_unavailable = false;
+        for attempt in 0..2 {
+            let endpoint = self.endpoint(target_ref).await?;
+            let result: Result<ResponseReply, RpcAttemptError> =
+                match tokio::time::timeout(RPC_TIMEOUT, async {
+                    let mut socket = match launch::connect(&endpoint).await {
+                        Ok(socket) => socket,
+                        Err(launch::GuestConnectError::Http(502)) => {
+                            return Err(RpcAttemptError::EndpointApplicationUnavailable);
+                        }
+                        Err(_) => {
+                            return Err(
+                                temporary("could not connect to the physical sandbox").into()
+                            );
+                        }
+                    };
+                    socket
+                        .send(Message::Text(encoded.clone().into()))
+                        .await
+                        .map_err(|_| temporary("could not send the Hand request"))?;
+                    while let Some(message) = socket.next().await {
+                        let text = match message {
+                            Ok(Message::Text(text)) => text.to_string(),
+                            Ok(Message::Binary(bytes)) => String::from_utf8(bytes.to_vec())
+                                .map_err(|_| temporary("Hand response is not UTF-8"))?,
+                            Ok(Message::Ping(bytes)) => {
+                                socket
+                                    .send(Message::Pong(bytes))
+                                    .await
+                                    .map_err(|_| temporary("Hand ping response failed"))?;
+                                continue;
+                            }
+                            Ok(Message::Pong(_)) => continue,
+                            Ok(Message::Close(_)) | Err(_) => {
+                                return Err(
+                                    temporary("Hand connection ended before its receipt").into()
+                                );
+                            }
+                            Ok(Message::Frame(_)) => continue,
+                        };
+                        let response: ResponseFrame = serde_json::from_str(&text)
+                            .map_err(|_| temporary("Hand response is malformed"))?;
+                        if response.request_id != frame.request_id {
+                            continue;
+                        }
+                        return response.result.map_err(Into::into);
+                    }
+                    Err(temporary("Hand connection ended before its receipt").into())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(RpcAttemptError::Hand(temporary("Hand request timed out"))),
+                };
+            match result {
+                Ok(reply) => return Ok(reply),
+                Err(RpcAttemptError::EndpointApplicationUnavailable) => {
+                    if record_application_failure(&mut saw_application_unavailable, attempt) {
+                        return Err(endpoint_application_gone());
+                    }
+                    if attempt == 0 {
+                        self.forget(target_ref).await;
+                    } else {
+                        return Err(temporary("physical sandbox endpoint is unavailable"));
+                    }
+                }
+                Err(RpcAttemptError::Hand(error)) if attempt == 0 && error.retryable => {
+                    self.forget(target_ref).await;
+                }
+                Err(RpcAttemptError::Hand(error)) => return Err(error),
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    pub async fn post_json<T: serde::Serialize>(
+        &self,
+        target_ref: &str,
+        path: &str,
+        body: &T,
+    ) -> Result<(), HandError> {
+        let bytes = serde_json::to_vec(body).map_err(|_| {
+            error(
+                HandErrorCode::InvalidRequest,
+                false,
+                "install body is invalid",
+            )
+        })?;
+        self.post_bytes(target_ref, path, bytes, "application/json")
+            .await
+    }
+
+    pub async fn post_blob<T: serde::Serialize>(
+        &self,
+        target_ref: &str,
+        path: &str,
+        metadata: &T,
+        bytes: &[u8],
+    ) -> Result<(), HandError> {
+        let body = encode_blob_install(metadata, bytes)?;
+        self.post_bytes(target_ref, path, body, "application/octet-stream")
+            .await
+    }
+
+    pub async fn post_file<T: serde::Serialize>(
+        &self,
+        target_ref: &str,
+        path: &str,
+        metadata: &T,
+        file_path: &Path,
+        bytes: u64,
+    ) -> Result<(), HandError> {
+        let metadata = serde_json::to_vec(metadata).map_err(|_| {
+            error(
+                HandErrorCode::InvalidRequest,
+                false,
+                "object metadata is invalid",
+            )
+        })?;
+        let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(metadata);
+        let mut saw_application_unavailable = false;
+        for attempt in 0..2 {
+            let endpoint = self.endpoint(target_ref).await?;
+            let file = tokio::fs::File::open(file_path)
+                .await
+                .map_err(|_| temporary("staged object is unavailable"))?;
+            let body =
+                reqwest::Body::wrap_stream(ReaderStream::new(file.take(bytes.saturating_add(1))));
+            let response = self
+                .http
+                .post(format!("{}{path}", endpoint.endpoint))
+                .header(AUTH_HEADER, &endpoint.auth_token)
+                .header(OBJECT_METADATA_HEADER, &metadata)
+                .header(reqwest::header::CONTENT_LENGTH, bytes)
+                .body(body)
+                .timeout(Duration::from_secs(15 * 60))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
+                    self.forget(target_ref).await;
+                }
+                Ok(response) if response.status().as_u16() == 502 => {
+                    if record_application_failure(&mut saw_application_unavailable, attempt) {
+                        return Err(endpoint_application_gone());
+                    }
+                    if attempt == 0 {
+                        self.forget(target_ref).await;
+                    } else {
+                        return Err(temporary("physical sandbox endpoint is unavailable"));
+                    }
+                }
+                Ok(response) if response.status().is_server_error() && attempt == 0 => {
+                    self.forget(target_ref).await;
+                }
+                Ok(response) => {
+                    return Err(endpoint_response_error(
+                        response.status(),
+                        "guest object install",
+                    ));
+                }
+                Err(_) if attempt == 0 => self.forget(target_ref).await,
+                Err(_) => return Err(temporary("guest object install failed")),
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    pub async fn export_file(
+        &self,
+        target_ref: &str,
+        request: &brain_protocol::hand::SandboxFileRequest,
+    ) -> Result<(brain_protocol::hand::FileEntry, reqwest::Response), HandError> {
+        let encoded = serde_json::to_vec(request).map_err(|_| {
+            error(
+                HandErrorCode::InvalidRequest,
+                false,
+                "file export is invalid",
+            )
+        })?;
+        let mut saw_application_unavailable = false;
+        for attempt in 0..2 {
+            let endpoint = self.endpoint(target_ref).await?;
+            let response = self
+                .http
+                .post(format!("{}/internal/files/export", endpoint.endpoint))
+                .header(AUTH_HEADER, &endpoint.auth_token)
+                .header("content-type", "application/json")
+                .body(encoded.clone())
+                .timeout(Duration::from_secs(15 * 60))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let metadata = response
+                        .headers()
+                        .get(FILE_ENTRY_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| {
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .decode(value)
+                                .ok()
+                        })
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .ok_or_else(|| temporary("guest file metadata is malformed"))?;
+                    return Ok((metadata, response));
+                }
+                Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
+                    self.forget(target_ref).await;
+                }
+                Ok(response) if response.status().as_u16() == 502 => {
+                    if record_application_failure(&mut saw_application_unavailable, attempt) {
+                        return Err(endpoint_application_gone());
+                    }
+                    if attempt == 0 {
+                        self.forget(target_ref).await;
+                    } else {
+                        return Err(temporary("physical sandbox endpoint is unavailable"));
+                    }
+                }
+                Ok(response) if response.status().is_server_error() && attempt == 0 => {
+                    self.forget(target_ref).await;
+                }
+                Ok(response) => {
+                    return Err(endpoint_response_error(
+                        response.status(),
+                        "guest file export",
+                    ));
+                }
+                Err(_) if attempt == 0 => self.forget(target_ref).await,
+                Err(_) => return Err(temporary("guest file export failed")),
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    async fn post_bytes(
+        &self,
+        target_ref: &str,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<(), HandError> {
+        if body.len() > MAX_INSTALL_BODY_BYTES {
+            return Err(error(
+                HandErrorCode::ResourceExhausted,
+                false,
+                "install body exceeds the guest bound",
+            ));
+        }
+        let mut saw_application_unavailable = false;
+        for attempt in 0..2 {
+            let endpoint = self.endpoint(target_ref).await?;
+            let response = self
+                .http
+                .post(format!("{}{path}", endpoint.endpoint))
+                .header(AUTH_HEADER, &endpoint.auth_token)
+                .header("content-type", content_type)
+                .body(body.clone())
+                .timeout(RPC_TIMEOUT)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
+                    self.forget(target_ref).await;
+                }
+                Ok(response) if response.status().as_u16() == 502 => {
+                    if record_application_failure(&mut saw_application_unavailable, attempt) {
+                        return Err(endpoint_application_gone());
+                    }
+                    if attempt == 0 {
+                        self.forget(target_ref).await;
+                    } else {
+                        return Err(temporary("physical sandbox endpoint is unavailable"));
+                    }
+                }
+                Ok(response) if response.status().is_server_error() && attempt == 0 => {
+                    self.forget(target_ref).await;
+                }
+                Ok(response) => {
+                    return Err(endpoint_response_error(response.status(), "guest install"));
+                }
+                Err(_) if attempt == 0 => self.forget(target_ref).await,
+                Err(_) => return Err(temporary("guest install request failed")),
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+}
+
+fn encode_blob_install<T: serde::Serialize>(
+    metadata: &T,
+    bytes: &[u8],
+) -> Result<Vec<u8>, HandError> {
+    let mut body = serde_json::to_vec(metadata).map_err(|_| {
+        error(
+            HandErrorCode::InvalidRequest,
+            false,
+            "install metadata is invalid",
+        )
+    })?;
+    if body.len() > MAX_INSTALL_METADATA_BYTES || bytes.len() > MAX_BUNDLE_INSTALL_BYTES {
+        return Err(error(
+            HandErrorCode::ResourceExhausted,
+            false,
+            "bundle or immutable metadata exceeds the guest install bound",
+        ));
+    }
+    body.reserve_exact(bytes.len().saturating_add(1));
+    body.push(b'\n');
+    body.extend_from_slice(bytes);
+    debug_assert!(body.len() <= MAX_INSTALL_BODY_BYTES);
+    Ok(body)
+}
+
+fn endpoint_application_gone() -> HandError {
+    error(
+        HandErrorCode::SandboxGone,
+        false,
+        "physical sandbox application is persistently unavailable",
+    )
+}
+
+fn record_application_failure(seen: &mut bool, attempt: usize) -> bool {
+    let persistent = *seen && attempt > 0;
+    *seen = true;
+    persistent
+}
+
+fn endpoint_response_error(status: reqwest::StatusCode, operation: &str) -> HandError {
+    if status.is_server_error() {
+        temporary(format!("{operation} is temporarily unavailable"))
+    } else {
+        error(
+            HandErrorCode::InvalidRequest,
+            false,
+            format!("{operation} refused with HTTP {status}"),
+        )
+    }
+}
+
+fn control_error(error_value: ControlError) -> HandError {
+    match error_value {
+        ControlError::Gone(_) => error(HandErrorCode::SandboxGone, false, "sandbox is gone"),
+        ControlError::Capacity {
+            scope,
+            retry_after_ms,
+            ..
+        } => {
+            let mut value = error(
+                HandErrorCode::ResourceExhausted,
+                true,
+                "sandbox provider capacity is exhausted",
+            );
+            value.details.insert("scope".into(), scope.into());
+            value
+                .details
+                .insert("retry_after_ms".into(), retry_after_ms.into());
+            value
+        }
+        ControlError::Retryable(_) | ControlError::Throttled(_) | ControlError::Unknown(_) => {
+            temporary("sandbox provider is temporarily unavailable")
+        }
+        ControlError::Fatal(_) => error(
+            HandErrorCode::CapabilityUnavailable,
+            false,
+            "sandbox provider configuration is invalid",
+        ),
+    }
+}
+
+pub fn error(code: HandErrorCode, retryable: bool, message: impl Into<String>) -> HandError {
+    HandError {
+        code,
+        details: serde_json::Map::new(),
+        message: message
+            .into()
+            .parse()
+            .unwrap_or_else(|_| "Hand request failed".parse().expect("fallback message")),
+        retryable,
+    }
+}
+
+pub fn temporary(message: impl Into<String>) -> HandError {
+    error(HandErrorCode::TemporarilyUnavailable, true, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_repeated_endpoint_502_fences_the_physical_generation() {
+        let mut seen = false;
+        assert!(!record_application_failure(&mut seen, 0));
+        assert!(record_application_failure(&mut seen, 1));
+
+        let mut only_second_attempt_failed = false;
+        assert!(!record_application_failure(
+            &mut only_second_attempt_failed,
+            1
+        ));
+        let transient =
+            endpoint_response_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, "guest request");
+        assert_eq!(transient.code, HandErrorCode::TemporarilyUnavailable);
+        assert!(transient.retryable);
+        let gone = endpoint_application_gone();
+        assert_eq!(gone.code, HandErrorCode::SandboxGone);
+        assert!(!gone.retryable);
+    }
+
+    #[test]
+    fn private_install_transport_accepts_session_bundle_ceiling_and_rejects_plus_one() {
+        let exact = vec![0x5a; MAX_BUNDLE_INSTALL_BYTES];
+        let encoded = encode_blob_install(&serde_json::json!({}), &exact).unwrap();
+        assert_eq!(encoded.len(), MAX_BUNDLE_INSTALL_BYTES + 3);
+        assert!(encoded.len() <= MAX_INSTALL_BODY_BYTES);
+
+        let oversized = vec![0x5a; MAX_BUNDLE_INSTALL_BYTES + 1];
+        let error = encode_blob_install(&serde_json::json!({}), &oversized).unwrap_err();
+        assert_eq!(error.code, HandErrorCode::ResourceExhausted);
+        assert!(!error.retryable);
+    }
+}

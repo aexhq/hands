@@ -12,13 +12,13 @@
 //!   the build), and checked against the managed base's deprecation schedule (images expire on
 //!   AWS's calendar, not ours).
 //! - [`control`] — typed lifecycle calls (`RunMicrovm`/`Get`/`Suspend`/`Resume`/`Terminate`,
-//!   `CreateMicrovmAuthToken`) with error classification: every failure maps to *retryable*,
-//!   *gone* (→ `hand_lost`), or *fatal*.
-//! - [`launch`] — a session's arc: launch (or adopt) a VM, deliver the session token through
-//!   the run-hook payload, mint an endpoint token, connect the ABI WebSocket through the
-//!   endpoint, keep the VM alive while jobs live, probe (speculative resume) on message
-//!   admission.
+//!   `CreateMicrovmAuthToken`) with explicit retryable, throttled, unknown-effect, gone and fatal
+//!   classifications. State-changing 5xx/transport failures are never called safe retries.
+//! - [`launch`] — launch (or adopt) a VM, deliver its immutable secret-free target seal through
+//!   the run hook, mint a short-lived provider endpoint JWE, keep active work alive, and probe
+//!   (speculative resume) on message admission.
 
+pub mod canary;
 pub mod control;
 pub mod image;
 pub mod launch;

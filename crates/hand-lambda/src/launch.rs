@@ -1,26 +1,34 @@
 //! One session's arc on a Lambda MicroVM.
 //!
-//! Launch delivers the per-session secret in the run-hook payload (the only per-VM input the
-//! service offers), waits for RUNNING — which by the hook contract means the guest's `/run`
-//! returned 200 and the hand is armed — then mints the endpoint JWE and connects the ABI
-//! WebSocket through the VM's public endpoint.
+//! Launch delivers only the immutable, credential-free physical target seal in the run-hook
+//! payload. Session secret material is redeemed later over the trusted control channel, after
+//! durable target installation. The caller durably installs the MicroVM identity returned by
+//! `RunMicrovm` before readiness checks, endpoint discovery, JWE minting, or any guest request.
 //!
-//! While a session has live jobs the VM must not idle-suspend, so [`Keepalive`] sends endpoint
-//! traffic (an authenticated probe) well inside the 180 s idle window. When the brain admits a
-//! message for a possibly-suspended hand it calls [`probe`] first: the endpoint holds the
-//! request until `/resume` completes, so the resume cost is paid concurrently with model
-//! inference rather than in front of the first tool call.
+//! Brain's bounded observe schedule supplies endpoint traffic while an operation is live. An idle
+//! target may auto-suspend; the next authenticated endpoint request auto-resumes the same physical
+//! generation. Hand deliberately has no independent keepalive loop and no unauthenticated guest
+//! resume hook.
 
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use aws_sdk_lambdamicrovms::types::MicrovmState;
-use brain_hand_client::HandClient;
+use hand_core::connector::ConnectorRef;
+use hand_wire::RunPayload;
 
-use crate::control::{AUTH_HEADER, Control, ControlError, Microvm, is_gone};
+use crate::control::{
+    AUTH_HEADER, Control, ControlError, ExactRunMicrovmRequest, Microvm, is_gone,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchFailure {
+    #[error(transparent)]
+    Run(#[from] ControlError),
+}
 
 /// What a launched, armed, reachable hand looks like to the brain.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LaunchedHand {
     pub microvm_id: String,
     /// `https://…`, no trailing slash.
@@ -29,47 +37,53 @@ pub struct LaunchedHand {
     pub auth_token: String,
 }
 
-/// The run-hook payload the guest expects (`hand_guest::hooks::RunPayload`).
-#[must_use]
-pub fn run_payload(session_token: &str) -> String {
-    serde_json::json!({ "v": 1, "token": session_token }).to_string()
+/// The only provider identity needed at the durable target-install boundary. Endpoint discovery
+/// and JWE minting happen after that install, so a transient credential failure cannot turn a
+/// successfully launched VM into an unlocatable eight-hour orphan.
+#[derive(Clone)]
+pub struct LaunchedTarget {
+    pub microvm_id: String,
 }
 
-/// Launches (or idempotently re-launches, same `client_token`) a MicroVM and waits until it is
-/// RUNNING — i.e. the guest booted and its `/run` hook accepted the session token.
+/// The run-hook payload the guest expects (`hand_guest::hooks::RunPayload`).
+pub fn run_payload(payload: &RunPayload) -> anyhow::Result<String> {
+    serde_json::to_string(payload).context("serializing the closed Hand run payload")
+}
+
+/// Convenience launch for release canaries that always terminate their known target and do not
+/// participate in durable crash recovery. Production target materialization uses
+/// [`launch_exact`] after persisting the full request.
+///
+/// Readiness is deliberately after that CAS. Losing a wait/readiness response must never discard a
+/// provider identity that is already known or strand its charged capacity until the eight-hour
+/// uncertainty wall.
 pub async fn launch(
     control: &Control,
     image_arn: &str,
     image_version: &str,
-    session_token: &str,
+    run_data: &str,
     client_token: &str,
-) -> anyhow::Result<LaunchedHand> {
-    let vm = control
-        .run(
-            image_arn,
-            image_version,
-            &run_payload(session_token),
-            client_token,
-        )
-        .await
-        .context("RunMicrovm")?;
-    let vm = wait_for_state(
-        control,
-        &vm.id,
-        &MicrovmState::Running,
-        Duration::from_secs(180),
-    )
-    .await?;
-    let endpoint = vm
-        .endpoint
-        .clone()
-        .context("RUNNING MicroVM has no endpoint")?;
-    let auth_token = control.auth_token(&vm.id).await.context("auth token")?;
-    Ok(LaunchedHand {
-        microvm_id: vm.id,
-        endpoint: normalise_endpoint(&endpoint),
-        auth_token,
-    })
+    egress_connector: &ConnectorRef,
+) -> Result<LaunchedTarget, LaunchFailure> {
+    let request = control.exact_run_request(
+        image_arn,
+        image_version,
+        run_data,
+        client_token,
+        egress_connector,
+    );
+    launch_exact(control, &request).await
+}
+
+/// Replays a complete request that was durably sealed before the first provider dispatch. AWS
+/// specifies `client_token` as the idempotency key; exact replay recovers the same provider target
+/// before Hands installs its identity with the existing TARGET CAS.
+pub async fn launch_exact(
+    control: &Control,
+    request: &ExactRunMicrovmRequest,
+) -> Result<LaunchedTarget, LaunchFailure> {
+    let vm = control.run_exact(request).await?;
+    Ok(LaunchedTarget { microvm_id: vm.id })
 }
 
 /// `RunMicrovm` returns the endpoint as a bare host (`mvm-….on.aws`); make it a scheme-qualified
@@ -93,14 +107,23 @@ pub async fn wait_for_state(
 ) -> anyhow::Result<Microvm> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let vm = match control.get(id).await {
-            Ok(vm) => vm,
-            Err(ControlError::Retryable(e)) => {
-                tracing::debug!(error = %e, "get_microvm retry");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-            Err(e) => return Err(e.into()),
+        if tokio::time::Instant::now() >= deadline {
+            bail!("microvm {id} did not reach {want:?} within {timeout:?}");
+        }
+        let vm = match tokio::time::timeout_at(deadline, control.get(id)).await {
+            Err(_) => bail!("microvm {id} state read exceeded the {timeout:?} readiness bound"),
+            Ok(result) => match result {
+                Ok(vm) => vm,
+                Err(ControlError::Retryable(e) | ControlError::Throttled(e)) => {
+                    tracing::debug!(error = %e, "get_microvm retry");
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            },
         };
         if vm.state == *want {
             return Ok(vm);
@@ -108,13 +131,10 @@ pub async fn wait_for_state(
         if is_gone(&vm.state) {
             bail!("microvm {id} is {:?} while waiting for {want:?}", vm.state);
         }
-        if tokio::time::Instant::now() > deadline {
-            bail!(
-                "microvm {id} still {:?} after {timeout:?} (wanted {want:?})",
-                vm.state
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline),
+        )
+        .await;
     }
 }
 
@@ -128,128 +148,40 @@ pub fn ws_url(endpoint: &str) -> String {
     format!("wss://{host}/")
 }
 
-/// Connects the ABI WebSocket through the authenticated endpoint.
-pub async fn connect(hand: &LaunchedHand, fence: u64) -> anyhow::Result<HandClient> {
-    HandClient::connect_with_headers(
-        &ws_url(&hand.endpoint),
-        fence,
-        &[(AUTH_HEADER, hand.auth_token.as_str())],
-    )
-    .await
-    .context("connecting through the MicroVM endpoint")
+pub type GuestSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Credential-redacted endpoint connection failure. AWS documents HTTP 502 from a MicroVM
+/// endpoint as an application-process failure; callers deliberately distinguish it from a generic
+/// network break so repeated 502s can fence the physical generation even while `GetMicrovm`
+/// remains eventually-consistently `RUNNING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GuestConnectError {
+    #[error("MicroVM endpoint rejected the WebSocket handshake with HTTP {0}")]
+    Http(u16),
+    #[error("MicroVM endpoint connection failed")]
+    Transport,
+    #[error("MicroVM endpoint request is invalid")]
+    InvalidRequest,
 }
 
-/// One authenticated GET to the guest's probe document. To a suspended VM this is the
-/// speculative resume: the endpoint holds the request until `/resume` completes, then the
-/// probe answers from the running guest.
-pub async fn probe(
-    http: &reqwest::Client,
-    hand: &LaunchedHand,
-    timeout: Duration,
-) -> anyhow::Result<serde_json::Value> {
-    let response = http
-        .get(format!("{}/", hand.endpoint))
-        .header(AUTH_HEADER, &hand.auth_token)
-        .timeout(timeout)
-        .send()
-        .await
-        .context("probe request")?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("probe answered {status}");
-    }
-    response.json().await.context("probe body")
-}
-
-/// The speculative resume: send endpoint traffic to a suspended hand so Lambda holds the request
-/// while `/resume` runs, then answers from the resumed guest. Right after an explicit suspend the
-/// endpoint can briefly answer 502/503 before auto-resume is wired, so this retries the held
-/// request until it succeeds or `overall` elapses. Brain uses this path to hide
-/// the resume behind model inference.
-pub async fn resume_via_probe(
-    http: &reqwest::Client,
-    hand: &LaunchedHand,
-    overall: Duration,
-) -> anyhow::Result<serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + overall;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match probe(http, hand, Duration::from_secs(60)).await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(
-                        e.context(format!("resume-via-probe gave up after {attempt} tries"))
-                    );
-                }
-                tracing::debug!(attempt, error = %e, "resume probe not ready; retrying");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+/// Connects the private Hands framing socket through the provider-authenticated endpoint.
+pub async fn connect(hand: &LaunchedHand) -> Result<GuestSocket, GuestConnectError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut request = ws_url(&hand.endpoint)
+        .into_client_request()
+        .map_err(|_| GuestConnectError::InvalidRequest)?;
+    let auth = hand
+        .auth_token
+        .parse()
+        .map_err(|_| GuestConnectError::InvalidRequest)?;
+    request.headers_mut().insert(AUTH_HEADER, auth);
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(GuestConnectError::Http(response.status().as_u16()))
         }
-    }
-}
-
-/// Endpoint traffic on a timer, so a hand with live jobs is never idle-suspended under them.
-/// Dropping the handle stops it.
-pub struct Keepalive {
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Keepalive {
-    /// Probes every `interval` (choose well under the 180 s idle policy; 60 s is right).
-    pub fn spawn(hand: LaunchedHand, interval: Duration) -> Self {
-        let http = reqwest::Client::new();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                match probe(&http, &hand, Duration::from_secs(30)).await {
-                    Ok(_) => tracing::trace!(microvm = %hand.microvm_id, "keepalive"),
-                    Err(e) => {
-                        tracing::warn!(microvm = %hand.microvm_id, error = %e, "keepalive probe failed");
-                    }
-                }
-            }
-        });
-        Self { task }
-    }
-}
-
-impl Drop for Keepalive {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// What a connection loss actually means. The brain maps `Lost` to the session-visible
-/// `hand_lost` event (never replayed); everything else is reconnectable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Disposition {
-    /// Running: the drop was transport-level. Reconnect.
-    Reconnect,
-    /// Suspended (idle policy fired): probe to resume, then reconnect.
-    ResumeThenReconnect,
-    /// In transition; ask again shortly.
-    Wait,
-    /// Gone for good: `hand_lost`, with the reason we can attest.
-    Lost(String),
-}
-
-/// Classifies a dropped hand by asking the control plane what became of the VM.
-pub async fn diagnose(control: &Control, microvm_id: &str) -> Disposition {
-    match control.get(microvm_id).await {
-        Ok(vm) => match vm.state {
-            MicrovmState::Running => Disposition::Reconnect,
-            MicrovmState::Suspended => Disposition::ResumeThenReconnect,
-            MicrovmState::Pending | MicrovmState::Suspending => Disposition::Wait,
-            MicrovmState::Terminating | MicrovmState::Terminated => {
-                Disposition::Lost(format!("microvm is {:?}", vm.state))
-            }
-            other => Disposition::Lost(format!("unmodelled microvm state {other:?}")),
-        },
-        Err(ControlError::Gone(reason)) => Disposition::Lost(reason),
-        Err(ControlError::Retryable(_)) | Err(ControlError::Unknown(_)) => Disposition::Wait,
-        Err(ControlError::Fatal(reason)) => Disposition::Lost(format!("control: {reason}")),
+        Err(_) => Err(GuestConnectError::Transport),
     }
 }
 
@@ -282,10 +214,24 @@ mod tests {
     }
 
     #[test]
-    fn the_run_payload_is_versioned_and_carries_only_the_token() {
-        let payload: serde_json::Value = serde_json::from_str(&run_payload("s3cret")).unwrap();
-        assert_eq!(payload["v"], 1);
-        assert_eq!(payload["token"], "s3cret");
-        assert_eq!(payload.as_object().unwrap().len(), 2);
+    fn the_run_payload_is_closed_and_contains_no_executor_credential() {
+        let payload: RunPayload = serde_json::from_value(serde_json::json!({
+            "contract_digest": "a".repeat(64),
+            "generation": "generation-1",
+            "expires_at_ms": 28800000,
+            "root_id": "root-1",
+            "owner_session_id": "session-1",
+            "connector": "none",
+            "resource_class": "microvm-1gb",
+            "resources": {"max_output_bytes": 1024, "timeout_ms": 1000},
+            "network": {"kind": "none"}
+        }))
+        .unwrap();
+        let encoded = run_payload(&payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["generation"], "generation-1");
+        assert!(value.get("token").is_none());
+        assert!(value.get("credentials").is_none());
+        assert!(value.get("canary_exit_after_operation_id").is_none());
     }
 }

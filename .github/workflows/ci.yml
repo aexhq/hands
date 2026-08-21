@@ -4,23 +4,83 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: hands-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build-test:
+  release-boundary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Enforce the Hands release boundary
+        run: |
+          test ! -e hosted
+          test ! -e .github/workflows/brain-image.yml
+          test ! -e .github/workflows/oci.yml
+
+  format:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.1"
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - run: cargo fmt --all -- --check
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-build
+      - run: cargo build --workspace --all-targets
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test
       - run: cargo test --workspace
 
-  # Proves the guest works inside the built image, on the runner's native arch. The production
-  # ARM64 image is built on an arm host / via buildx separately.
-  image-smoke:
+  node-runtime:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: node scripts/test-tool-runner.mjs
+
+  # Build the native CI image once. Static image policy and adversarial runtime tests consume the
+  # same artifact in parallel; the production ARM64 image is built on an arm host separately.
+  linux-image-build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -28,15 +88,74 @@ jobs:
         with:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@v2
-      - name: Build guest and Brain client smoke (native)
+        with:
+          shared-key: ci-linux-image
+      - name: Build guest (native)
+        run: cargo build -p hand-guest --release
+      - name: Build native image
+        run: docker build -f image/Dockerfile --build-arg BIN=target/release/hand-guest -t hand:ci .
+      - name: Seal native image
         run: |
-          cargo build -p hand-guest --release
-          cargo build -p hand-guest --example smoke --release
-      - name: Build image and drive a session
+          mkdir hand-ci-image
+          docker save hand:ci | gzip -1 > hand-ci-image/hand-ci.tar.gz
+          sha256sum hand-ci-image/hand-ci.tar.gz > hand-ci-image/SHA256SUMS
+      - uses: actions/upload-artifact@v6
+        with:
+          name: hand-ci-image-${{ github.sha }}
+          path: hand-ci-image/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  image-policy-security:
+    needs: linux-image-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: hand-ci-image-${{ github.sha }}
+          path: hand-ci-image
+      - name: Verify and load native image
         run: |
-          docker build -f image/Dockerfile --build-arg BIN=target/release/hand-guest -t hand:ci .
-          TOKEN=ci-smoke
-          CID=$(docker run -d --rm -p 8080:8080 -e HAND_TOKEN=$TOKEN hand:ci)
+          sha256sum --check hand-ci-image/SHA256SUMS
+          gzip -dc hand-ci-image/hand-ci.tar.gz | docker load
+      - name: Prove the image privilege allowlist
+        run: |
+          docker run --rm --entrypoint sh --user 0:0 hand:ci -ceu '
+            test -z "$(find / -xdev -type f -perm /6000 -print -quit)"
+            capabilities=$(getcap -r / 2>/dev/null || true)
+            test "$capabilities" = "/usr/local/bin/hand-guest cap_kill,cap_setgid,cap_setuid=ep"
+            test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/tool-boundary.so)" = "0:0:555"
+            test "$(stat -c "%u:%g:%a" /usr/local/lib/hand/proc-secret-static)" = "0:0:555"
+            ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP
+          '
+
+  guest-runtime-security:
+    needs: linux-image-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: hand-ci-image-${{ github.sha }}
+          path: hand-ci-image
+      - name: Verify and load native image
+        run: |
+          sha256sum --check hand-ci-image/SHA256SUMS
+          gzip -dc hand-ci-image/hand-ci.tar.gz | docker load
+      - name: Prove Tool identities cannot reach supervisor control
+        run: |
+          CID=$(docker run -d --rm --cap-add NET_ADMIN -p 8080:8080 hand:ci)
+          trap 'docker logs "$CID"; docker stop "$CID" >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && { exec 3>&-; sleep 1; break; }; sleep 0.5; done
-          ./target/release/examples/smoke ws://127.0.0.1:8080/ $TOKEN || { docker logs "$CID"; exit 1; }
-          docker stop "$CID"
+          curl --fail --silent http://127.0.0.1:8080/ >/dev/null
+          docker exec --user 0:0 "$CID" sh -ceu '
+            iptables -C OUTPUT -p tcp --sport 8080 -m owner ! --uid-owner 1001 -j REJECT
+            iptables -C OUTPUT -o lo -p tcp --dport 8080 -m owner ! --uid-owner 1001 -j REJECT
+          '
+          docker cp scripts/test-control-boundary.mjs "$CID":/tmp/test-control-boundary.mjs
+          docker exec --user 1000:1000 "$CID" node /tmp/test-control-boundary.mjs
+          docker cp scripts/test-guest-deadline.mjs "$CID":/tmp/test-guest-deadline.mjs
+          docker exec --user 0:0 "$CID" node /tmp/test-guest-deadline.mjs
+          docker stop "$CID" >/dev/null
+          trap - EXIT

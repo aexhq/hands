@@ -28,8 +28,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

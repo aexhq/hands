@@ -25,7 +25,7 @@ here.
 | [`hand-guest`](crates/hand-guest) | WebSocket guest, tool runner, bounded output, jobs, and live file access |
 | [`hand-brain-aws`](crates/hand-brain-aws) | Lambda MicroVM implementation of Brain's receipt and capability ports |
 | [`hand-lambda`](crates/hand-lambda) | Image publication, lifecycle controls, and hosted runtime checks |
-| [`hand-egress-gateway`](crates/hand-egress-gateway) | Signed-capability CONNECT and SOCKS allowlist gateway |
+| [`hand-egress-gateway`](crates/hand-egress-gateway) | Signed-capability HTTP CONNECT allowlist gateway |
 | [`gateway`](gateway) | Low-privilege egress gateway image and deployment contract |
 | [`image`](image) | Curated Linux tool image |
 | [`scripts`](scripts) | Node bundle and guest security conformance fixtures |
@@ -41,7 +41,7 @@ cargo test --workspace
 node scripts/test-tool-runner.mjs
 ```
 
-CI also builds the Linux image and proves that a malicious Tool UID cannot reach the supervisor
+CI also builds the Linux image and proves that neither Tool identity class can reach the supervisor
 control listener. Production publishes only the immutable egress-gateway image and plane-local
 Lambda MicroVM images.
 

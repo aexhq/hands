@@ -1,7 +1,7 @@
 [package]
 name = "hand-brain-aws"
 version = "0.1.0"
-description = "AWS Lambda MicroVM HandFactory implementation for the public Brain Hand ports"
+description = "AWS Lambda MicroVM implementation of the public Brain Hand ports"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,23 +14,32 @@ workspace = true
 [dependencies]
 brain.workspace = true
 brain-protocol.workspace = true
-brain-hand-client.workspace = true
-brain-aws.workspace = true
 hand-lambda = { path = "../hand-lambda" }
+hand-core = { path = "../hand-core" }
+hand-egress-gateway = { path = "../hand-egress-gateway" }
+hand-wire = { path = "../hand-wire" }
 
 async-trait.workspace = true
 anyhow.workspace = true
 aws-config.workspace = true
-aws-sdk-s3.workspace = true
+aws-sdk-dynamodb.workspace = true
+aws-sdk-kms.workspace = true
+aws-sdk-lambdamicrovms.workspace = true
 base64.workspace = true
-chrono = "0.4"
+futures-util.workspace = true
 hex.workspace = true
+ipnet.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true

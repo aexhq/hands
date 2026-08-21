@@ -1,23 +1,18 @@
-//! Default Hand guest — serves the Brain↔Hand ABI v1 (`brain_protocol::abi`) inside the sandbox.
+//! Default Aex-managed Hand guest.
 //!
-//! One process per hand. It listens for one multiplexed WebSocket per brain connection, keeps
-//! lanes (persistent shell environments), runs operations (tool calls) with bounded, spilled
-//! output, moves files in/out over presigned URLs, and syncs the workspace as packs + manifests.
-//! Semantics: `aex/contracts/abi/v1/README.md`.
+//! Brain owns the public receipt contract. This crate implements the physical-generation side of
+//! that contract: exact request deduplication, bounded terminal retention, immutable target seals,
+//! verified Node22 bundles, live files, and explicit additional-sandbox execution. It deliberately
+//! contains no workspace checkpoint or implicit persistence path.
 
+mod acks;
 pub mod config;
 pub mod errors;
-pub mod exec;
+mod file_effects;
 pub mod hand;
 pub mod hooks;
-pub mod lanes;
-pub mod ops;
+pub mod process;
 pub mod server;
-pub mod spill;
-pub mod status;
-pub mod sync;
-pub mod tools;
-pub mod transfer;
 
 pub use config::Config;
 pub use hand::Hand;
