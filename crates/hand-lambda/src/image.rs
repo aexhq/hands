@@ -253,6 +253,8 @@ pub fn artifact_key(zip: &[u8]) -> String {
 /// Everything `publish` needs besides the bytes.
 #[derive(Debug, Clone)]
 pub struct PublishConfig {
+    /// Exact lowercase 40-hex source commit represented by this publication.
+    pub source_sha: String,
     /// Image name (one per shape variant), e.g. `hands-dev-1gb`.
     pub name: String,
     /// S3 bucket the ZIP is uploaded to.
@@ -275,7 +277,7 @@ pub struct PublishedImage {
 
 /// Bump this whenever a fixed `CreateMicrovmImage`/`UpdateMicrovmImage` request field changes.
 /// Variable request fields are hashed individually below.
-const PUBLISH_REQUEST_TOKEN_SCHEMA: &str = "hand-lambda-publish-request-v4";
+const PUBLISH_REQUEST_TOKEN_SCHEMA: &str = "hand-lambda-publish-request-v5";
 
 #[derive(Clone, Copy)]
 enum PublishOperation {
@@ -309,6 +311,7 @@ fn publish_client_token(
         operation.as_str(),
         region,
         image_identifier,
+        &cfg.source_sha,
         &cfg.name,
         &cfg.bucket,
         &cfg.build_role_arn,
@@ -325,6 +328,47 @@ fn publish_client_token(
         digest.update(connector.as_bytes());
     }
     hex::encode(&digest.finalize()[..16])
+}
+
+fn publish_request_fingerprint(region: &str, cfg: &PublishConfig, artifact_key: &str) -> String {
+    let mut digest = sha2::Sha256::new();
+    for field in [
+        PUBLISH_REQUEST_TOKEN_SCHEMA,
+        region,
+        &cfg.source_sha,
+        &cfg.name,
+        &cfg.bucket,
+        &cfg.build_role_arn,
+        &cfg.log_group,
+        artifact_key,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    let mut connectors = cfg.egress_connectors.clone();
+    connectors.sort();
+    for connector in connectors {
+        digest.update((connector.len() as u64).to_be_bytes());
+        digest.update(connector.as_bytes());
+    }
+    hex::encode(&digest.finalize()[..16])
+}
+
+pub fn validate_source_sha(source_sha: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source_sha.len() == 40
+            && source_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "source SHA must be exactly 40 lowercase hexadecimal characters"
+    );
+    Ok(())
+}
+
+fn publish_description(source_sha: &str, request_fingerprint: &str) -> String {
+    format!(
+        "Aex Hand source {source_sha} request {request_fingerprint} ({MVP_TARGET_MEMORY_MIB} MiB shape)"
+    )
 }
 
 pub fn validate_network_connector_arn(connector: &str, region: &str) -> anyhow::Result<()> {
@@ -393,9 +437,34 @@ pub async fn publish(
     cfg: &PublishConfig,
     zip: Vec<u8>,
 ) -> anyhow::Result<PublishedImage> {
+    validate_source_sha(&cfg.source_sha)?;
     validated_connectors(&cfg.egress_connectors, control.region())?;
     let image_build_egress = image_build_egress_connector(control.region());
     let key = artifact_key(&zip);
+    let request_fingerprint = publish_request_fingerprint(control.region(), cfg, &key);
+    let description = publish_description(&cfg.source_sha, &request_fingerprint);
+    let exists = find_image_arn(control, &cfg.name).await?;
+
+    if let Some(arn) = exists.as_deref() {
+        let versions = control
+            .sdk()
+            .list_microvm_image_versions()
+            .image_identifier(arn)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("list_microvm_image_versions: {}", detail(&e)))?;
+        let newest = versions
+            .items()
+            .iter()
+            .max_by_key(|version| version_ord(version.image_version()));
+        if let Some(version) =
+            newest.filter(|version| version.description() == Some(description.as_str()))
+        {
+            tracing::info!(%arn, source_sha = %cfg.source_sha, "resuming existing source publication");
+            return wait_for_build(control, arn, version.image_version(), &description).await;
+        }
+    }
+
     let uri = format!("s3://{}/{key}", cfg.bucket);
     s3.put_object()
         .bucket(&cfg.bucket)
@@ -436,16 +505,15 @@ pub async fn publish(
             .build(),
     );
     let sdk = control.sdk();
-    let exists = find_image_arn(control, &cfg.name).await?;
-
-    let arn = if let Some(arn) = exists {
+    let (arn, version) = if let Some(arn) = exists {
         let client_token =
             publish_client_token(PublishOperation::Update, control.region(), &arn, cfg, &key);
-        sdk.update_microvm_image()
+        let out = sdk
+            .update_microvm_image()
             .image_identifier(&arn)
             .base_image_arn(base_image_arn(control.region()))
             .build_role_arn(&cfg.build_role_arn)
-            .description(format!("Hand guest ({MVP_TARGET_MEMORY_MIB} MiB shape)"))
+            .description(&description)
             .code_artifact(CodeArtifact::Uri(uri))
             .logging(logging)
             .egress_network_connectors(image_build_egress.clone())
@@ -467,7 +535,7 @@ pub async fn publish(
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("update_microvm_image: {}", detail(&e)))?;
-        arn
+        (out.image_arn().to_owned(), out.image_version().to_owned())
     } else {
         let client_token = publish_client_token(
             PublishOperation::Create,
@@ -481,7 +549,7 @@ pub async fn publish(
             .name(&cfg.name)
             .base_image_arn(base_image_arn(control.region()))
             .build_role_arn(&cfg.build_role_arn)
-            .description(format!("Hand guest ({MVP_TARGET_MEMORY_MIB} MiB shape)"))
+            .description(&description)
             .code_artifact(CodeArtifact::Uri(uri))
             .logging(logging)
             .egress_network_connectors(image_build_egress)
@@ -503,46 +571,50 @@ pub async fn publish(
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("create_microvm_image: {}", detail(&e)))?;
-        out.image_arn().to_owned()
+        (out.image_arn().to_owned(), out.image_version().to_owned())
     };
-    tracing::info!(%arn, "image registration accepted; AWS is building");
-    wait_for_build(control, &arn).await
+    tracing::info!(%arn, %version, "image registration accepted; AWS is building");
+    wait_for_build(control, &arn, &version, &description).await
 }
 
-/// Polls until the newest version of `image_arn` leaves PENDING/IN_PROGRESS. AWS's builds run
-/// minutes, not seconds; the timeout is generous and the caller sees every transition.
-pub async fn wait_for_build(control: &Control, image_arn: &str) -> anyhow::Result<PublishedImage> {
+/// Polls until the exact accepted version leaves PENDING/IN_PROGRESS. AWS's builds run minutes,
+/// not seconds; the timeout is generous and the caller sees every transition.
+pub async fn wait_for_build(
+    control: &Control,
+    image_arn: &str,
+    image_version: &str,
+    expected_description: &str,
+) -> anyhow::Result<PublishedImage> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
     let sdk = control.sdk();
     loop {
-        let out = sdk
-            .list_microvm_image_versions()
+        let version = sdk
+            .get_microvm_image_version()
             .image_identifier(image_arn)
+            .image_version(image_version)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("list_microvm_image_versions: {}", detail(&e)))?;
-        let newest = out
-            .items()
-            .iter()
-            .max_by_key(|v| version_ord(v.image_version()))
-            .context("image has no versions")?;
-        let version = newest.image_version().to_owned();
-        match newest.state() {
+            .map_err(|e| anyhow::anyhow!("get_microvm_image_version: {}", detail(&e)))?;
+        anyhow::ensure!(
+            version.description() == Some(expected_description),
+            "accepted image version does not match the requested source publication"
+        );
+        match version.state() {
             MicrovmImageVersionState::Successful => {
-                tracing::info!(%version, "image version built");
+                tracing::info!(%image_version, "image version built");
                 return Ok(PublishedImage {
                     image_arn: image_arn.to_owned(),
-                    image_version: version,
+                    image_version: image_version.to_owned(),
                 });
             }
             MicrovmImageVersionState::Failed => {
                 bail!(
-                    "image version {version} failed: {}",
-                    newest.state_reason().unwrap_or("no reason given")
+                    "image version {image_version} failed: {}",
+                    version.state_reason().unwrap_or("no reason given")
                 );
             }
             state => {
-                tracing::info!(%version, ?state, "building…");
+                tracing::info!(%image_version, ?state, "building…");
             }
         }
         if tokio::time::Instant::now() > deadline {
@@ -669,6 +741,7 @@ mod tests {
 
     fn publish_config(name: &str) -> PublishConfig {
         PublishConfig {
+            source_sha: "1111111111111111111111111111111111111111".to_owned(),
             name: name.to_owned(),
             bucket: "artifacts-dev".to_owned(),
             build_role_arn: "arn:aws:iam::111111111111:role/build-dev".to_owned(),
@@ -701,6 +774,43 @@ mod tests {
                 &cfg,
                 &key,
             )
+        );
+    }
+
+    #[test]
+    fn publication_source_is_exact_and_part_of_the_provider_identity() {
+        let valid = "0123456789abcdef0123456789abcdef01234567";
+        assert!(validate_source_sha(valid).is_ok());
+        for invalid in [
+            "0123456789abcdef0123456789abcdef0123456",
+            "0123456789abcdef0123456789abcdef012345678",
+            "0123456789abcdef0123456789abcdef0123456g",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+        ] {
+            assert!(validate_source_sha(invalid).is_err(), "{invalid}");
+        }
+
+        let cfg = publish_config("hands-dev-1gb");
+        let mut changed = cfg.clone();
+        changed.source_sha = "2222222222222222222222222222222222222222".to_owned();
+        let key = artifact_key(b"same image");
+        let target = "arn:aws:lambda:us-east-1:111111111111:microvm-image:hands-dev-1gb";
+        assert_ne!(
+            publish_client_token(PublishOperation::Update, "us-east-1", target, &cfg, &key),
+            publish_client_token(
+                PublishOperation::Update,
+                "us-east-1",
+                target,
+                &changed,
+                &key
+            )
+        );
+        assert_eq!(
+            publish_description(
+                &cfg.source_sha,
+                &publish_request_fingerprint("us-east-1", &cfg, &key)
+            ),
+            "Aex Hand source 1111111111111111111111111111111111111111 request 456e39af6db83dccfb8b12660b38f5f1 (1024 MiB shape)"
         );
     }
 

@@ -178,6 +178,7 @@ jobs:
           HAND_NETWORK_CONNECTOR_PUBLIC: ${{ vars.HAND_NETWORK_CONNECTOR_PUBLIC }}
         run: |
           published="$(hand-image-binaries/hand-lambda --region us-east-1 image publish \
+            --source-sha "$EXPECTED_COMMIT" \
             --binary hand-image-binaries/hand-guest \
             --name aex-hands-${{ inputs.plane }}-1gb \
             --bucket aex-hands-${{ inputs.plane }}-use1-artifacts-522921482290 \

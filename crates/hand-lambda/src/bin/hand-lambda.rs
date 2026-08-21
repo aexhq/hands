@@ -44,6 +44,8 @@ enum Command {
 enum ImageCommand {
     Publish {
         #[arg(long)]
+        source_sha: String,
+        #[arg(long)]
         binary: std::path::PathBuf,
         #[arg(long)]
         name: String,
@@ -201,6 +203,7 @@ async fn image_command(
             .await
         }
         ImageCommand::Publish {
+            source_sha,
             binary,
             name,
             bucket,
@@ -225,6 +228,7 @@ async fn image_command(
                 control,
                 &s3,
                 &PublishConfig {
+                    source_sha,
                     name,
                     bucket,
                     build_role_arn: build_role,
