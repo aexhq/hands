@@ -422,7 +422,6 @@ impl Hand {
         options.create_new(true).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
             // Every managed binding may read the verified module through the shared Tool group,
             // but no untrusted Tool process may rewrite code after digest verification.
             options.mode(0o640);

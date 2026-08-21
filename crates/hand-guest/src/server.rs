@@ -177,7 +177,6 @@ async fn commit_canary_terminal_receipt(hand: &Hand, bytes: &[u8]) -> std::io::R
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let mut file = options.open(&temporary).await?;
@@ -354,7 +353,6 @@ async fn install_object(
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let mut file = match options.open(&temporary).await {
