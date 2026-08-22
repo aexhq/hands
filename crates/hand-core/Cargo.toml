@@ -11,6 +11,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Exposes the in-memory registry double for conformance tests in dependent crates.
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
 cap-std.workspace = true
