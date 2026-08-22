@@ -290,54 +290,33 @@ impl GuestClient {
             )
         })?;
         let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(metadata);
-        let mut saw_application_unavailable = false;
-        for attempt in 0..2 {
-            let endpoint = self.endpoint(target).await?;
-            let file = tokio::fs::File::open(file_path)
-                .await
-                .map_err(|error| temporary_from("staged object is unavailable", error))?;
-            let body =
-                reqwest::Body::wrap_stream(ReaderStream::new(file.take(bytes.saturating_add(1))));
-            let response = self
-                .http
-                .post(format!("{}{path}", endpoint.endpoint))
-                .header(AUTH_HEADER, &endpoint.auth_token)
-                .header(CONTROL_AUTH_HEADER, target.control_token.expose())
-                .header(OBJECT_METADATA_HEADER, &metadata)
-                .header(reqwest::header::CONTENT_LENGTH, bytes)
-                .body(body)
-                .timeout(Duration::from_secs(15 * 60))
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
-                    self.forget(&target.target_ref).await;
-                }
-                Ok(response) if response.status().as_u16() == 502 => {
-                    if record_application_failure(&mut saw_application_unavailable, attempt) {
-                        return Err(endpoint_application_gone());
-                    }
-                    if attempt == 0 {
-                        self.forget(&target.target_ref).await;
-                    } else {
-                        return Err(temporary("physical sandbox endpoint is unavailable"));
-                    }
-                }
-                Ok(response) if response.status().is_server_error() && attempt == 0 => {
-                    self.forget(&target.target_ref).await;
-                }
-                Ok(response) => {
-                    return Err(endpoint_response_error(
-                        response.status(),
-                        "guest object install",
-                    ));
-                }
-                Err(_) if attempt == 0 => self.forget(&target.target_ref).await,
-                Err(_) => return Err(temporary("guest object install failed")),
+        self.endpoint_request(target, "guest object install", |endpoint: LaunchedHand| {
+            let metadata = metadata.clone();
+            async move {
+                let file = tokio::fs::File::open(file_path).await.map_err(|error| {
+                    EndpointAttemptError::Fatal(temporary_from(
+                        "staged object is unavailable",
+                        error,
+                    ))
+                })?;
+                let body = reqwest::Body::wrap_stream(ReaderStream::new(
+                    file.take(bytes.saturating_add(1)),
+                ));
+                self.http
+                    .post(format!("{}{path}", endpoint.endpoint))
+                    .header(AUTH_HEADER, &endpoint.auth_token)
+                    .header(CONTROL_AUTH_HEADER, target.control_token.expose())
+                    .header(OBJECT_METADATA_HEADER, &metadata)
+                    .header(reqwest::header::CONTENT_LENGTH, bytes)
+                    .body(body)
+                    .timeout(Duration::from_secs(15 * 60))
+                    .send()
+                    .await
+                    .map_err(EndpointAttemptError::Transport)
             }
-        }
-        unreachable!("bounded retry loop returns")
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn export_file(
@@ -352,61 +331,35 @@ impl GuestClient {
                 "file export is invalid",
             )
         })?;
-        let mut saw_application_unavailable = false;
-        for attempt in 0..2 {
-            let endpoint = self.endpoint(target).await?;
-            let response = self
-                .http
-                .post(format!("{}/internal/files/export", endpoint.endpoint))
-                .header(AUTH_HEADER, &endpoint.auth_token)
-                .header(CONTROL_AUTH_HEADER, target.control_token.expose())
-                .header("content-type", "application/json")
-                .body(encoded.clone())
-                .timeout(Duration::from_secs(15 * 60))
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let metadata = response
-                        .headers()
-                        .get(FILE_ENTRY_HEADER)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| {
-                            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                                .decode(value)
-                                .ok()
-                        })
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                        .ok_or_else(|| temporary("guest file metadata is malformed"))?;
-                    return Ok((metadata, response));
+        let response = self
+            .endpoint_request(target, "guest file export", |endpoint: LaunchedHand| {
+                let encoded = encoded.clone();
+                async move {
+                    self.http
+                        .post(format!("{}/internal/files/export", endpoint.endpoint))
+                        .header(AUTH_HEADER, &endpoint.auth_token)
+                        .header(CONTROL_AUTH_HEADER, target.control_token.expose())
+                        .header("content-type", "application/json")
+                        .body(encoded.clone())
+                        .timeout(Duration::from_secs(15 * 60))
+                        .send()
+                        .await
+                        .map_err(EndpointAttemptError::Transport)
                 }
-                Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
-                    self.forget(&target.target_ref).await;
-                }
-                Ok(response) if response.status().as_u16() == 502 => {
-                    if record_application_failure(&mut saw_application_unavailable, attempt) {
-                        return Err(endpoint_application_gone());
-                    }
-                    if attempt == 0 {
-                        self.forget(&target.target_ref).await;
-                    } else {
-                        return Err(temporary("physical sandbox endpoint is unavailable"));
-                    }
-                }
-                Ok(response) if response.status().is_server_error() && attempt == 0 => {
-                    self.forget(&target.target_ref).await;
-                }
-                Ok(response) => {
-                    return Err(endpoint_response_error(
-                        response.status(),
-                        "guest file export",
-                    ));
-                }
-                Err(_) if attempt == 0 => self.forget(&target.target_ref).await,
-                Err(_) => return Err(temporary("guest file export failed")),
-            }
-        }
-        unreachable!("bounded retry loop returns")
+            })
+            .await?;
+        let metadata = response
+            .headers()
+            .get(FILE_ENTRY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(value)
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| temporary("guest file metadata is malformed"))?;
+        Ok((metadata, response))
     }
 
     async fn post_bytes(
@@ -423,21 +376,43 @@ impl GuestClient {
                 "install body exceeds the guest bound",
             ));
         }
+        self.endpoint_request(target, "guest install", |endpoint: LaunchedHand| {
+            let body = body.clone();
+            async move {
+                self.http
+                    .post(format!("{}{path}", endpoint.endpoint))
+                    .header(AUTH_HEADER, &endpoint.auth_token)
+                    .header(CONTROL_AUTH_HEADER, target.control_token.expose())
+                    .header("content-type", content_type)
+                    .body(body)
+                    .timeout(RPC_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(EndpointAttemptError::Transport)
+            }
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// One bounded exact-replay ladder for every HTTP request against the guest endpoint: refresh
+    /// the cached JWE once on 401/5xx/transport failure, fence the generation on repeated
+    /// application 502, and classify everything else exactly once.
+    async fn endpoint_request<F, Fut>(
+        &self,
+        target: &InstalledTarget,
+        operation: &'static str,
+        send: F,
+    ) -> Result<reqwest::Response, HandError>
+    where
+        F: Fn(LaunchedHand) -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response, EndpointAttemptError>> + Send,
+    {
         let mut saw_application_unavailable = false;
         for attempt in 0..2 {
             let endpoint = self.endpoint(target).await?;
-            let response = self
-                .http
-                .post(format!("{}{path}", endpoint.endpoint))
-                .header(AUTH_HEADER, &endpoint.auth_token)
-                .header(CONTROL_AUTH_HEADER, target.control_token.expose())
-                .header("content-type", content_type)
-                .body(body.clone())
-                .timeout(RPC_TIMEOUT)
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => return Ok(()),
+            match send(endpoint).await {
+                Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) if response.status().as_u16() == 401 && attempt == 0 => {
                     self.forget(&target.target_ref).await;
                 }
@@ -455,14 +430,27 @@ impl GuestClient {
                     self.forget(&target.target_ref).await;
                 }
                 Ok(response) => {
-                    return Err(endpoint_response_error(response.status(), "guest install"));
+                    return Err(endpoint_response_error(response.status(), operation));
                 }
-                Err(_) if attempt == 0 => self.forget(&target.target_ref).await,
-                Err(_) => return Err(temporary("guest install request failed")),
+                Err(EndpointAttemptError::Fatal(error)) => return Err(error),
+                Err(EndpointAttemptError::Transport(error)) if attempt == 0 => {
+                    tracing::debug!(%error, operation, "guest endpoint attempt failed; refreshing");
+                    self.forget(&target.target_ref).await;
+                }
+                Err(EndpointAttemptError::Transport(error)) => {
+                    return Err(temporary_from(operation, error));
+                }
             }
         }
         unreachable!("bounded retry loop returns")
     }
+}
+
+/// One request attempt against the guest endpoint: a transport failure is retried once with a
+/// refreshed endpoint, while a fatal failure already carries its exact classification.
+enum EndpointAttemptError {
+    Transport(reqwest::Error),
+    Fatal(HandError),
 }
 
 fn encode_blob_install<T: serde::Serialize>(
