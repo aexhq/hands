@@ -1,5 +1,9 @@
 use axum::http::StatusCode;
+
+use crate::acks::AckStoreError;
+use crate::file_effects::FileEffectStoreError;
 use brain_protocol::hand::{HandError, HandErrorCode};
+use hand_core::operation::OperationError;
 
 /// HTTP projection of a Hand error for the install routes. The code and `retryable` flag carry
 /// the real distinction; the status keeps plain HTTP clients from reading every failure as 409.
@@ -52,6 +56,62 @@ pub fn invalid(message: impl Into<String>) -> HandError {
 
 pub fn unavailable(message: impl Into<String>) -> HandError {
     hand_error(HandErrorCode::TemporarilyUnavailable, true, message)
+}
+
+pub(crate) fn operation_error(error: OperationError) -> HandError {
+    let code = match error {
+        OperationError::IdempotencyConflict | OperationError::TerminalConflict => {
+            HandErrorCode::OperationConflict
+        }
+        OperationError::Unknown => HandErrorCode::OperationUnknown,
+        OperationError::Capacity | OperationError::TerminalCapacity => {
+            HandErrorCode::ResourceExhausted
+        }
+        OperationError::InvalidIdentity(_)
+        | OperationError::AlreadyTerminal
+        | OperationError::NotTerminal
+        | OperationError::TerminalDigestMismatch => HandErrorCode::InvalidRequest,
+    };
+    hand_error(code, false, error.to_string())
+}
+
+pub(crate) fn stdin_conflict() -> HandError {
+    hand_error(
+        HandErrorCode::OperationConflict,
+        false,
+        "stdin operation_id is already reserved for a different request digest",
+    )
+}
+
+pub(crate) fn ack_store_error(error: AckStoreError) -> HandError {
+    let (code, retryable) = match error {
+        AckStoreError::Conflict => (HandErrorCode::OperationConflict, false),
+        AckStoreError::Capacity => (HandErrorCode::ResourceExhausted, false),
+        AckStoreError::Invalid(_) => (HandErrorCode::InvalidRequest, false),
+        AckStoreError::Io(_) => (HandErrorCode::TemporarilyUnavailable, true),
+        AckStoreError::Corrupt(_) => (HandErrorCode::TemporarilyUnavailable, false),
+    };
+    hand_error(code, retryable, error.to_string())
+}
+
+pub(crate) fn file_effect_store_error(error: FileEffectStoreError) -> HandError {
+    let (code, retryable) = match error {
+        FileEffectStoreError::Conflict => (HandErrorCode::BindingConflict, false),
+        FileEffectStoreError::Ambiguous => (HandErrorCode::OperationUnknown, false),
+        FileEffectStoreError::Capacity => (HandErrorCode::ResourceExhausted, false),
+        FileEffectStoreError::Invalid(_) => (HandErrorCode::InvalidRequest, false),
+        FileEffectStoreError::Io(_) => (HandErrorCode::TemporarilyUnavailable, true),
+        FileEffectStoreError::Corrupt(_) => (HandErrorCode::CapabilityUnavailable, false),
+    };
+    hand_error(code, retryable, error.to_string())
+}
+
+pub(crate) fn generation_conflict() -> HandError {
+    hand_error(
+        HandErrorCode::GenerationConflict,
+        false,
+        "request does not match the live physical generation",
+    )
 }
 
 #[cfg(test)]
