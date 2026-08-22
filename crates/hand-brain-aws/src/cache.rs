@@ -12,7 +12,7 @@ pub(crate) struct Preparation {
 
 pub(crate) struct CachedBundle {
     pub(crate) bytes: Arc<Vec<u8>>,
-    pub(crate) last_access: u64,
+    pub(crate) last_access: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -22,17 +22,30 @@ pub(crate) struct ValidatedPreparedBundle {
     pub(crate) digest: String,
 }
 
-pub(crate) struct PreparationCache {
+/// Session preparation metadata: one LRU bounded by bytes and entries.
+pub(crate) struct PreparationStore {
     pub(crate) sessions: HashMap<String, Preparation>,
     pub(crate) root_sessions: HashMap<String, HashSet<String>>,
     pub(crate) preparation_bytes: usize,
     pub(crate) max_preparation_bytes: usize,
     pub(crate) max_preparations: usize,
-    pub(crate) preparation_access_clock: AtomicU64,
+    pub(crate) access_clock: AtomicU64,
+}
+
+/// Content-addressed bundle bytes: a second, independent LRU. Lookups take `&self` (atomic
+/// access clock), so the hot install path can hold the cache read guard.
+pub(crate) struct BundleCache {
     pub(crate) bundles: HashMap<String, CachedBundle>,
     pub(crate) bundle_bytes: usize,
     pub(crate) max_bundle_bytes: usize,
-    pub(crate) access_clock: u64,
+    pub(crate) access_clock: AtomicU64,
+}
+
+/// The two caches share one lock: `install` moves entries into both against a single admission
+/// decision, and a purge must not observe one side updated without the other.
+pub(crate) struct PreparationCache {
+    pub(crate) store: PreparationStore,
+    pub(crate) bundles: BundleCache,
 }
 
 impl PreparationCache {
@@ -50,22 +63,41 @@ impl PreparationCache {
         max_preparations: usize,
     ) -> Self {
         Self {
-            sessions: HashMap::new(),
-            root_sessions: HashMap::new(),
-            preparation_bytes: 0,
-            max_preparation_bytes,
-            max_preparations,
-            preparation_access_clock: AtomicU64::new(0),
-            bundles: HashMap::new(),
-            bundle_bytes: 0,
-            max_bundle_bytes,
-            access_clock: 0,
+            store: PreparationStore {
+                sessions: HashMap::new(),
+                root_sessions: HashMap::new(),
+                preparation_bytes: 0,
+                max_preparation_bytes,
+                max_preparations,
+                access_clock: AtomicU64::new(0),
+            },
+            bundles: BundleCache {
+                bundles: HashMap::new(),
+                bundle_bytes: 0,
+                max_bundle_bytes,
+                access_clock: AtomicU64::new(0),
+            },
         }
     }
 
     pub(crate) fn get(&self, session_id: &str) -> Option<Preparation> {
+        self.store.get(session_id)
+    }
+
+    pub(crate) fn bundle(&self, digest: &str) -> Option<Arc<Vec<u8>>> {
+        self.bundles.get(digest)
+    }
+
+    /// Drops at most `limit` logical preparations and their bundle references.
+    pub(crate) fn purge_root_page(&mut self, root_id: &str, limit: usize) -> bool {
+        self.store.purge_root_page(root_id, limit)
+    }
+}
+
+impl PreparationStore {
+    pub(crate) fn get(&self, session_id: &str) -> Option<Preparation> {
         let access = self
-            .preparation_access_clock
+            .access_clock
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         self.sessions
@@ -121,12 +153,16 @@ impl PreparationCache {
                 .expect("preparation eviction candidate exists");
         }
     }
+}
 
-    pub(crate) fn bundle(&mut self, digest: &str) -> Option<Arc<Vec<u8>>> {
-        self.access_clock = self.access_clock.saturating_add(1);
-        let access = self.access_clock;
-        self.bundles.get_mut(digest).map(|bundle| {
-            bundle.last_access = access;
+impl BundleCache {
+    pub(crate) fn get(&self, digest: &str) -> Option<Arc<Vec<u8>>> {
+        let access = self
+            .access_clock
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.bundles.get(digest).map(|bundle| {
+            bundle.last_access.store(access, Ordering::Relaxed);
             bundle.bytes.clone()
         })
     }
@@ -159,7 +195,7 @@ impl PreparationCache {
                 .filter(|(digest, bundle)| {
                     !protected.contains(digest.as_str()) && Arc::strong_count(&bundle.bytes) == 1
                 })
-                .min_by_key(|(_, bundle)| bundle.last_access)
+                .min_by_key(|(_, bundle)| bundle.last_access.load(Ordering::Relaxed))
                 .map(|(digest, _)| digest.clone())
                 .ok_or_else(|| {
                     if !entries_fit && bytes_fit {
@@ -173,6 +209,23 @@ impl PreparationCache {
         }
     }
 
+    fn insert(&mut self, digest: String, bytes: Arc<Vec<u8>>) {
+        self.bundle_bytes += bytes.len();
+        let access = self
+            .access_clock
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.bundles.insert(
+            digest,
+            CachedBundle {
+                bytes,
+                last_access: AtomicU64::new(access),
+            },
+        );
+    }
+}
+
+impl PreparationCache {
     pub(crate) fn install(
         &mut self,
         request: PrepareSessionRequest,
@@ -182,6 +235,7 @@ impl PreparationCache {
         let session_id = request.session_id.to_string();
         let root_id = request.root_id.to_string();
         if self
+            .store
             .sessions
             .get(&session_id)
             .is_some_and(|old| old.request.root_id != request.root_id)
@@ -191,6 +245,7 @@ impl PreparationCache {
             ));
         }
         if self
+            .store
             .sessions
             .get(&session_id)
             .is_some_and(|old| old.public_digest != public_digest)
@@ -206,7 +261,7 @@ impl PreparationCache {
             ));
         }
         for digest in &required {
-            if !fetched.contains_key(digest) && !self.bundles.contains_key(digest) {
+            if !fetched.contains_key(digest) && !self.bundles.bundles.contains_key(digest) {
                 return Err(error(
                     HandErrorCode::CapabilityUnavailable,
                     false,
@@ -222,54 +277,54 @@ impl PreparationCache {
         let metadata_bytes = serde_jcs::to_vec(&request)
             .map_err(|_| invalid("preparation metadata cannot be bounded"))?
             .len();
-        if metadata_bytes > self.max_preparation_bytes || self.max_preparations == 0 {
-            return Err(preparation_cache_capacity_error(self.max_preparation_bytes));
+        if metadata_bytes > self.store.max_preparation_bytes || self.store.max_preparations == 0 {
+            return Err(preparation_cache_capacity_error(
+                self.store.max_preparation_bytes,
+            ));
         }
         let prior_metadata_bytes = self
+            .store
             .sessions
             .get(&session_id)
             .map_or(0, |preparation| preparation.metadata_bytes);
         let additional_bytes = metadata_bytes.saturating_sub(prior_metadata_bytes);
-        let additional_entries = usize::from(!self.sessions.contains_key(&session_id));
-        self.evict_preparations_to_fit(additional_bytes, additional_entries, &session_id)?;
+        let additional_entries = usize::from(!self.store.sessions.contains_key(&session_id));
+        self.store
+            .evict_preparations_to_fit(additional_bytes, additional_entries, &session_id)?;
 
         let missing = required
             .iter()
-            .filter(|digest| !self.bundles.contains_key(digest.as_str()))
+            .filter(|digest| !self.bundles.bundles.contains_key(digest.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         let additional_bytes = missing.iter().try_fold(0usize, |total, digest| {
             total
                 .checked_add(fetched.get(digest).expect("required fetch checked").len())
-                .ok_or_else(|| bundle_cache_capacity_error(self.max_bundle_bytes))
+                .ok_or_else(|| bundle_cache_capacity_error(self.bundles.max_bundle_bytes))
         })?;
-        self.evict_idle_to_fit(additional_bytes, missing.len(), &required)?;
+        self.bundles
+            .evict_idle_to_fit(additional_bytes, missing.len(), &required)?;
         for digest in &required {
-            if !self.bundles.contains_key(digest) {
+            if !self.bundles.bundles.contains_key(digest) {
                 let bytes = fetched.get(digest).expect("required fetch checked").clone();
-                self.bundle_bytes += bytes.len();
-                self.access_clock = self.access_clock.saturating_add(1);
-                self.bundles.insert(
-                    digest.clone(),
-                    CachedBundle {
-                        bytes,
-                        last_access: self.access_clock,
-                    },
-                );
+                self.bundles.insert(digest.clone(), bytes);
             }
-            let _ = self.bundle(digest);
+            let _ = self.bundles.get(digest);
         }
-        if self.sessions.contains_key(&session_id) {
-            self.remove_session(&session_id);
+        if self.store.sessions.contains_key(&session_id) {
+            self.store.remove_session(&session_id);
         }
-        self.preparation_access_clock
-            .fetch_add(1, Ordering::Relaxed);
-        let last_access = self.preparation_access_clock.load(Ordering::Relaxed);
-        self.preparation_bytes = self
+        let last_access = self
+            .store
+            .access_clock
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.store.preparation_bytes = self
+            .store
             .preparation_bytes
             .checked_add(metadata_bytes)
-            .ok_or_else(|| preparation_cache_capacity_error(self.max_preparation_bytes))?;
-        self.sessions.insert(
+            .ok_or_else(|| preparation_cache_capacity_error(self.store.max_preparation_bytes))?;
+        self.store.sessions.insert(
             session_id.clone(),
             Preparation {
                 request: Arc::new(request),
@@ -278,20 +333,24 @@ impl PreparationCache {
                 last_access: Arc::new(AtomicU64::new(last_access)),
             },
         );
-        self.root_sessions
+        self.store
+            .root_sessions
             .entry(root_id)
             .or_default()
             .insert(session_id);
         debug_assert_eq!(
-            self.bundle_bytes,
+            self.bundles.bundle_bytes,
             self.bundles
+                .bundles
                 .values()
                 .map(|bundle| bundle.bytes.len())
                 .sum::<usize>()
         );
         Ok(())
     }
+}
 
+impl PreparationStore {
     /// Drops at most `limit` logical preparations and their bundle references.
     pub(crate) fn purge_root_page(&mut self, root_id: &str, limit: usize) -> bool {
         let session_ids = self

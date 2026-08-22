@@ -111,8 +111,8 @@ impl SessionPreparationPort for AwsHand {
                 .bundle_fetch_reserved
                 .lock()
                 .map_err(|_| temporary("bundle fetch admission lock is unavailable"))?;
-            let cache_limit = cache.max_bundle_bytes;
-            cache.evict_idle_to_fit(
+            let cache_limit = cache.bundles.max_bundle_bytes;
+            cache.bundles.evict_idle_to_fit(
                 in_flight
                     .bytes
                     .checked_add(fetch_bytes)
@@ -125,11 +125,11 @@ impl SessionPreparationPort for AwsHand {
             )?;
             let reservation = BundleFetchReservation::admit(
                 self.bundle_fetch_reserved.clone(),
-                cache.bundle_bytes,
-                cache.bundles.len(),
+                cache.bundles.bundle_bytes,
+                cache.bundles.bundles.len(),
                 fetch_bytes,
                 missing_fetches.len(),
-                cache.max_bundle_bytes,
+                cache.bundles.max_bundle_bytes,
                 self.bundle_fetch_max_bytes,
             )?;
             (missing_fetches, reservation, resident_borrows)

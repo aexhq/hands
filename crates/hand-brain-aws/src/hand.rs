@@ -268,9 +268,11 @@ impl AwsHand {
                 .acquire()
                 .await
                 .map_err(|_| temporary("bundle installation admission is unavailable"))?;
+            // Cached bundle lookup only reads (the access clock is atomic), so concurrent
+            // installs are not serialized behind the write lock.
             let bundle = self
                 .preparation_cache
-                .write()
+                .read()
                 .await
                 .bundle(descriptor.bundle_digest.as_str())
                 .ok_or_else(|| {
@@ -458,7 +460,7 @@ impl AwsHand {
 
     async fn consume_secret_capability(&self, session_id: &str, capability_ref: &str) {
         let mut cache = self.preparation_cache.write().await;
-        let Some(preparation) = cache.sessions.get_mut(session_id) else {
+        let Some(preparation) = cache.store.sessions.get_mut(session_id) else {
             return;
         };
         if preparation
