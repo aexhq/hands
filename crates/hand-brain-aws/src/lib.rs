@@ -45,9 +45,10 @@ use brain_protocol::network::network_ceiling_is_subset;
 use futures_util::StreamExt as _;
 use hand_core::connector::{ConnectorCatalog, ConnectorClass, GatewayAuthority};
 use hand_core::materialization::{
-    AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetRegistry, DurableTargetState,
-    InstalledTarget, LaunchError, MaterializationError, MaterializationLease, PhysicalTarget,
-    PhysicalTargetLauncher, TargetKey, TargetMaterializer, TargetSpec,
+    AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetState, InstalledTarget,
+    LaunchError, MaterializationError, MaterializationLease, PhysicalTarget,
+    PhysicalTargetLauncher, TargetDirectory, TargetKey, TargetMaterializer, TargetReservations,
+    TargetSpec,
 };
 use hand_egress_gateway::{
     Capability, CapabilityDestination, DestinationProtocol, encode_signed_token,

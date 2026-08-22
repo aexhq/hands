@@ -17,9 +17,9 @@ use aws_sdk_dynamodb::types::{
 use hand_core::connector::ConnectorClass;
 use hand_core::materialization::{
     AcquireOutcome, AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetRecord,
-    DurableTargetRegistry, DurableTargetState, InstallOutcome, InstalledTarget, MAX_TARGET_PAGE,
-    MaterializationError, MaterializationLease, TARGET_KEY_PREFIX, TargetKey, TargetPage,
-    TargetSpec, materialization_poll_after,
+    DurableTargetState, InstallOutcome, InstalledTarget, MAX_TARGET_PAGE, MaterializationError,
+    MaterializationLease, TARGET_KEY_PREFIX, TargetDirectory, TargetKey, TargetPage,
+    TargetReservations, TargetSpec, materialization_poll_after,
 };
 
 const ROOT_ID: &str = "root_id";
@@ -314,7 +314,7 @@ impl DynamoTargetRegistry {
 }
 
 #[async_trait]
-impl DurableTargetRegistry for DynamoTargetRegistry {
+impl TargetReservations for DynamoTargetRegistry {
     async fn acquire(
         &self,
         request: &AcquireTarget,
@@ -531,14 +531,6 @@ impl DurableTargetRegistry for DynamoTargetRegistry {
         }
     }
 
-    async fn get(
-        &self,
-        key: &TargetKey,
-    ) -> Result<Option<DurableTargetRecord>, MaterializationError> {
-        key.validate()?;
-        self.read(key).await
-    }
-
     async fn expire_lease(
         &self,
         lease: &MaterializationLease,
@@ -600,6 +592,17 @@ impl DurableTargetRegistry for DynamoTargetRegistry {
             }
             Err(error) => Err(storage_error("expire target lease", &error)),
         }
+    }
+}
+
+#[async_trait]
+impl TargetDirectory for DynamoTargetRegistry {
+    async fn get(
+        &self,
+        key: &TargetKey,
+    ) -> Result<Option<DurableTargetRecord>, MaterializationError> {
+        key.validate()?;
+        self.read(key).await
     }
 
     async fn mark_gone(

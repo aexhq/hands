@@ -71,7 +71,7 @@ impl MemoryTargetRegistry {
 }
 
 #[async_trait]
-impl DurableTargetRegistry for MemoryTargetRegistry {
+impl TargetReservations for MemoryTargetRegistry {
     async fn acquire(
         &self,
         request: &AcquireTarget,
@@ -185,19 +185,6 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
         }
     }
 
-    async fn get(
-        &self,
-        key: &TargetKey,
-    ) -> Result<Option<DurableTargetRecord>, MaterializationError> {
-        key.validate()?;
-        Ok(self
-            .records
-            .lock()
-            .map_err(|_| poisoned())?
-            .get(key)
-            .cloned())
-    }
-
     async fn expire_lease(
         &self,
         lease: &MaterializationLease,
@@ -224,6 +211,22 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
         }
         let _ = now_ms;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl TargetDirectory for MemoryTargetRegistry {
+    async fn get(
+        &self,
+        key: &TargetKey,
+    ) -> Result<Option<DurableTargetRecord>, MaterializationError> {
+        key.validate()?;
+        Ok(self
+            .records
+            .lock()
+            .map_err(|_| poisoned())?
+            .get(key)
+            .cloned())
     }
 
     async fn mark_gone(

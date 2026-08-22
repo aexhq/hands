@@ -21,7 +21,7 @@ impl<R, L> TargetMaterializer<R, L> {
 
 impl<R, L> TargetMaterializer<R, L>
 where
-    R: DurableTargetRegistry,
+    R: TargetReservations,
     L: PhysicalTargetLauncher,
 {
     /// No caller may dispatch a guest effect until this returns `InstalledTarget`.

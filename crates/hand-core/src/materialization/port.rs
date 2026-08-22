@@ -2,9 +2,13 @@
 
 use super::*;
 
-/// Durable storage operations needed by target materialization.
+/// The reservation lifecycle the [`TargetMaterializer`] composes: acquire a durable reservation,
+/// install the launched target, and expire a known-no-effect lease. Every implementation must
+/// also uphold the plane capacity invariant: `acquire` charges `spec.materialized_mib` against
+/// the plane quota in the same durable transaction as the reservation, and exactly one of
+/// `expire_lease`, `mark_gone`, or `mark_terminated` refunds it.
 #[async_trait]
-pub trait DurableTargetRegistry: Send + Sync {
+pub trait TargetReservations: Send + Sync {
     async fn acquire(
         &self,
         request: &AcquireTarget,
@@ -17,18 +21,24 @@ pub trait DurableTargetRegistry: Send + Sync {
         now_ms: u64,
     ) -> Result<InstallOutcome, MaterializationError>;
 
-    async fn get(
-        &self,
-        key: &TargetKey,
-    ) -> Result<Option<DurableTargetRecord>, MaterializationError>;
-
-    /// Removes a known-no-effect failed launch attempt. Outcome-unknown launches retain the exact
-    /// provider request and idempotency token so a later attempt can recover the same target.
+    /// Removes a known-no-effect failed launch attempt and refunds its charged capacity.
+    /// Outcome-unknown launches retain the exact provider request and idempotency token so a
+    /// later attempt can recover the same target.
     async fn expire_lease(
         &self,
         lease: &MaterializationLease,
         now_ms: u64,
     ) -> Result<(), MaterializationError>;
+}
+
+/// Lifecycle and administrative reads/transitions over installed durable records. `mark_gone`
+/// and `mark_terminated` refund the record's charged plane capacity exactly once.
+#[async_trait]
+pub trait TargetDirectory: Send + Sync {
+    async fn get(
+        &self,
+        key: &TargetKey,
+    ) -> Result<Option<DurableTargetRecord>, MaterializationError>;
 
     async fn mark_gone(
         &self,
@@ -51,6 +61,10 @@ pub trait DurableTargetRegistry: Send + Sync {
         limit: usize,
     ) -> Result<TargetPage, MaterializationError>;
 }
+
+/// Convenience bound for stores that provide the complete registry contract.
+pub trait DurableTargetRegistry: TargetReservations + TargetDirectory {}
+impl<T: TargetReservations + TargetDirectory> DurableTargetRegistry for T {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalTarget {

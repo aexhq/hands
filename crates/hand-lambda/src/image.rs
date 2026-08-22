@@ -433,11 +433,11 @@ pub async fn publish(
     let description = publish_description(&cfg.source_sha, &request_fingerprint);
     let existing_arn = find_image_arn(control, &cfg.name).await?;
 
-    if let Some(arn) = existing_arn.as_deref() {
-        if let Some(version) = resumable_version(control, arn, &description).await? {
-            tracing::info!(%arn, source_sha = %cfg.source_sha, "resuming existing source publication");
-            return wait_for_build(control, arn, &version, &description).await;
-        }
+    if let Some(arn) = existing_arn.as_deref()
+        && let Some(version) = resumable_version(control, arn, &description).await?
+    {
+        tracing::info!(%arn, source_sha = %cfg.source_sha, "resuming existing source publication");
+        return wait_for_build(control, arn, &version, &description).await;
     }
 
     let uri = upload_context(s3, cfg, &key, zip).await?;
