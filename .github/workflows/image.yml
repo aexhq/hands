@@ -121,7 +121,7 @@ jobs:
         with:
           shared-key: release-aarch64-build
       - name: Build aarch64 guest and publisher
-        run: cargo build -p hand-guest -p hand-lambda --release
+        run: cargo build -p hand-guest -p hand-lambda --release --locked
       - name: Seal release binaries
         run: |
           mkdir hand-image-binaries

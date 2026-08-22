@@ -35,9 +35,14 @@ pub async fn run(State(hand): State<Arc<Hand>>, body: String) -> (StatusCode, Js
             );
         }
     };
-    let target_ref = envelope
-        .microvm_id
-        .unwrap_or_else(|| payload.generation.clone());
+    // Every real caller sends microvmId; inventing a target from the generation would
+    // surface later as baffling GenerationConflicts far from this hook. Refuse at the door.
+    let Some(target_ref) = envelope.microvm_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the run envelope is missing microvmId"})),
+        );
+    };
     match hand.arm(target_ref, payload).await {
         Ok(replayed) => (StatusCode::OK, Json(json!({"replayed": replayed}))),
         Err(error) => (
