@@ -924,6 +924,38 @@ mod tests {
         }
     }
 
+    /// CI's isolation and security jobs prove `image/Dockerfile`; production ships THIS
+    /// generated one. If the pins drift apart, CI keeps proving properties of an image
+    /// production no longer runs — so the dev Dockerfile must carry the same identities.
+    #[test]
+    fn the_dev_dockerfile_carries_the_production_pins() {
+        let dev = include_str!("../../../image/Dockerfile");
+        assert!(
+            dev.contains(&format!("https://nodejs.org/dist/v{NODE_VERSION}/")),
+            "image/Dockerfile installs Node {NODE_VERSION}"
+        );
+        assert!(
+            dev.contains(NODE_ARM64_SHA256),
+            "image/Dockerfile pins the same ARM64 Node archive"
+        );
+        assert!(
+            dev.contains(&format!("npm@{NPM_VERSION}")),
+            "image/Dockerfile installs npm {NPM_VERSION}"
+        );
+        for shared in [
+            "HAND_SUPERVISOR_UID=1001",
+            "HAND_TOOL_UID=1000",
+            "HAND_TOOL_GID=1000",
+            "HAND_LISTEN=0.0.0.0:8080",
+            "PATH=/workspace/.hand/bin:/workspace/.hand/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ] {
+            assert!(
+                dev.contains(shared) && dockerfile().contains(shared),
+                "shared image contract line missing from one Dockerfile: {shared}"
+            );
+        }
+    }
+
     #[test]
     fn the_dockerfile_is_pinned_and_serves_one_port_as_root_boot() {
         assert_eq!(MVP_TARGET_MEMORY_MIB, 1_024);

@@ -143,3 +143,12 @@ impl Config {
         Ok(())
     }
 }
+
+/// Wall-clock epoch milliseconds. A pre-epoch system clock would silently disable target
+/// expiry and skew deadline math if clamped to zero, so it fails loudly instead.
+pub fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the system clock is before the Unix epoch")
+        .as_millis() as u64
+}

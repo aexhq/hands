@@ -317,8 +317,10 @@ async fn execute_bundle_inner(request: &BundleExecution) -> Result<ExecutionResu
         stdout_settled,
         stderr_settled
     );
-    let stdout = stdout.unwrap_or_default();
-    let stderr = stderr.unwrap_or_default();
+    // Diagnostics only: the framed fd-3 result is authoritative here, so a failed or torn
+    // diagnostic stream deliberately degrades to empty rather than failing the operation.
+    let stdout = stdout.and_then(std::io::Result::ok).unwrap_or_default();
+    let stderr = stderr.and_then(std::io::Result::ok).unwrap_or_default();
     let exit_code = status.code().map(i64::from);
     let result_bytes = result_bytes.map_err(|_| Failure::Message {
         message: diagnostic("Tool runner produced no result", &stdout, &stderr),
@@ -463,6 +465,16 @@ async fn execute_shell_inner(request: &ShellExecution) -> Result<ExecutionResult
         });
     };
     let exit_code = status.code().map(i64::from);
+    // These bytes are the operation's authoritative output: a pipe error is a failed
+    // operation, never a Completed receipt carrying silently truncated output.
+    let stdout = stdout.map_err(|error| Failure::Message {
+        message: format!("sandbox stdout stream failed: {error}"),
+        exit_code,
+    })?;
+    let stderr = stderr.map_err(|error| Failure::Message {
+        message: format!("sandbox stderr stream failed: {error}"),
+        exit_code,
+    })?;
     if stdout.len().saturating_add(stderr.len()) > output_limit {
         return Err(Failure::Message {
             message: "sandbox output exceeds the sealed output ceiling".into(),
@@ -504,12 +516,7 @@ fn enforce_inline_bound(
     Ok(())
 }
 
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+use crate::config::wall_ms;
 
 fn execution_deadline_at(
     now_ms: u64,
@@ -604,7 +611,9 @@ async fn settle_result_reader(
     }
 }
 
-async fn settle_bounded_reader(mut task: tokio::task::JoinHandle<Vec<u8>>) -> Option<Vec<u8>> {
+async fn settle_bounded_reader(
+    mut task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Option<std::io::Result<Vec<u8>>> {
     match tokio::time::timeout(POST_CHILD_IO_TIMEOUT, &mut task).await {
         Ok(Ok(bytes)) => Some(bytes),
         _ => {
@@ -903,16 +912,18 @@ async fn reap_process_group(process_id: u32) {
     }
 }
 
-async fn read_bounded<R>(reader: Option<R>, limit: usize) -> Vec<u8>
+async fn read_bounded<R>(reader: Option<R>, limit: usize) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let Some(reader) = reader else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut bytes = Vec::new();
-    let _ = reader.take(limit as u64).read_to_end(&mut bytes).await;
-    bytes
+    // A mid-stream read error must surface: in the shell path these bytes ARE the
+    // authoritative result, and partial output reported as Completed is a silent lie.
+    reader.take(limit as u64).read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 #[cfg(unix)]

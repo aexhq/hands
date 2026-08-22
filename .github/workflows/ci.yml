@@ -42,7 +42,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-build
-      - run: cargo build --workspace --all-targets
+      - run: cargo build --workspace --all-targets --locked
 
   clippy:
     runs-on: ubuntu-24.04
@@ -106,7 +106,7 @@ jobs:
         with:
           shared-key: ci-linux-image
       - name: Build guest (native)
-        run: cargo build -p hand-guest --release
+        run: cargo build -p hand-guest --release --locked
       - name: Build native image
         run: docker build -f image/Dockerfile --build-arg BIN=target/release/hand-guest -t hand:ci .
       - name: Seal native image

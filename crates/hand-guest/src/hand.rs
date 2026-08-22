@@ -1912,12 +1912,7 @@ fn canonical_equal<T: serde::Serialize>(left: &T, right: &T) -> Result<bool, Han
     Ok(left == right)
 }
 
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+use crate::config::wall_ms;
 
 fn operation_error(error: OperationError) -> HandError {
     let code = match error {
