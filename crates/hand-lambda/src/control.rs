@@ -341,28 +341,6 @@ impl Control {
         }
     }
 
-    /// Launches one MicroVM attempt. AWS defines `client_token` as this request's idempotency key.
-    /// The caller durably seals the token and every RunMicrovm parameter before dispatch and
-    /// replays that byte-identical request after an ambiguous response. The returned target must
-    /// still be durably installed before any guest effect is sent.
-    pub async fn run(
-        &self,
-        image_arn: &str,
-        image_version: &str,
-        run_hook_payload: &str,
-        client_token: &str,
-        egress_connector: &ConnectorRef,
-    ) -> Result<Microvm, ControlError> {
-        let request = self.exact_run_request(
-            image_arn,
-            image_version,
-            run_hook_payload,
-            client_token,
-            egress_connector,
-        );
-        self.run_exact(&request).await
-    }
-
     /// Validates a sealed request without comparing it to mutable deployment defaults. An old
     /// in-flight reservation must replay its exact image version and connector ARN after a Hand
     /// rollout, provided those immutable provider resources still exist.

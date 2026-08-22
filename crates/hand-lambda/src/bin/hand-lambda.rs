@@ -61,6 +61,14 @@ enum ImageCommand {
     Status {
         name: String,
     },
+    /// Exits non-zero when the version's recorded MicroVM base is no longer the newest managed
+    /// base version (AWS retires bases on its own calendar; an EXPIRED base cannot run).
+    RebuildDue {
+        #[arg(long)]
+        image_arn: String,
+        #[arg(long)]
+        image_version: String,
+    },
     Dockerfile,
     /// Destructive dev release gate: launches and always terminates one exact image version.
     Canary {
@@ -241,6 +249,19 @@ async fn image_command(
             println!("{}\t{}", published.image_arn, published.image_version);
             Ok(())
         }
+        ImageCommand::RebuildDue {
+            image_arn,
+            image_version,
+        } => match image::rebuild_due(control, &image_arn, &image_version).await? {
+            Some(newest) => bail!(
+                "rebuild due: managed base version {newest} is newer than the recorded base of \
+                 {image_arn}@{image_version}"
+            ),
+            None => {
+                println!("current");
+                Ok(())
+            }
+        },
         ImageCommand::Status { name } => {
             let Some(arn) = image::find_image_arn(control, &name).await? else {
                 bail!("no image named {name}");

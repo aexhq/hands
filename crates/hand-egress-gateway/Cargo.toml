@@ -14,18 +14,15 @@ workspace = true
 [dependencies]
 brain-protocol.workspace = true
 base64.workspace = true
-hex.workspace = true
 hickory-resolver.workspace = true
 idna.workspace = true
 ipnet.workspace = true
 p256.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

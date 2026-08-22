@@ -1638,7 +1638,6 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "zeroize",
 ]
 
@@ -1667,15 +1666,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "brain-protocol",
- "hex",
  "hickory-resolver",
  "idna",
  "ipnet",
  "p256",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1747,7 +1743,6 @@ dependencies = [
  "hand-core",
  "serde",
  "serde_jcs",
- "serde_json",
  "zeroize",
 ]
 

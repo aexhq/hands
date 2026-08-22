@@ -934,20 +934,8 @@ fn diagnostic(prefix: &str, stdout: &[u8], stderr: &[u8]) -> String {
             message.push_str(&format!("\n{name}: {}", String::from_utf8_lossy(bytes)));
         }
     }
-    truncate_utf8(&mut message, MAX_DIAGNOSTIC_BYTES);
+    crate::errors::truncate_utf8(&mut message, MAX_DIAGNOSTIC_BYTES);
     message
-}
-
-#[cfg(unix)]
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
 }
 
 fn failure(

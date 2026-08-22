@@ -40,7 +40,6 @@ pub struct Config {
     pub listen: SocketAddr,
     pub workspace: PathBuf,
     pub state_dir: PathBuf,
-    pub binding_dir: PathBuf,
     pub tool_dir: PathBuf,
     pub object_dir: PathBuf,
     pub tool_runner: PathBuf,
@@ -77,7 +76,6 @@ impl Config {
         let config = Self {
             listen,
             workspace,
-            binding_dir: state_dir.join("bindings"),
             object_dir: state_dir.join("objects"),
             state_dir,
             tool_dir,
@@ -98,7 +96,6 @@ impl Config {
             listen: "127.0.0.1:0".parse().expect("test listener"),
             workspace: root.join("workspace"),
             state_dir: root.join("state"),
-            binding_dir: root.join("state/bindings"),
             tool_dir: root.join("state/tools"),
             object_dir: root.join("state/objects"),
             tool_runner: PathBuf::from("image/tool-runner.mjs"),

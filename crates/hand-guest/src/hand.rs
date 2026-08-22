@@ -219,7 +219,6 @@ impl Hand {
     pub fn new(cfg: Config) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&cfg.workspace)?;
         std::fs::create_dir_all(&cfg.state_dir)?;
-        std::fs::create_dir_all(&cfg.binding_dir)?;
         std::fs::create_dir_all(&cfg.tool_dir)?;
         std::fs::create_dir_all(&cfg.object_dir)?;
         let acknowledgement_dir = cfg.state_dir.join("ops");
@@ -952,7 +951,7 @@ impl Hand {
         }
         let lock = file_effect_lock_index(&request.effect.operation_id);
         let _guard = self.file_effect_locks[lock].lock().await;
-        match self.claim_file_effect_inner(request.effect.clone()).await? {
+        match self.claim_file_effect(request.effect.clone()).await? {
             FileEffectReservation::Replay(result) => return Ok(*result),
             FileEffectReservation::New => {}
         }
@@ -1030,30 +1029,6 @@ impl Hand {
         &self,
         identity: FileEffectIdentity,
     ) -> Result<FileEffectReservation, HandError> {
-        self.reserve_file_effect_inner(identity).await
-    }
-
-    pub async fn claim_file_effect(
-        &self,
-        identity: FileEffectIdentity,
-    ) -> Result<FileEffectReservation, HandError> {
-        self.claim_file_effect_inner(identity).await
-    }
-
-    pub async fn complete_file_effect(
-        &self,
-        result: FileEffectStoredResult,
-    ) -> Result<FileEffectStoredResult, HandError> {
-        let identity = file_effect_result_identity(&result)?;
-        let lock = file_effect_lock_index(&identity.operation_id);
-        let _guard = self.file_effect_locks[lock].lock().await;
-        self.complete_file_effect_inner(identity, result).await
-    }
-
-    async fn reserve_file_effect_inner(
-        &self,
-        identity: FileEffectIdentity,
-    ) -> Result<FileEffectReservation, HandError> {
         let store = self.file_effects.clone();
         blocking_hand(move || {
             store
@@ -1067,7 +1042,7 @@ impl Hand {
         .await
     }
 
-    async fn claim_file_effect_inner(
+    pub async fn claim_file_effect(
         &self,
         identity: FileEffectIdentity,
     ) -> Result<FileEffectReservation, HandError> {
@@ -1082,6 +1057,16 @@ impl Hand {
                 .map_err(file_effect_store_error)
         })
         .await
+    }
+
+    pub async fn complete_file_effect(
+        &self,
+        result: FileEffectStoredResult,
+    ) -> Result<FileEffectStoredResult, HandError> {
+        let identity = file_effect_result_identity(&result)?;
+        let lock = file_effect_lock_index(&identity.operation_id);
+        let _guard = self.file_effect_locks[lock].lock().await;
+        self.complete_file_effect_inner(identity, result).await
     }
 
     async fn complete_file_effect_inner(

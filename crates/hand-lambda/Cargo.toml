@@ -1,7 +1,7 @@
 [package]
 name = "hand-lambda"
 version = "0.1.0"
-description = "Hand host mechanics for AWS Lambda MicroVMs: image pipeline, lifecycle control, endpoint auth, launch, keepalive, and probe"
+description = "Hand host mechanics for AWS Lambda MicroVMs: image pipeline, lifecycle control, endpoint auth, and launch"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

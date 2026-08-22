@@ -35,7 +35,7 @@ pub fn hand_error(code: HandErrorCode, retryable: bool, message: impl Into<Strin
     }
 }
 
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
+pub(crate) fn truncate_utf8(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
         return;
     }

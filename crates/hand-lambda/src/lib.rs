@@ -14,9 +14,9 @@
 //! - [`control`] — typed lifecycle calls (`RunMicrovm`/`Get`/`Suspend`/`Resume`/`Terminate`,
 //!   `CreateMicrovmAuthToken`) with explicit retryable, throttled, unknown-effect, gone and fatal
 //!   classifications. State-changing 5xx/transport failures are never called safe retries.
-//! - [`launch`] — launch (or adopt) a VM, deliver its immutable secret-free target seal through
-//!   the run hook, mint a short-lived provider endpoint JWE, keep active work alive, and probe
-//!   (speculative resume) on message admission.
+//! - [`launch`] — exact-replay launch against a durably sealed request, delivery of the
+//!   immutable secret-free target seal through the run hook, readiness waiting, and the guest
+//!   WebSocket connect. The Hand deliberately has no independent keepalive loop.
 
 pub mod canary;
 pub mod control;

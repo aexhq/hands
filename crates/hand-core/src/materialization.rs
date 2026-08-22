@@ -28,7 +28,7 @@ const CONTROL_TOKEN_PREFIX: &str = "control-";
 const CONTROL_TOKEN_HEX_BYTES: usize = 32;
 
 /// Generation-scoped bearer for the in-guest supervisor channel. The provider JWE authenticates
-/// traffic at the public MicroVM endpoint, but an untrusted Tool shares the guest network
+/// traffic at the public provider endpoint, but an untrusted Tool shares the guest network
 /// namespace and can bypass that proxy. This second bearer is delivered only in the sealed run
 /// payload and retained with the installed routing row. It is never exposed through Brain's
 /// public Hand contract, formatting, logs, or Tool environments.
@@ -91,7 +91,7 @@ impl Drop for ControlToken {
 
 /// Exact provider request retained only while a target is materializing. It can contain a
 /// short-lived private-network bearer, so formatting is always redacted and dropped storage is
-/// zeroized. The registry persists these bytes before RunMicrovm and removes them on install.
+/// zeroized. The registry persists these bytes before provider dispatch and removes them on install.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DurableLaunchRequest(String);
@@ -596,7 +596,7 @@ pub enum LaunchError {
         retry_after_ms: u64,
         message: String,
     },
-    /// The platform attested that no MicroVM was launched. The lease may be shortened safely.
+    /// The platform attested that no physical target was launched. The lease may be shortened safely.
     #[error("launch rejected before a target was created: {0}")]
     KnownNoTarget(String),
     /// A dependency failed before provider dispatch, so no target exists and capacity may be
@@ -1300,7 +1300,7 @@ mod tests {
             panic!("first worker acquires")
         };
         let orphan = physical("mvm-idle-orphan", "guest-generation-old");
-        // Crash here: RunMicrovm returned, but no install CAS and therefore no code path has the
+        // Crash here: the provider launch returned, but no install CAS and therefore no code path has the
         // InstalledTarget proof accepted by the dispatcher.
         assert_eq!(effects.load(Ordering::SeqCst), 0);
 
@@ -1376,7 +1376,7 @@ mod tests {
         };
         assert!(!first_lease.recovery_attempt);
         let first_target = provider.run(&first_lease);
-        // Crash after AWS accepted RunMicrovm and returned the target, before the install CAS.
+        // Crash after the provider accepted the launch and returned the target, before the install CAS.
 
         let retry = request(102, "reservation-unused", "generation-unused");
         let AcquireOutcome::Acquired(recovery_lease) = registry.acquire(&retry).await.unwrap()

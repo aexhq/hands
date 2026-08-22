@@ -7,5 +7,5 @@ pub mod connector;
 pub mod files;
 pub mod materialization;
 pub mod operation;
+pub mod page;
 pub mod resources;
-pub mod target;

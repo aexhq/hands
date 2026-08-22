@@ -693,7 +693,7 @@ pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Opt
 }
 
 /// Grumble: `SdkError` Display hides the service message; this pulls it out.
-fn detail<E: ProvideErrorMetadataExt, R>(
+fn detail<E: aws_sdk_lambdamicrovms::error::ProvideErrorMetadata, R>(
     e: &aws_sdk_lambdamicrovms::error::SdkError<E, R>,
 ) -> String {
     match e {
@@ -705,10 +705,6 @@ fn detail<E: ProvideErrorMetadataExt, R>(
         other => other.to_string(),
     }
 }
-
-/// Alias so the helpers stay generic over every operation's error type.
-pub trait ProvideErrorMetadataExt: aws_sdk_lambdamicrovms::error::ProvideErrorMetadata {}
-impl<T: aws_sdk_lambdamicrovms::error::ProvideErrorMetadata> ProvideErrorMetadataExt for T {}
 
 #[cfg(test)]
 mod tests {
