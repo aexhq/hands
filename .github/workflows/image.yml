@@ -85,11 +85,11 @@ jobs:
           EXPECTED_COMMIT: ${{ inputs.expected_commit }}
         run: bash scripts/verify-release-source.sh "$EXPECTED_COMMIT"
       - name: Verify the immutable Brain revision
-        run: test "$(bash scripts/pinned-brain-revision.sh)" = "23f71d6148b9fcf81b031517fafe8c4b411d9119"
+        run: test "$(bash scripts/pinned-brain-revision.sh)" = "8fbc42569d1e3bbe1af9b1e6e2e1bcc517de432b"
       - uses: actions/checkout@v7
         with:
           repository: aexhq/brain
-          ref: 23f71d6148b9fcf81b031517fafe8c4b411d9119
+          ref: 8fbc42569d1e3bbe1af9b1e6e2e1bcc517de432b
           path: brain
       - uses: actions/setup-node@v7
         with:
