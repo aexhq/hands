@@ -74,11 +74,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Verify the immutable Brain revision
-        run: test "$(bash scripts/pinned-brain-revision.sh)" = "8fbc42569d1e3bbe1af9b1e6e2e1bcc517de432b"
+        run: test "$(bash scripts/pinned-brain-revision.sh)" = "61561d468eafb192f3515a4f7b14c6488da11690"
       - uses: actions/checkout@v7
         with:
           repository: aexhq/brain
-          ref: 8fbc42569d1e3bbe1af9b1e6e2e1bcc517de432b
+          ref: 61561d468eafb192f3515a4f7b14c6488da11690
           path: brain
       - uses: actions/setup-node@v7
         with:
