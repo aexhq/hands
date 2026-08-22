@@ -349,7 +349,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
-        assert_eq!(cache.bundle_bytes, 3);
+        assert_eq!(cache.bundles.bundle_bytes, 3);
         assert_eq!(cache.bundle(&digest).unwrap().as_slice(), &[1, 2, 3]);
 
         assert!(!cache.purge_root_page("root-1", 1));
@@ -367,7 +367,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, HandErrorCode::ResourceExhausted);
-        assert_eq!(cache.bundle_bytes, 3);
+        assert_eq!(cache.bundles.bundle_bytes, 3);
         drop(borrowed);
 
         cache
@@ -379,7 +379,7 @@ mod tests {
             .unwrap();
         assert!(cache.bundle(&digest).is_none());
         assert_eq!(cache.bundle(&replacement).unwrap().as_slice(), &[4, 5, 6]);
-        assert_eq!(cache.bundle_bytes, 3);
+        assert_eq!(cache.bundles.bundle_bytes, 3);
     }
 
     #[test]
@@ -415,8 +415,8 @@ mod tests {
         assert!(cache.get("session-1").is_some());
         assert!(cache.get("session-2").is_none());
         assert!(cache.get("session-3").is_some());
-        assert_eq!(cache.sessions.len(), 2);
-        assert!(cache.preparation_bytes <= metadata_bytes * 2);
+        assert_eq!(cache.store.sessions.len(), 2);
+        assert!(cache.store.preparation_bytes <= metadata_bytes * 2);
         assert!(!cache.root_sessions.contains_key("root-2"));
     }
 
