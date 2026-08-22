@@ -86,7 +86,10 @@ impl Hand {
                     // unlock and await cannot be missed.
                     notified.as_mut().enable();
                     drop(writes);
-                    if tokio::time::timeout_at(wait_deadline, notified).await.is_err() {
+                    if tokio::time::timeout_at(wait_deadline, notified)
+                        .await
+                        .is_err()
+                    {
                         return Err(unavailable(
                             "an exact stdin write is still completing; observe and retry",
                         ));

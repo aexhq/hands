@@ -215,7 +215,24 @@ impl GuestClient {
                         if response.request_id != frame.request_id {
                             continue;
                         }
-                        return response.result.map_err(Into::into);
+                        return match response.result {
+                            // A reply variant that does not answer this request's method is a
+                            // protocol contract violation, not a transient fault: replaying it
+                            // reproduces the exact mismatch.
+                            Ok(reply) if reply.method() != frame.call.method() => {
+                                Err(RpcAttemptError::Hand(error(
+                                    HandErrorCode::InvalidRequest,
+                                    false,
+                                    format!(
+                                        "guest answered {} with a {} reply",
+                                        frame.call.method(),
+                                        reply.method()
+                                    ),
+                                )))
+                            }
+                            Ok(reply) => Ok(reply),
+                            Err(refusal) => Err(refusal.into()),
+                        };
                     }
                     Err(temporary("Hand connection ended before its receipt").into())
                 })

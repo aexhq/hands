@@ -65,7 +65,10 @@ impl Hand {
         }
         let lock = file_effect_lock_index(&request.effect.operation_id);
         let _guard = self.effects.locks[lock].lock().await;
-        match self.claim_file_effect_unlocked(request.effect.clone()).await? {
+        match self
+            .claim_file_effect_unlocked(request.effect.clone())
+            .await?
+        {
             FileEffectReservation::Replay(result) => return Ok(*result),
             FileEffectReservation::New => {}
         }

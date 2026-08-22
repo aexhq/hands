@@ -137,6 +137,57 @@ pub enum ResponseReply {
     WriteStdin(WriteStdinReceipt),
 }
 
+impl RequestCall {
+    /// The wire method tag. Lets an ingress pair a reply to its request until the protocol gains
+    /// typed request/reply association (tracked on the Brain rewrite backlog).
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Submit(_) => "submit",
+            Self::Observe(_) => "observe",
+            Self::Cancel(_) => "cancel",
+            Self::AcknowledgeTerminal(_) => "acknowledge_terminal",
+            Self::Status => "status",
+            Self::ListFiles(_) => "list_files",
+            Self::StatFile(_) => "stat_file",
+            Self::ReadFile(_) => "read_file",
+            Self::WriteFile(_) => "write_file",
+            Self::ReserveFileEffect(_) => "reserve_file_effect",
+            Self::ClaimFileEffect(_) => "claim_file_effect",
+            Self::CompleteFileEffect(_) => "complete_file_effect",
+            Self::FindFiles(_) => "find_files",
+            Self::GrepFiles(_) => "grep_files",
+            Self::ExecuteSandbox(_) => "execute_sandbox",
+            Self::WriteStdin(_) => "write_stdin",
+        }
+    }
+}
+
+impl ResponseReply {
+    /// The wire method tag carried by this reply; must equal the request's [`RequestCall::method`].
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Submit(_) => "submit",
+            Self::Observe(_) => "observe",
+            Self::Cancel(_) => "cancel",
+            Self::AcknowledgeTerminal(_) => "acknowledge_terminal",
+            Self::Status(_) => "status",
+            Self::ListFiles(_) => "list_files",
+            Self::StatFile(_) => "stat_file",
+            Self::ReadFile(_) => "read_file",
+            Self::WriteFile(_) => "write_file",
+            Self::ReserveFileEffect(_) => "reserve_file_effect",
+            Self::ClaimFileEffect(_) => "claim_file_effect",
+            Self::CompleteFileEffect(_) => "complete_file_effect",
+            Self::FindFiles(_) => "find_files",
+            Self::GrepFiles(_) => "grep_files",
+            Self::ExecuteSandbox(_) => "execute_sandbox",
+            Self::WriteStdin(_) => "write_stdin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetRuntimeStatus {
