@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;

@@ -261,7 +261,7 @@ impl Hand {
             .identities
             .lock()
             .await
-            .allocate(request.binding_ref.as_str(), self.cfg.tool_identity)?;
+            .allocate(request.binding_ref.as_str(), self.cfg.sandboxing.identity())?;
         bindings.insert(
             request.binding_ref.to_string(),
             InstalledBinding {

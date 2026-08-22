@@ -52,7 +52,11 @@ impl Hand {
                 environment: execution.environment,
                 proxy_environment: execution.target.proxy_environment,
                 identity: execution.identity,
-                boundary_library: self.cfg.tool_boundary_library.clone(),
+                boundary_library: self
+                    .cfg
+                    .sandboxing
+                    .boundary_library()
+                    .map(Path::to_path_buf),
                 target_expires_at_ms: execution.target.expires_at_ms,
                 cancellation,
             };
@@ -270,8 +274,12 @@ impl Hand {
                 max_output_bytes: request.resources.max_output_bytes.get(),
                 interactive: request.input.interactive,
                 proxy_environment: target.proxy_environment,
-                identity: self.cfg.tool_identity,
-                boundary_library: self.cfg.tool_boundary_library.clone(),
+                identity: self.cfg.sandboxing.identity(),
+                boundary_library: self
+                    .cfg
+                    .sandboxing
+                    .boundary_library()
+                    .map(Path::to_path_buf),
                 target_expires_at_ms: target.expires_at_ms,
                 cancellation,
                 control,

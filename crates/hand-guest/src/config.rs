@@ -35,6 +35,38 @@ pub struct ToolIdentity {
     pub supervisor_uid: u32,
 }
 
+/// Whether the kernel Tool boundary is enforced. Production always enforces; the plain test
+/// harness runs unenforced. The half-configured combinations (an identity without a boundary
+/// library, or the reverse) are unrepresentable, so validation cannot be skipped by accident.
+#[derive(Debug, Clone)]
+pub enum Sandboxing {
+    Enforced {
+        identity: ToolIdentity,
+        boundary_library: PathBuf,
+    },
+    Unenforced,
+}
+
+impl Sandboxing {
+    #[must_use]
+    pub fn identity(&self) -> Option<ToolIdentity> {
+        match self {
+            Self::Enforced { identity, .. } => Some(*identity),
+            Self::Unenforced => None,
+        }
+    }
+
+    #[must_use]
+    pub fn boundary_library(&self) -> Option<&Path> {
+        match self {
+            Self::Enforced {
+                boundary_library, ..
+            } => Some(boundary_library),
+            Self::Unenforced => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -43,8 +75,7 @@ pub struct Config {
     pub tool_dir: PathBuf,
     pub object_dir: PathBuf,
     pub tool_runner: PathBuf,
-    pub tool_boundary_library: Option<PathBuf>,
-    pub tool_identity: Option<ToolIdentity>,
+    pub sandboxing: Sandboxing,
 }
 
 impl Config {
@@ -80,12 +111,14 @@ impl Config {
             state_dir,
             tool_dir,
             tool_runner,
-            tool_boundary_library: Some(tool_boundary_library),
-            tool_identity: Some(ToolIdentity {
-                supervisor_uid: parse_id(ENV_SUPERVISOR_UID)?,
-                uid: parse_id(ENV_TOOL_UID)?,
-                gid: parse_id(ENV_TOOL_GID)?,
-            }),
+            sandboxing: Sandboxing::Enforced {
+                identity: ToolIdentity {
+                    supervisor_uid: parse_id(ENV_SUPERVISOR_UID)?,
+                    uid: parse_id(ENV_TOOL_UID)?,
+                    gid: parse_id(ENV_TOOL_GID)?,
+                },
+                boundary_library: tool_boundary_library,
+            },
         };
         config.validate()?;
         Ok(config)
@@ -99,13 +132,16 @@ impl Config {
             tool_dir: root.join("state/tools"),
             object_dir: root.join("state/objects"),
             tool_runner: PathBuf::from("image/tool-runner.mjs"),
-            tool_boundary_library: None,
-            tool_identity: None,
+            sandboxing: Sandboxing::Unenforced,
         }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let Some(identity) = self.tool_identity else {
+        let Sandboxing::Enforced {
+            identity,
+            boundary_library,
+        } = &self.sandboxing
+        else {
             return Ok(());
         };
         anyhow::ensure!(
@@ -118,14 +154,10 @@ impl Config {
                 && identity.supervisor_uid < MANAGED_BINDING_UID_MIN,
             "configured supervisor and sandbox uids overlap the managed-binding uid range"
         );
-        let boundary = self
-            .tool_boundary_library
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Tool boundary library is required"))?;
         anyhow::ensure!(
-            boundary.is_file(),
+            boundary_library.is_file(),
             "Tool boundary library is unavailable: {}",
-            boundary.display()
+            boundary_library.display()
         );
         #[cfg(unix)]
         {
