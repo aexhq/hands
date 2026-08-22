@@ -142,13 +142,19 @@ fn seal_canary_run(
     Ok((seal, payload))
 }
 
+/// One canary's exact launch identity: the immutable image version plus the connector class ref
+/// it must run behind.
+struct CanaryLaunch<'a> {
+    image_arn: &'a str,
+    image_version: &'a str,
+    connector: &'a ConnectorRef,
+}
+
 /// Launches the sealed target, runs the proof body against it, and always terminates the target,
 /// merging proof and cleanup outcomes so neither failure can mask the other.
 async fn with_canary_target<Fut>(
     control: &Control,
-    image_arn: &str,
-    image_version: &str,
-    connector: &ConnectorRef,
+    launch: CanaryLaunch<'_>,
     label: &str,
     seal: KnownTargetSeal,
     payload: &RunPayload,
@@ -159,11 +165,11 @@ where
 {
     let vm = launch_canary_target(
         control,
-        image_arn,
-        image_version,
+        launch.image_arn,
+        launch.image_version,
         &serde_json::to_string(payload)?,
         &format!("hands-{}", seal.operation_id),
-        connector,
+        launch.connector,
     )
     .await
     .with_context(|| format!("launching the {label} canary"))?;
@@ -288,9 +294,11 @@ async fn run_restricted_network_canary(
     )?;
     with_canary_target(
         control,
-        image_arn,
-        image_version,
-        connector,
+        CanaryLaunch {
+            image_arn,
+            image_version,
+            connector,
+        },
         &format!("{label} connector"),
         seal,
         &payload,
@@ -353,9 +361,11 @@ async fn run_public_network_canary(
     )?;
     with_canary_target(
         control,
-        &cfg.image_arn,
-        &cfg.image_version,
-        cfg.connectors.resolve(ConnectorClass::Public),
+        CanaryLaunch {
+            image_arn: &cfg.image_arn,
+            image_version: &cfg.image_version,
+            connector: cfg.connectors.resolve(ConnectorClass::Public),
+        },
         "direct-public network",
         seal,
         &payload,
@@ -406,9 +416,11 @@ pub async fn run_no_respawn_canary(
     )?;
     with_canary_target(
         control,
-        &cfg.image_arn,
-        &cfg.image_version,
-        &cfg.none_connector,
+        CanaryLaunch {
+            image_arn: &cfg.image_arn,
+            image_version: &cfg.image_version,
+            connector: &cfg.none_connector,
+        },
         "no-respawn image",
         seal,
         &payload,
