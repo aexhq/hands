@@ -21,7 +21,7 @@ use aws_sdk_lambdamicrovms::types::{
 };
 use sha2::Digest as _;
 
-use crate::AGENT_PORT;
+use crate::{AGENT_PORT, SUPERVISOR_UID, TOOL_GID, TOOL_UID};
 use crate::control::Control;
 
 /// The container base, pinned by digest (resolved from public ECR on 2026-08-18). A tag is a
@@ -156,7 +156,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     userdel -f ubuntu 2>/dev/null || true; \
     groupdel ubuntu 2>/dev/null || true; \
-    useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 --user-group agent \
+    useradd --create-home --home-dir /home/agent --shell /bin/bash --uid {TOOL_UID} --user-group agent \
     && groupadd --gid 1001 hand \
     && useradd --uid 1001 --gid hand --groups agent --no-create-home --home-dir /nonexistent hand \
     && mkdir -p /workspace /var/hand/ops /var/hand/bindings /var/hand/objects /var/hand/file-staging /var/hand/tools /usr/local/lib/hand \
@@ -202,7 +202,7 @@ RUN chown root:hand /usr/local/bin/hand-guest \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/tool-boundary.so)" = "0:0:555" \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/proc-secret-static)" = "0:0:555" \
     && ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP \
-    && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:1001:750" \
+    && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:{SUPERVISOR_UID}:750" \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(getcap -r / 2>/dev/null)"
 
@@ -939,11 +939,11 @@ mod tests {
             "image/Dockerfile installs npm {NPM_VERSION}"
         );
         for shared in [
-            "HAND_SUPERVISOR_UID=1001",
-            "HAND_TOOL_UID=1000",
-            "HAND_TOOL_GID=1000",
-            "HAND_LISTEN=0.0.0.0:8080",
-            "PATH=/workspace/.hand/bin:/workspace/.hand/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            &format!("HAND_SUPERVISOR_UID={SUPERVISOR_UID}"),
+            &format!("HAND_TOOL_UID={TOOL_UID}"),
+            &format!("HAND_TOOL_GID={TOOL_GID}"),
+            &format!("HAND_LISTEN=0.0.0.0:{AGENT_PORT}"),
+            &"PATH=/workspace/.hand/bin:/workspace/.hand/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         ] {
             assert!(
                 dev.contains(shared) && dockerfile().contains(shared),
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(MVP_TARGET_MEMORY_MIB, 1_024);
         let df = dockerfile();
         assert!(df.contains("@sha256:"), "base must be digest-pinned");
-        assert!(df.contains("EXPOSE 8080"));
+        assert!(df.contains(&format!("EXPOSE {AGENT_PORT}")));
         assert!(df.contains(&format!("node-v{NODE_VERSION}-linux-arm64.tar.xz")));
         assert!(df.contains(NODE_ARM64_SHA256));
         assert!(df.contains(&format!(r#"test "$(node --version)" = "v{NODE_VERSION}""#)));
@@ -987,9 +987,13 @@ mod tests {
         assert!(boot.contains("umask 0002"));
         assert!(!df.contains("setcap cap_kill,cap_setuid,cap_setgid=ep"));
         assert!(df.contains("control-listener.c"));
-        assert!(df.contains("0:1001:750"));
+        assert!(df.contains(&format!("0:{SUPERVISOR_UID}:750")));
         assert!(df.contains("chown hand:agent /var/hand"));
         assert!(df.contains("chmod 0710 /var/hand"));
+        assert!(listener.contains(&format!("CONTROL_PORT = {AGENT_PORT},")));
+        assert!(listener.contains(&format!("SUPERVISOR_UID = {SUPERVISOR_UID},")));
+        assert!(listener.contains(&format!("SUPERVISOR_GID = {SUPERVISOR_UID},")));
+        assert!(listener.contains(&format!("\"0.0.0.0:{AGENT_PORT}\"")));
         assert!(listener.contains("setenv(\"HAND_LISTEN_FD\", listener_number, 1)"));
         assert!(listener.contains("PR_SET_KEEPCAPS"));
         assert!(listener.contains("PR_CAP_AMBIENT_RAISE"));
@@ -1010,6 +1014,24 @@ mod tests {
         assert!(df.contains(r#"stat -c '%d:%g' /workspace"#));
         assert!(df.contains(r#"stat -c '%a' /var/hand/file-staging)" = 2700"#));
         assert!(boot.contains("swapon"));
+
+        // CI's adversarial guest-runtime jobs prove `image/hand-boot.sh`; production boots the
+        // generated script. The shared boundary properties must never drift apart.
+        let dev_boot = include_str!("../../../image/hand-boot.sh");
+        let port_reserve = format!("$(( {AGENT_PORT} + 1 ))");
+        for (name, script) in [("generated", boot.as_str()), ("image/hand-boot.sh", dev_boot)] {
+            for property in [
+                "ip_unprivileged_port_start",
+                port_reserve.as_str(),
+                "unprivileged_userns_clone",
+                "max_user_namespaces",
+                "ulimit -c 0",
+                "umask 0002",
+                "exec /usr/local/lib/hand/control-listener /usr/local/bin/hand-guest",
+            ] {
+                assert!(script.contains(property), "{name} lost: {property}");
+            }
+        }
     }
 
     #[test]

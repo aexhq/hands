@@ -27,8 +27,16 @@ pub mod launch;
 pub const REGION: &str = "us-east-1";
 
 /// The single guest port: lifecycle hooks, probe, and the ABI WebSocket. Matches the port the
-/// image registration declares and the endpoint auth token is scoped to.
+/// image registration declares and the endpoint auth token is scoped to. `image/control-listener.c`
+/// and `image/hand-boot.sh` carry the same value; the image conformance tests pin them together.
 pub const AGENT_PORT: u16 = 8080;
+
+/// The sandbox identity split baked into both images and the C launcher: the trusted Hand
+/// supervisor uid/gid and the untrusted Tool uid/gid. The image conformance tests pin the
+/// Dockerfiles and `image/control-listener.c` to these values.
+pub const SUPERVISOR_UID: u32 = 1001;
+pub const TOOL_UID: u32 = 1000;
+pub const TOOL_GID: u32 = 1000;
 
 /// Idle policy: AWS suspends the VM after this much endpoint-traffic silence.
 pub const MAX_IDLE_SECONDS: u64 = 180;
