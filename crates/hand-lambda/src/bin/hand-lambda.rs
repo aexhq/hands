@@ -155,10 +155,7 @@ async fn image_command(
             none_connector,
             confirm_dev_image_canary,
         } => {
-            anyhow::ensure!(
-                confirm_dev_image_canary,
-                "--confirm-dev-image-canary is required"
-            );
+            debug_assert!(confirm_dev_image_canary, "clap enforces the flag");
             let http = hand_lambda::endpoint_http_client_builder().build()?;
             run_no_respawn_canary(
                 control,
@@ -181,10 +178,7 @@ async fn image_command(
             customer_hand_hosts,
             confirm_dev_network_canary,
         } => {
-            anyhow::ensure!(
-                confirm_dev_network_canary,
-                "--confirm-dev-network-canary is required"
-            );
+            debug_assert!(confirm_dev_network_canary, "clap enforces the flag");
             let customer_hand_hosts: [String; 2] =
                 customer_hand_hosts.try_into().map_err(|_| {
                     anyhow::anyhow!(
@@ -220,11 +214,8 @@ async fn image_command(
         } => {
             let bytes =
                 std::fs::read(&binary).with_context(|| format!("reading {}", binary.display()))?;
-            anyhow::ensure!(
-                bytes.len() > 19 && bytes[..4] == [0x7f, b'E', b'L', b'F'] && bytes[18] == 0xb7,
-                "{} is not an aarch64 ELF binary",
-                binary.display()
-            );
+            image::validate_aarch64_elf(&bytes)
+                .with_context(|| format!("validating {}", binary.display()))?;
             let zip = image::pack_zip(&bytes)?;
             let s3 = aws_sdk_s3::Client::new(aws);
             let published = image::publish(
@@ -261,19 +252,10 @@ async fn image_command(
             let Some(arn) = image::find_image_arn(control, &name).await? else {
                 bail!("no image named {name}");
             };
-            let versions = control
-                .sdk()
-                .list_microvm_image_versions()
-                .image_identifier(&arn)
-                .send()
-                .await?;
-            for version in versions.items() {
+            for version in image::version_summaries(control, &arn).await? {
                 println!(
-                    "{}\t{:?}\t{:?}\tbase={}",
-                    version.image_version(),
-                    version.state(),
-                    version.status(),
-                    version.base_image_version().unwrap_or("?")
+                    "{}\t{}\t{}\tbase={}",
+                    version.version, version.state, version.status, version.base_version
                 );
             }
             Ok(())

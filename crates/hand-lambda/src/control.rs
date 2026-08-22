@@ -292,10 +292,10 @@ impl Control {
                     tracing::debug!(
                         attempt,
                         delay_ms = delay.as_millis(),
+                        %message,
                         "provider throttled lifecycle operation"
                     );
                     tokio::time::sleep(delay).await;
-                    let _ = message;
                 }
                 result => return result,
             }
@@ -510,7 +510,7 @@ impl Control {
             .ok_or_else(|| ControlError::Fatal("response carried no auth token".into()))
     }
 
-    pub async fn list(&self) -> Result<Vec<Microvm>, ControlError> {
+    pub async fn list(&self) -> Result<Vec<MicrovmSummary>, ControlError> {
         let mut vms = Vec::new();
         let mut next: Option<String> = None;
         loop {
@@ -522,10 +522,9 @@ impl Control {
                 .await
                 .map_err(|e| read_error(&e))?;
             for item in out.items() {
-                vms.push(Microvm {
+                vms.push(MicrovmSummary {
                     id: item.microvm_id().to_owned(),
                     state: item.state().clone(),
-                    endpoint: None,
                 });
             }
             next = out.next_token().map(str::to_owned);
@@ -535,13 +534,21 @@ impl Control {
         }
     }
 
-    pub fn sdk(&self) -> &Client {
+    pub(crate) fn sdk(&self) -> &Client {
         &self.client
     }
 
     pub fn region(&self) -> &str {
         &self.region
     }
+}
+
+/// A listing row. `ListMicrovms` does not return endpoints, so the summary deliberately has no
+/// endpoint field instead of an ambiguous `None`.
+#[derive(Debug, Clone)]
+pub struct MicrovmSummary {
+    pub id: String,
+    pub state: MicrovmState,
 }
 
 /// Whether a VM state means the hand can never come back.
@@ -601,7 +608,7 @@ fn effect_error<E: ProvideErrorMetadata, R>(e: &SdkError<E, R>) -> ControlError 
     sdk_error(e, true)
 }
 
-fn read_error<E: ProvideErrorMetadata, R>(e: &SdkError<E, R>) -> ControlError {
+pub(crate) fn read_error<E: ProvideErrorMetadata, R>(e: &SdkError<E, R>) -> ControlError {
     sdk_error(e, false)
 }
 

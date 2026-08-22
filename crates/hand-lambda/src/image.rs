@@ -21,7 +21,7 @@ use aws_sdk_lambdamicrovms::types::{
 };
 use sha2::Digest as _;
 
-use crate::control::Control;
+use crate::control::{Control, ControlError, read_error};
 use crate::{AGENT_PORT, SUPERVISOR_UID, TOOL_GID, TOOL_UID};
 
 /// The container base, pinned by digest (resolved from public ECR on 2026-08-18). A tag is a
@@ -459,7 +459,7 @@ async fn resumable_version(
         .image_identifier(arn)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("list_microvm_image_versions: {}", detail(&e)))?;
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("list_microvm_image_versions"))?;
     Ok(versions
         .items()
         .iter()
@@ -562,7 +562,7 @@ async fn register_image(
             sdk.update_microvm_image().image_identifier(&arn),
             &client_token
         )
-        .map_err(|e| anyhow::anyhow!("update_microvm_image: {}", detail(&e)))?;
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("update_microvm_image"))?;
         Ok((out.image_arn().to_owned(), out.image_version().to_owned()))
     } else {
         let client_token = publish_client_token(
@@ -573,7 +573,7 @@ async fn register_image(
             key,
         );
         let out = with_image_spec!(sdk.create_microvm_image().name(&cfg.name), &client_token)
-            .map_err(|e| anyhow::anyhow!("create_microvm_image: {}", detail(&e)))?;
+            .map_err(|e| anyhow::Error::new(read_error(&e)).context("create_microvm_image"))?;
         Ok((out.image_arn().to_owned(), out.image_version().to_owned()))
     }
 }
@@ -589,13 +589,29 @@ pub async fn wait_for_build(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
     let sdk = control.sdk();
     loop {
-        let version = sdk
+        let version = match sdk
             .get_microvm_image_version()
             .image_identifier(image_arn)
             .image_version(image_version)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("get_microvm_image_version: {}", detail(&e)))?;
+            .map_err(|e| read_error(&e))
+        {
+            Ok(version) => version,
+            // A transient read failure must not abort a build that AWS is still running.
+            Err(ControlError::Retryable(cause) | ControlError::Throttled(cause)) => {
+                tracing::debug!(%cause, "image build state read deferred");
+                anyhow::ensure!(
+                    tokio::time::Instant::now() <= deadline,
+                    "image build did not finish within 30 minutes"
+                );
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("get_microvm_image_version"));
+            }
+        };
         anyhow::ensure!(
             version.description() == Some(expected_description),
             "accepted image version does not match the requested source publication"
@@ -639,7 +655,7 @@ pub async fn rebuild_due(
         .image_version(image_version)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("get_microvm_image_version: {}", detail(&e)))?;
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("get_microvm_image_version"))?;
     let base_arn = ours.base_image_arn().to_owned();
     let our_base = ours.base_image_version().unwrap_or("0").to_owned();
     let managed = sdk
@@ -647,7 +663,9 @@ pub async fn rebuild_due(
         .image_identifier(&base_arn)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("list_managed_microvm_image_versions: {}", detail(&e)))?;
+        .map_err(|e| {
+            anyhow::Error::new(read_error(&e)).context("list_managed_microvm_image_versions")
+        })?;
     let newest = managed
         .items()
         .iter()
@@ -667,6 +685,49 @@ fn version_ord(v: &str) -> (u64, u64) {
     (major, minor)
 }
 
+/// Rejects any guest binary that is not an aarch64 ELF before packing: the MicroVM image is
+/// ARM64-only, and a wrong-architecture binary would fail only inside AWS's build minutes later.
+pub fn validate_aarch64_elf(bytes: &[u8]) -> anyhow::Result<()> {
+    const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+    const EM_AARCH64: u8 = 0xb7;
+    anyhow::ensure!(
+        bytes.len() > 19 && bytes[..4] == ELF_MAGIC && bytes[18] == EM_AARCH64,
+        "guest binary is not an aarch64 ELF"
+    );
+    Ok(())
+}
+
+/// One printable row per registered version of an image.
+pub struct VersionSummary {
+    pub version: String,
+    pub state: String,
+    pub status: String,
+    pub base_version: String,
+}
+
+pub async fn version_summaries(
+    control: &Control,
+    image_arn: &str,
+) -> anyhow::Result<Vec<VersionSummary>> {
+    let versions = control
+        .sdk()
+        .list_microvm_image_versions()
+        .image_identifier(image_arn)
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("list_microvm_image_versions"))?;
+    Ok(versions
+        .items()
+        .iter()
+        .map(|version| VersionSummary {
+            version: version.image_version().to_owned(),
+            state: format!("{:?}", version.state()),
+            status: format!("{:?}", version.status()),
+            base_version: version.base_image_version().unwrap_or("?").to_owned(),
+        })
+        .collect())
+}
+
 /// The ARN of the image named `name`, if it exists. Accepts an ARN and returns it unchanged.
 pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Option<String>> {
     if name.starts_with("arn:") {
@@ -680,7 +741,7 @@ pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Opt
             .set_next_token(next)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("list_microvm_images: {}", detail(&e)))?;
+            .map_err(|e| anyhow::Error::new(read_error(&e)).context("list_microvm_images"))?;
         for item in out.items() {
             if item.name() == name {
                 return Ok(Some(item.image_arn().to_owned()));
@@ -690,20 +751,6 @@ pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Opt
         if next.is_none() {
             return Ok(None);
         }
-    }
-}
-
-/// Grumble: `SdkError` Display hides the service message; this pulls it out.
-fn detail<E: aws_sdk_lambdamicrovms::error::ProvideErrorMetadata, R>(
-    e: &aws_sdk_lambdamicrovms::error::SdkError<E, R>,
-) -> String {
-    match e {
-        aws_sdk_lambdamicrovms::error::SdkError::ServiceError(s) => format!(
-            "{}: {}",
-            s.err().code().unwrap_or("service error"),
-            s.err().message().unwrap_or("no message")
-        ),
-        other => other.to_string(),
     }
 }
 
