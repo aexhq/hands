@@ -18,6 +18,9 @@ pub const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 7_607;
 pub const MAX_ENCODED_TOKEN_BYTES: usize = 10 * 1024;
 const MAX_DER_SIGNATURE_BYTES: usize = 72;
 pub const MAX_DESTINATIONS: usize = 128;
+/// `CapabilityError::Invalid` carries only static text, so the bound's message lives beside the
+/// bound it names.
+const MAX_DESTINATIONS_MESSAGE: &str = "destinations must contain between 1 and 128 entries";
 pub const MAX_GENERATION_LIFETIME_MS: u64 = 8 * 60 * 60 * 1000;
 const CLOCK_SKEW_MS: u64 = 60_000;
 
@@ -74,9 +77,7 @@ pub fn unsigned_capability_bytes(capability: &Capability) -> Result<Vec<u8>, Cap
         return Err(CapabilityError::Lifetime);
     }
     if capability.destinations.is_empty() || capability.destinations.len() > MAX_DESTINATIONS {
-        return Err(CapabilityError::Invalid(
-            "destinations must contain between 1 and 128 entries",
-        ));
+        return Err(CapabilityError::Invalid(MAX_DESTINATIONS_MESSAGE));
     }
     let mut canonical = capability.clone();
     for destination in &mut canonical.destinations {

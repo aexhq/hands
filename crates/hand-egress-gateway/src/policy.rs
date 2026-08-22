@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+pub const MAX_PORTS_PER_DESTINATION: usize = 32;
+
 use brain_protocol::network::is_public_unicast;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::{RData, Record};
@@ -43,7 +45,7 @@ impl ValidatedPolicy {
     pub(crate) fn new(destinations: &[CapabilityDestination]) -> Result<Self, PolicyError> {
         let mut validated = Vec::new();
         for destination in destinations {
-            if destination.ports.is_empty() || destination.ports.len() > 32 {
+            if destination.ports.is_empty() || destination.ports.len() > MAX_PORTS_PER_DESTINATION {
                 return Err(PolicyError::MalformedPolicy);
             }
             let mut ports = destination.ports.clone();
