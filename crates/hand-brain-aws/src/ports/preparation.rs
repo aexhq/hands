@@ -34,12 +34,12 @@ impl SessionPreparationPort for AwsHand {
         if request.target.kind != TargetKind::Default || request.target.sandbox_id.is_some() {
             return Err(invalid("default sandbox target is required"));
         }
-        let preparation = self.preparation(request.target.session_id.as_str()).await?;
-        if preparation.request.root_id != request.target.root_id {
-            return Err(binding_error(
-                "default sandbox target does not belong to the prepared root",
-            ));
-        }
+        let preparation = self
+            .preparation_for_root(
+                request.target.session_id.as_str(),
+                request.target.root_id.as_str(),
+            )
+            .await?;
         require_exact_root_seal(&request, &preparation.request)?;
         let installed = self
             .materialize(

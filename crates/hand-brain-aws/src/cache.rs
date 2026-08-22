@@ -38,6 +38,7 @@ pub(crate) struct BundleCache {
     pub(crate) bundles: HashMap<String, CachedBundle>,
     pub(crate) bundle_bytes: usize,
     pub(crate) max_bundle_bytes: usize,
+    pub(crate) max_bundles: usize,
     pub(crate) access_clock: AtomicU64,
 }
 
@@ -75,6 +76,7 @@ impl PreparationCache {
                 bundles: HashMap::new(),
                 bundle_bytes: 0,
                 max_bundle_bytes,
+                max_bundles: MAX_CACHED_BUNDLES,
                 access_clock: AtomicU64::new(0),
             },
         }
@@ -185,7 +187,7 @@ impl BundleCache {
                 .bundles
                 .len()
                 .checked_add(additional_entries)
-                .is_some_and(|total| total <= MAX_CACHED_BUNDLES);
+                .is_some_and(|total| total <= self.max_bundles);
             if bytes_fit && entries_fit {
                 return Ok(());
             }

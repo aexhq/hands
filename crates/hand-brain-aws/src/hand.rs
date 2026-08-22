@@ -2,11 +2,49 @@
 
 use crate::*;
 
+/// One artifact recorded as installed on a live physical target. A typed set instead of
+/// prefix-tagged strings, so the two installation namespaces cannot collide or be typo'd.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum InstalledArtifact {
+    Bundle { binding_ref: String, digest: String },
+    SessionSecrets { session_id: String },
+}
+
+/// The two legal routing shapes of one submit envelope, normalized at the boundary so the rest
+/// of the adapter never re-checks the paired options.
+enum SubmitRoute<'a> {
+    Established {
+        target_ref: &'a str,
+        generation: &'a str,
+    },
+    Lazy,
+}
+
+fn submit_route(envelope: &brain_protocol::hand::OperationEnvelope) -> HandResult<SubmitRoute<'_>> {
+    match (&envelope.target_ref, &envelope.generation) {
+        (Some(target_ref), Some(generation)) => Ok(SubmitRoute::Established {
+            target_ref: target_ref.as_str(),
+            generation: generation.as_str(),
+        }),
+        (None, None) => Ok(SubmitRoute::Lazy),
+        _ => Err(invalid(
+            "target_ref and generation must either both be absent or both be present",
+        )),
+    }
+}
+
+/// Whether the provider still holds (or may still hold) memory for a physical target.
+enum ProviderLiveness {
+    Absent,
+    Terminating,
+    Live,
+}
+
 /// The canonical production implementation of Brain's Hand ports.
 pub struct AwsHand {
     pub(crate) plane: Arc<HandPlane>,
     pub(crate) preparation_cache: RwLock<PreparationCache>,
-    pub(crate) prepared_targets: RwLock<HashMap<String, HashSet<String>>>,
+    pub(crate) prepared_targets: RwLock<HashMap<String, HashSet<InstalledArtifact>>>,
     pub(crate) secret_install_locks: [Mutex<()>; SECRET_INSTALL_LOCK_SHARDS],
     pub(crate) file_effect_locks: [Mutex<()>; FILE_EFFECT_LOCK_SHARDS],
     pub(crate) secret_delivery: StdRwLock<Option<Arc<dyn SecretDeliveryPort>>>,
@@ -37,6 +75,25 @@ impl AwsHand {
             bundle_install_permits: Semaphore::new(MAX_CONCURRENT_BUNDLE_INSTALLS),
             secret_install_permits: Semaphore::new(MAX_CONCURRENT_SECRET_INSTALLS),
         })
+    }
+
+    /// Composition-root self-check: call after wiring so a missing secret-delivery port fails
+    /// deployment startup instead of the first secret-bearing operation deep inside a session.
+    pub fn verify_composed(&self) -> HandResult<()> {
+        let attached = self
+            .secret_delivery
+            .read()
+            .map_err(|_| temporary("secret delivery lock is unavailable"))?
+            .is_some();
+        if attached {
+            Ok(())
+        } else {
+            Err(error(
+                HandErrorCode::CapabilityUnavailable,
+                false,
+                "secret delivery port is not attached",
+            ))
+        }
     }
 
     /// Completes the deliberate Brain↔Hand composition cycle. It must be called before a session
@@ -124,14 +181,17 @@ impl AwsHand {
         request: &SubmitRequest,
     ) -> HandResult<InstalledTarget> {
         let envelope = &request.envelope;
-        match (&envelope.target_ref, &envelope.generation) {
-            (Some(target_ref), Some(generation)) => {
+        let route = submit_route(envelope)?;
+        let prep = self
+            .preparation_for_root(envelope.session_id.as_str(), envelope.root_id.as_str())
+            .await?;
+        validate_operation_root_seal(envelope, &prep.request)?;
+        match route {
+            SubmitRoute::Established {
+                target_ref,
+                generation,
+            } => {
                 // Hot path: Brain journaled this receipt. Do not read or write DynamoDB.
-                let prep = self.preparation(envelope.session_id.as_str()).await?;
-                if prep.request.root_id != envelope.root_id {
-                    return Err(binding_error("prepared root does not match operation root"));
-                }
-                validate_operation_root_seal(envelope, &prep.request)?;
                 let spec = target_spec(
                     &self.plane.cfg,
                     &prep.request.resources,
@@ -143,21 +203,14 @@ impl AwsHand {
                 // guest network namespace. Resolve that durable row even for an established
                 // operation so a restarted Hand never invents or loses the bearer.
                 let installed = self
-                    .resolve_target(&default_target(envelope)?, Some(generation.as_str()))
+                    .resolve_target(&default_target(envelope)?, Some(generation))
                     .await?;
-                if installed.target_ref != target_ref.as_str()
-                    || installed.spec_digest != spec.digest()
-                {
+                if installed.target_ref != target_ref || installed.spec_digest != spec.digest() {
                     return Err(generation_error());
                 }
                 Ok(installed)
             }
-            (None, None) => {
-                let prep = self.preparation(envelope.session_id.as_str()).await?;
-                if prep.request.root_id != envelope.root_id {
-                    return Err(binding_error("prepared root does not match operation root"));
-                }
-                validate_operation_root_seal(envelope, &prep.request)?;
+            SubmitRoute::Lazy => {
                 self.materialize(
                     TargetKey::for_default_target(envelope.root_id.as_str())
                         .map_err(materialization_error)?,
@@ -169,10 +222,23 @@ impl AwsHand {
                 )
                 .await
             }
-            _ => Err(invalid(
-                "target_ref and generation must either both be absent or both be present",
-            )),
         }
+    }
+
+    /// The prepared session for one exact root; a session prepared under a different root can
+    /// never route this operation.
+    pub(crate) async fn preparation_for_root(
+        &self,
+        session_id: &str,
+        root_id: &str,
+    ) -> HandResult<Preparation> {
+        let prep = self.preparation(session_id).await?;
+        if prep.request.root_id.as_str() != root_id {
+            return Err(binding_error(
+                "prepared session does not belong to the operation root",
+            ));
+        }
+        Ok(prep)
     }
 
     pub(crate) async fn materialize(
@@ -249,17 +315,13 @@ impl AwsHand {
                 "managed binding has no immutable bundle",
             )
         })?;
-        let install_key = format!(
-            "{}:{}",
-            envelope.binding_ref.as_str(),
-            descriptor.bundle_digest.as_str()
-        );
+        let install_key = InstalledArtifact::Bundle {
+            binding_ref: envelope.binding_ref.to_string(),
+            digest: descriptor.bundle_digest.to_string(),
+        };
         let installed = self
-            .prepared_targets
-            .read()
-            .await
-            .get(&route.target_ref)
-            .is_some_and(|items| items.contains(&install_key));
+            .already_installed(&route.target_ref, &install_key)
+            .await;
         if !installed {
             // Brain's maximum Tool bundle is 4 MiB. Bound concurrent transient request-body
             // copies in the hosted process and buffered bodies in a 1-GiB guest when many first
@@ -356,7 +418,9 @@ impl AwsHand {
         if !required {
             return Ok(());
         }
-        let installed_key = format!("secret-session:{}", envelope.session_id.as_str());
+        let installed_key = InstalledArtifact::SessionSecrets {
+            session_id: envelope.session_id.to_string(),
+        };
         if self
             .already_installed(&route.target_ref, &installed_key)
             .await
@@ -457,12 +521,12 @@ impl AwsHand {
         Ok(())
     }
 
-    async fn already_installed(&self, target_ref: &str, installed_key: &str) -> bool {
+    async fn already_installed(&self, target_ref: &str, artifact: &InstalledArtifact) -> bool {
         self.prepared_targets
             .read()
             .await
             .get(target_ref)
-            .is_some_and(|items| items.contains(installed_key))
+            .is_some_and(|items| items.contains(artifact))
     }
 
     async fn consume_secret_capability(&self, session_id: &str, capability_ref: &str) {
@@ -576,30 +640,39 @@ impl AwsHand {
         // Every retry reconciles provider state before another state-changing call. In
         // particular, `Terminating` is not considered absent: it may still consume account memory
         // and the registry capacity counter must remain charged until termination is confirmed.
-        match self.plane.control.get(&installed.target_ref).await {
-            Err(ControlError::Gone(_)) => {}
-            Ok(vm) if is_terminated(&vm.state) => {}
-            Ok(vm) if vm.state == aws_sdk_lambdamicrovms::types::MicrovmState::Terminating => {
-                return Err(temporary("sandbox termination is still in progress"));
+        match self.provider_liveness(&installed.target_ref).await? {
+            ProviderLiveness::Absent => Ok(()),
+            ProviderLiveness::Terminating => {
+                Err(temporary("sandbox termination is still in progress"))
             }
-            Ok(_) => match self.plane.control.terminate(&installed.target_ref).await {
-                Ok(()) | Err(ControlError::Unknown(_)) => {
-                    match self.plane.control.get(&installed.target_ref).await {
-                        Err(ControlError::Gone(_)) => {}
-                        Ok(vm) if is_terminated(&vm.state) => {}
-                        _ => {
-                            return Err(temporary(
-                                "sandbox termination outcome is not yet confirmed",
-                            ));
+            ProviderLiveness::Live => {
+                match self.plane.control.terminate(&installed.target_ref).await {
+                    Ok(()) | Err(ControlError::Unknown(_)) => {
+                        match self.provider_liveness(&installed.target_ref).await? {
+                            ProviderLiveness::Absent => Ok(()),
+                            ProviderLiveness::Terminating | ProviderLiveness::Live => Err(
+                                temporary("sandbox termination outcome is not yet confirmed"),
+                            ),
                         }
                     }
+                    Err(ControlError::Gone(_)) => Ok(()),
+                    Err(error_value) => Err(control_error(error_value)),
                 }
-                Err(ControlError::Gone(_)) => {}
-                Err(error_value) => return Err(control_error(error_value)),
-            },
-            Err(error_value) => return Err(control_error(error_value)),
+            }
         }
-        Ok(())
+    }
+
+    /// One provider-state classification for every accounting decision in this adapter.
+    async fn provider_liveness(&self, target_ref: &str) -> HandResult<ProviderLiveness> {
+        match self.plane.control.get(target_ref).await {
+            Err(ControlError::Gone(_)) => Ok(ProviderLiveness::Absent),
+            Ok(vm) if is_terminated(&vm.state) => Ok(ProviderLiveness::Absent),
+            Ok(vm) if vm.state == aws_sdk_lambdamicrovms::types::MicrovmState::Terminating => {
+                Ok(ProviderLiveness::Terminating)
+            }
+            Ok(_) => Ok(ProviderLiveness::Live),
+            Err(error_value) => Err(control_error(error_value)),
+        }
     }
 
     async fn forget_target(&self, installed: &InstalledTarget) {
