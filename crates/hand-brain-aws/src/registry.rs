@@ -16,10 +16,11 @@ use aws_sdk_dynamodb::types::{
 };
 use hand_core::connector::ConnectorClass;
 use hand_core::materialization::{
-    AcquireOutcome, AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetRecord,
-    DurableTargetState, InstallOutcome, InstalledTarget, MAX_TARGET_PAGE, MaterializationError,
-    MaterializationLease, TARGET_KEY_PREFIX, TargetDirectory, TargetKey, TargetPage,
-    TargetReservations, TargetSpec, materialization_poll_after,
+    AcquireOutcome, AcquireTarget, ControlToken, Disposition, DurableLaunchRequest,
+    DurableTargetRecord, DurableTargetState, InstallOutcome, InstalledTarget, MAX_REASON_BYTES,
+    MAX_TARGET_PAGE, MaterializationError, MaterializationLease, TARGET_KEY_PREFIX,
+    TargetDirectory, TargetKey, TargetPage, TargetReservations, TargetSpec,
+    materialization_poll_after,
 };
 
 const ROOT_ID: &str = "root_id";
@@ -27,8 +28,9 @@ const TARGET_KEY: &str = "target_key";
 const STATE: &str = "state";
 const MATERIALIZING: &str = "materializing";
 const INSTALLED: &str = "installed";
-const GONE: &str = "gone";
-const TERMINATED: &str = "terminated";
+const CLOSED: &str = "closed";
+const DISPOSITION_LOST: &str = "lost";
+const DISPOSITION_TERMINATED: &str = "terminated";
 const LAUNCH_REQUEST: &str = "launch_request";
 const CONTROL_TOKEN: &str = "control_token";
 const ATTEMPT_ID: &str = "attempt_id";
@@ -122,7 +124,7 @@ impl DynamoTargetRegistry {
                  expires_at_ms = :expires, launch_request = :launch_request, \
                  attempt_id = :attempt_id, attempt_expires_at_ms = :attempt_expires, \
                  updated_at_ms = :now \
-                 REMOVE target_ref, control_token, installed_at_ms, reason, gone_at_ms, terminated_at_ms, \
+                 REMOVE target_ref, control_token, installed_at_ms, reason, disposition, at_ms, \
                  expires_at_s",
             )
             .expression_attribute_names("#state", STATE)
@@ -232,7 +234,8 @@ impl DynamoTargetRegistry {
                 AttributeValue::S(request.key.target_key.clone()),
             )
             .condition_expression(
-                "#state = :gone AND generation = :old_generation AND spec_digest = :spec_digest",
+                "#state = :closed AND disposition = :lost AND generation = :old_generation \
+                 AND spec_digest = :spec_digest",
             )
             .update_expression(
                 "SET #state = :materializing, reservation_id = :reservation, \
@@ -240,11 +243,12 @@ impl DynamoTargetRegistry {
                  expires_at_ms = :expires, launch_request = :launch_request, \
                  attempt_id = :attempt_id, attempt_expires_at_ms = :attempt_expires, \
                  updated_at_ms = :now \
-                 REMOVE target_ref, control_token, installed_at_ms, reason, gone_at_ms, terminated_at_ms, \
+                 REMOVE target_ref, control_token, installed_at_ms, reason, disposition, at_ms, \
                  expires_at_s",
             )
             .expression_attribute_names("#state", STATE)
-            .expression_attribute_values(":gone", s(GONE))
+            .expression_attribute_values(":closed", s(CLOSED))
+            .expression_attribute_values(":lost", s(DISPOSITION_LOST))
             .expression_attribute_values(":old_generation", s(&current.generation))
             .expression_attribute_values(":spec_digest", s(&lease.spec_digest))
             .expression_attribute_values(":materializing", s(MATERIALIZING))
@@ -293,13 +297,10 @@ impl DynamoTargetRegistry {
             .table_name(&self.table)
             .key(ROOT_ID, s(&key.root_id))
             .key(TARGET_KEY, s(&key.target_key))
-            .condition_expression(
-                "generation = :generation AND (#state = :gone OR #state = :terminated)",
-            )
+            .condition_expression("generation = :generation AND #state = :closed")
             .expression_attribute_names("#state", STATE)
             .expression_attribute_values(":generation", s(generation))
-            .expression_attribute_values(":gone", s(GONE))
-            .expression_attribute_values(":terminated", s(TERMINATED))
+            .expression_attribute_values(":closed", s(CLOSED))
             .send()
             .await;
         match result {
@@ -376,7 +377,13 @@ impl TargetReservations for DynamoTargetRegistry {
             if request.generation_is_fenced
                 && current.generation != lease.generation
                 && !(request.replace_after_loss
-                    && matches!(&current.state, DurableTargetState::Gone { .. }))
+                    && matches!(
+                        &current.state,
+                        DurableTargetState::Closed {
+                            disposition: Disposition::Lost,
+                            ..
+                        }
+                    ))
             {
                 return Err(MaterializationError::SpecConflict);
             }
@@ -427,7 +434,10 @@ impl TargetReservations for DynamoTargetRegistry {
                         return Ok(AcquireOutcome::Acquired(recovered));
                     }
                 }
-                DurableTargetState::Gone { .. } if request.replace_after_loss => {
+                DurableTargetState::Closed {
+                    disposition: Disposition::Lost,
+                    ..
+                } if request.replace_after_loss => {
                     if self.replace_gone_default(&current, request, &lease).await? {
                         return Ok(AcquireOutcome::Acquired(lease));
                     }
@@ -437,7 +447,13 @@ impl TargetReservations for DynamoTargetRegistry {
                     let unchanged = self.read(&request.key).await?.is_some_and(|latest| {
                         latest.generation == current.generation
                             && latest.spec_digest == current.spec_digest
-                            && matches!(latest.state, DurableTargetState::Gone { .. })
+                            && matches!(
+                                latest.state,
+                                DurableTargetState::Closed {
+                                    disposition: Disposition::Lost,
+                                    ..
+                                }
+                            )
                     });
                     if unchanged {
                         let reserved_mib = self.reserved_capacity().await?;
@@ -450,8 +466,14 @@ impl TargetReservations for DynamoTargetRegistry {
                         }
                     }
                 }
-                DurableTargetState::Gone { .. } => return Ok(AcquireOutcome::Gone),
-                DurableTargetState::Terminated { .. } => {
+                DurableTargetState::Closed {
+                    disposition: Disposition::Lost,
+                    ..
+                } => return Ok(AcquireOutcome::Gone),
+                DurableTargetState::Closed {
+                    disposition: Disposition::Terminated,
+                    ..
+                } => {
                     return Ok(AcquireOutcome::Terminated);
                 }
             }
@@ -481,8 +503,8 @@ impl TargetReservations for DynamoTargetRegistry {
                 "SET #state = :installed, target_ref = :target_ref, \
                  generation = :target_generation, control_token = :control_token, \
                  installed_at_ms = :now, updated_at_ms = :now \
-                 REMOVE reservation_id, lease_expires_at_ms, reason, gone_at_ms, \
-                 terminated_at_ms, expires_at_s, launch_request, attempt_id, \
+                 REMOVE reservation_id, lease_expires_at_ms, reason, disposition, \
+                 at_ms, expires_at_s, launch_request, attempt_id, \
                  attempt_expires_at_ms",
             )
             .expression_attribute_names("#state", STATE)
@@ -605,22 +627,14 @@ impl TargetDirectory for DynamoTargetRegistry {
         self.read(key).await
     }
 
-    async fn mark_gone(
+    async fn mark_closed(
         &self,
         target: &InstalledTarget,
+        disposition: Disposition,
         reason: &str,
         now_ms: u64,
     ) -> Result<(), MaterializationError> {
-        transition_terminalish(self, target, GONE, reason, now_ms).await
-    }
-
-    async fn mark_terminated(
-        &self,
-        target: &InstalledTarget,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<(), MaterializationError> {
-        transition_terminalish(self, target, TERMINATED, reason, now_ms).await
+        transition_closed(self, target, disposition, reason, now_ms).await
     }
 
     async fn list_root(
@@ -629,7 +643,7 @@ impl TargetDirectory for DynamoTargetRegistry {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<TargetPage, MaterializationError> {
-        TargetKey::default(root_id)?.validate()?;
+        TargetKey::for_default_target(root_id)?.validate()?;
         let limit = limit.clamp(1, MAX_TARGET_PAGE);
         let start_key = cursor.map(|cursor| {
             HashMap::from([(ROOT_ID.into(), s(root_id)), (TARGET_KEY.into(), s(cursor))])
@@ -663,22 +677,24 @@ impl TargetDirectory for DynamoTargetRegistry {
     }
 }
 
-async fn transition_terminalish(
+fn disposition_value(disposition: Disposition) -> &'static str {
+    match disposition {
+        Disposition::Lost => DISPOSITION_LOST,
+        Disposition::Terminated => DISPOSITION_TERMINATED,
+    }
+}
+
+async fn transition_closed(
     registry: &DynamoTargetRegistry,
     target: &InstalledTarget,
-    new_state: &str,
+    disposition: Disposition,
     reason: &str,
     now_ms: u64,
 ) -> Result<(), MaterializationError> {
     target.validate()?;
-    if reason.is_empty() || reason.len() > 512 {
+    if reason.is_empty() || reason.len() > MAX_REASON_BYTES {
         return Err(MaterializationError::InvalidIdentity("reason"));
     }
-    let timestamp_field = if new_state == GONE {
-        "gone_at_ms"
-    } else {
-        "terminated_at_ms"
-    };
     let update = Update::builder()
         .table_name(&registry.table)
         .key(ROOT_ID, AttributeValue::S(target.key.root_id.clone()))
@@ -687,13 +703,15 @@ async fn transition_terminalish(
             "#state = :installed AND target_ref = :target_ref \
              AND generation = :generation AND spec_digest = :spec_digest",
         )
-        .update_expression(format!(
-            "SET #state = :new_state, reason = :reason, {timestamp_field} = :now, \
-             updated_at_ms = :now REMOVE target_ref, control_token, installed_at_ms, expires_at_ms, expires_at_s"
-        ))
+        .update_expression(
+            "SET #state = :new_state, disposition = :disposition, reason = :reason, \
+             at_ms = :now, updated_at_ms = :now \
+             REMOVE target_ref, control_token, installed_at_ms, expires_at_ms, expires_at_s",
+        )
         .expression_attribute_names("#state", STATE)
         .expression_attribute_values(":installed", s(INSTALLED))
-        .expression_attribute_values(":new_state", s(new_state))
+        .expression_attribute_values(":new_state", s(CLOSED))
+        .expression_attribute_values(":disposition", s(disposition_value(disposition)))
         .expression_attribute_values(":target_ref", s(&target.target_ref))
         .expression_attribute_values(":generation", s(&target.generation))
         .expression_attribute_values(":spec_digest", s(&target.spec_digest))
@@ -716,9 +734,9 @@ async fn transition_terminalish(
                 Some(record)
                     if record.generation == target.generation
                         && matches!(
-                            (&record.state, new_state),
-                            (DurableTargetState::Gone { .. }, GONE)
-                                | (DurableTargetState::Terminated { .. }, TERMINATED)
+                            &record.state,
+                            DurableTargetState::Closed { disposition: stored, .. }
+                                if *stored == disposition
                         ) =>
                 {
                     Ok(())
@@ -835,13 +853,14 @@ fn parse_record(
             installed_at_ms: number("installed_at_ms")?,
             expires_at_ms: number("expires_at_ms")?,
         },
-        GONE => DurableTargetState::Gone {
+        CLOSED => DurableTargetState::Closed {
+            disposition: match string("disposition")?.as_str() {
+                DISPOSITION_LOST => Disposition::Lost,
+                DISPOSITION_TERMINATED => Disposition::Terminated,
+                other => return Err(corrupt(format!("unknown disposition {other}"))),
+            },
             reason: string("reason")?,
-            gone_at_ms: number("gone_at_ms")?,
-        },
-        TERMINATED => DurableTargetState::Terminated {
-            reason: string("reason")?,
-            terminated_at_ms: number("terminated_at_ms")?,
+            at_ms: number("at_ms")?,
         },
         other => return Err(corrupt(format!("unknown state {other}"))),
     };
@@ -979,7 +998,7 @@ mod tests {
 
     fn lease() -> MaterializationLease {
         AcquireTarget {
-            key: TargetKey::default("root-1").unwrap(),
+            key: TargetKey::for_default_target("root-1").unwrap(),
             spec: TargetSpec::new(
                 ConnectorClass::Allowlist,
                 "image-1",
@@ -1049,16 +1068,20 @@ mod tests {
         assert!(parsed.installed().is_some());
         assert!(!format!("{parsed:?}").contains(&format!("control-{}", "c".repeat(64))));
 
-        installed.insert(STATE.into(), s(TERMINATED));
+        installed.insert(STATE.into(), s(CLOSED));
         installed.remove("target_ref");
         installed.remove(CONTROL_TOKEN);
         installed.remove("installed_at_ms");
         installed.remove("expires_at_ms");
+        installed.insert("disposition".into(), s(DISPOSITION_TERMINATED));
         installed.insert("reason".into(), s("session deleted"));
-        installed.insert("terminated_at_ms".into(), n(30));
+        installed.insert("at_ms".into(), n(30));
         assert!(matches!(
             parse_record(&installed).unwrap().state,
-            DurableTargetState::Terminated { .. }
+            DurableTargetState::Closed {
+                disposition: Disposition::Terminated,
+                ..
+            }
         ));
     }
 

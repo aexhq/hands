@@ -5,7 +5,7 @@ use crate::*;
 pub(crate) fn target_key(target: &SandboxTarget) -> HandResult<TargetKey> {
     match target.kind {
         TargetKind::Default if target.sandbox_id.is_none() => {
-            TargetKey::default(target.root_id.as_str()).map_err(materialization_error)
+            TargetKey::for_default_target(target.root_id.as_str()).map_err(materialization_error)
         }
         TargetKind::Additional => TargetKey::additional(
             target.root_id.as_str(),
@@ -73,21 +73,19 @@ pub(crate) fn status_from_record(
             target,
             target_ref: Some(target_ref.parse().expect("target ref")),
         },
-        DurableTargetState::Gone { reason, .. } => SandboxStatus {
+        DurableTargetState::Closed {
+            disposition,
+            reason,
+            ..
+        } => SandboxStatus {
             changed_at_ms: Some(record.updated_at_ms),
             expires_at_ms: None,
             generation: Some(record.generation.parse().expect("generation")),
             reason: Some(reason.parse().expect("reason")),
-            state: SandboxState::Gone,
-            target,
-            target_ref: None,
-        },
-        DurableTargetState::Terminated { reason, .. } => SandboxStatus {
-            changed_at_ms: Some(record.updated_at_ms),
-            expires_at_ms: None,
-            generation: Some(record.generation.parse().expect("generation")),
-            reason: Some(reason.parse().expect("reason")),
-            state: SandboxState::Terminated,
+            state: match disposition {
+                Disposition::Lost => SandboxState::Gone,
+                Disposition::Terminated => SandboxState::Terminated,
+            },
             target,
             target_ref: None,
         },

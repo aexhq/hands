@@ -6,7 +6,7 @@
 //! There is deliberately no per-operation database write on the ordinary execution path.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::connector::ConnectorClass;
@@ -19,6 +19,7 @@ pub use crate::page::MAX_PAGE as MAX_TARGET_PAGE;
 /// lease deadline as `retry_after_ms` would turn an ordinary first-call race into an eight-hour
 /// outage even though the installed target is normally visible within seconds.
 pub const MAX_MATERIALIZATION_POLL_MS: u64 = 1_000;
+pub const MAX_REASON_BYTES: usize = 512;
 
 // The secret newtypes live in the vocabulary crate; this re-export keeps every consumer of the
 // materialization contract on one import path.
@@ -71,7 +72,7 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), Materializati
 }
 
 fn validate_reason(reason: &str) -> Result<(), MaterializationError> {
-    if reason.is_empty() || reason.len() > 512 {
+    if reason.is_empty() || reason.len() > MAX_REASON_BYTES {
         return Err(MaterializationError::InvalidIdentity("reason"));
     }
     Ok(())

@@ -6,7 +6,7 @@ use super::*;
 /// install the launched target, and expire a known-no-effect lease. Every implementation must
 /// also uphold the plane capacity invariant: `acquire` charges `spec.materialized_mib` against
 /// the plane quota in the same durable transaction as the reservation, and exactly one of
-/// `expire_lease`, `mark_gone`, or `mark_terminated` refunds it.
+/// `expire_lease` or `mark_closed` refunds it.
 #[async_trait]
 pub trait TargetReservations: Send + Sync {
     async fn acquire(
@@ -31,8 +31,8 @@ pub trait TargetReservations: Send + Sync {
     ) -> Result<(), MaterializationError>;
 }
 
-/// Lifecycle and administrative reads/transitions over installed durable records. `mark_gone`
-/// and `mark_terminated` refund the record's charged plane capacity exactly once.
+/// Lifecycle and administrative reads/transitions over installed durable records. `mark_closed`
+/// refunds the record's charged plane capacity exactly once.
 #[async_trait]
 pub trait TargetDirectory: Send + Sync {
     async fn get(
@@ -40,16 +40,11 @@ pub trait TargetDirectory: Send + Sync {
         key: &TargetKey,
     ) -> Result<Option<DurableTargetRecord>, MaterializationError>;
 
-    async fn mark_gone(
+    /// Projects an installed record to its closed terminal state.
+    async fn mark_closed(
         &self,
         target: &InstalledTarget,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<(), MaterializationError>;
-
-    async fn mark_terminated(
-        &self,
-        target: &InstalledTarget,
+        disposition: Disposition,
         reason: &str,
         now_ms: u64,
     ) -> Result<(), MaterializationError>;

@@ -45,8 +45,8 @@ use brain_protocol::network::network_ceiling_is_subset;
 use futures_util::StreamExt as _;
 use hand_core::connector::{ConnectorCatalog, ConnectorClass, GatewayAuthority};
 use hand_core::materialization::{
-    AcquireTarget, ControlToken, DurableLaunchRequest, DurableTargetState, InstalledTarget,
-    LaunchError, MaterializationError, MaterializationLease, PhysicalTarget,
+    AcquireTarget, ControlToken, Disposition, DurableLaunchRequest, DurableTargetState,
+    InstalledTarget, LaunchError, MaterializationError, MaterializationLease, PhysicalTarget,
     PhysicalTargetLauncher, TargetDirectory, TargetKey, TargetMaterializer, TargetReservations,
     TargetSpec,
 };
@@ -191,7 +191,7 @@ mod tests {
 
     fn materialization_lease(now_ms: u64) -> MaterializationLease {
         AcquireTarget {
-            key: TargetKey::default("root-dispatch").unwrap(),
+            key: TargetKey::for_default_target("root-dispatch").unwrap(),
             spec: TargetSpec::new(
                 ConnectorClass::None,
                 "image-1",

@@ -93,7 +93,13 @@ impl TargetReservations for MemoryTargetRegistry {
         if request.generation_is_fenced
             && record.generation != lease.generation
             && !(request.replace_after_loss
-                && matches!(&record.state, DurableTargetState::Gone { .. }))
+                && matches!(
+                    &record.state,
+                    DurableTargetState::Closed {
+                        disposition: Disposition::Lost,
+                        ..
+                    }
+                ))
         {
             return Err(MaterializationError::SpecConflict);
         }
@@ -128,13 +134,22 @@ impl TargetReservations for MemoryTargetRegistry {
             DurableTargetState::Materializing { .. } => Ok(AcquireOutcome::Acquired(
                 take_materialization_attempt(record, request)?,
             )),
-            DurableTargetState::Gone { .. } if request.replace_after_loss => {
+            DurableTargetState::Closed {
+                disposition: Disposition::Lost,
+                ..
+            } if request.replace_after_loss => {
                 self.reserve_capacity(lease.spec.materialized_mib)?;
                 *record = record_from_lease(&lease, request.now_ms);
                 Ok(AcquireOutcome::Acquired(lease))
             }
-            DurableTargetState::Gone { .. } => Ok(AcquireOutcome::Gone),
-            DurableTargetState::Terminated { .. } => Ok(AcquireOutcome::Terminated),
+            DurableTargetState::Closed {
+                disposition: Disposition::Lost,
+                ..
+            } => Ok(AcquireOutcome::Gone),
+            DurableTargetState::Closed {
+                disposition: Disposition::Terminated,
+                ..
+            } => Ok(AcquireOutcome::Terminated),
         }
     }
 
@@ -229,9 +244,10 @@ impl TargetDirectory for MemoryTargetRegistry {
             .cloned())
     }
 
-    async fn mark_gone(
+    async fn mark_closed(
         &self,
         target: &InstalledTarget,
+        disposition: Disposition,
         reason: &str,
         now_ms: u64,
     ) -> Result<(), MaterializationError> {
@@ -242,34 +258,10 @@ impl TargetDirectory for MemoryTargetRegistry {
                 && record.generation == target.generation
         });
         transition_installed(&mut records, target, |record| {
-            record.state = DurableTargetState::Gone {
+            record.state = DurableTargetState::Closed {
+                disposition,
                 reason: reason.into(),
-                gone_at_ms: now_ms,
-            };
-            record.updated_at_ms = now_ms;
-        })?;
-        if was_installed {
-            self.refund_capacity(target.spec.materialized_mib)?;
-        }
-        Ok(())
-    }
-
-    async fn mark_terminated(
-        &self,
-        target: &InstalledTarget,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<(), MaterializationError> {
-        validate_reason(reason)?;
-        let mut records = self.records.lock().map_err(|_| poisoned())?;
-        let was_installed = records.get(&target.key).is_some_and(|record| {
-            matches!(&record.state, DurableTargetState::Installed { target_ref, .. } if target_ref == &target.target_ref)
-                && record.generation == target.generation
-        });
-        transition_installed(&mut records, target, |record| {
-            record.state = DurableTargetState::Terminated {
-                reason: reason.into(),
-                terminated_at_ms: now_ms,
+                at_ms: now_ms,
             };
             record.updated_at_ms = now_ms;
         })?;
@@ -358,7 +350,7 @@ pub(crate) fn transition_installed(
             transition(record);
             Ok(())
         }
-        DurableTargetState::Gone { .. } | DurableTargetState::Terminated { .. } => Ok(()),
+        DurableTargetState::Closed { .. } => Ok(()),
         _ => Err(MaterializationError::ReservationLost { cleanup: None }),
     }
 }

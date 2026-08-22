@@ -2,8 +2,14 @@
 
 use super::*;
 
+pub const MAX_IMAGE_IDENTITY_BYTES: usize = 256;
+/// One TiB: far above any real plane shape, low enough to catch a units mistake immediately.
+pub const MAX_MATERIALIZED_MIB: u64 = 1_048_576;
+
 /// A logical target within one root session tree.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+// Deliberately not serde-constructible: parse-only constructors are the sole entry points, so a
+// deserialized value can never bypass the identifier grammar.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TargetKey {
     pub root_id: String,
     /// `target:default` or `target:additional:<sandbox_id>`.
@@ -11,7 +17,7 @@ pub struct TargetKey {
 }
 
 impl TargetKey {
-    pub fn default(root_id: impl Into<String>) -> Result<Self, MaterializationError> {
+    pub fn for_default_target(root_id: impl Into<String>) -> Result<Self, MaterializationError> {
         let root_id = root_id.into();
         validate_identifier(&root_id, "root_id")?;
         Ok(Self {
@@ -61,7 +67,9 @@ impl TargetKey {
 }
 
 /// Everything that must remain immutable for one physical generation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Serialize feeds the canonical CAS digest only; Deserialize is deliberately absent so a spec
+// can never enter the process without `TargetSpec::new` validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TargetSpec {
     pub connector: ConnectorClass,
     /// Immutable image digest/version identity resolved by the trusted Hand process.
@@ -90,9 +98,9 @@ impl TargetSpec {
         let resource_class = resource_class.into();
         let resource_policy_digest = resource_policy_digest.into();
         let network_policy_digest = network_policy_digest.into();
-        validate_bounded_token(&image_identity, "image_identity", 256)?;
+        validate_bounded_token(&image_identity, "image_identity", MAX_IMAGE_IDENTITY_BYTES)?;
         validate_identifier(&resource_class, "resource_class")?;
-        if materialized_mib == 0 || materialized_mib > 1_048_576 {
+        if materialized_mib == 0 || materialized_mib > MAX_MATERIALIZED_MIB {
             return Err(MaterializationError::InvalidCapacity);
         }
         validate_digest(&resource_policy_digest, "resource_policy_digest")?;

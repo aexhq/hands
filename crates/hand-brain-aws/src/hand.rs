@@ -159,7 +159,8 @@ impl AwsHand {
                 }
                 validate_operation_root_seal(envelope, &prep.request)?;
                 self.materialize(
-                    TargetKey::default(envelope.root_id.as_str()).map_err(materialization_error)?,
+                    TargetKey::for_default_target(envelope.root_id.as_str())
+                        .map_err(materialization_error)?,
                     envelope.session_id.as_str(),
                     &prep.request.resources,
                     &prep.request.network,
@@ -510,7 +511,7 @@ impl AwsHand {
             })?;
         let installed = match record.state {
             DurableTargetState::Installed { .. } => record.installed().expect("installed target"),
-            DurableTargetState::Gone { .. } | DurableTargetState::Terminated { .. } => {
+            DurableTargetState::Closed { .. } => {
                 return Err(error(HandErrorCode::SandboxGone, false, "sandbox is gone"));
             }
             DurableTargetState::Materializing { .. } => {
@@ -554,7 +555,7 @@ impl AwsHand {
         self.confirm_provider_termination(installed).await?;
         self.plane
             .registry
-            .mark_terminated(installed, reason, now_ms())
+            .mark_closed(installed, Disposition::Terminated, reason, now_ms())
             .await
             .map_err(materialization_error)?;
         self.forget_target(installed).await;
@@ -615,7 +616,7 @@ impl AwsHand {
     ) -> HandResult<()> {
         self.plane
             .registry
-            .mark_gone(installed, reason, now_ms())
+            .mark_closed(installed, Disposition::Lost, reason, now_ms())
             .await
             .map_err(materialization_error)?;
         self.forget_target(installed).await;

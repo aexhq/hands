@@ -336,7 +336,7 @@ impl AwsHand {
             return Ok(PurgeStep::Purged);
         }
         match &record.state {
-            DurableTargetState::Gone { .. } | DurableTargetState::Terminated { .. } => {
+            DurableTargetState::Closed { .. } => {
                 self.plane
                     .registry
                     .purge_terminal(&record.key, &record.generation)

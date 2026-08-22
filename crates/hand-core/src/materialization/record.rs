@@ -27,7 +27,7 @@ pub struct MaterializationLease {
     pub recovery_attempt: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledTarget {
     pub key: TargetKey,
     pub spec: TargetSpec,
@@ -55,8 +55,17 @@ impl InstalledTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
+/// Why a closed target reached its terminal state. The stored disposition decides whether the
+/// shared default target may be replaced after confirmed loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// The provider lost the physical target (crash, hard deadline, external loss).
+    Lost,
+    /// An explicit lifecycle operation deliberately terminated the target.
+    Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableTargetState {
     Materializing {
         reservation_id: String,
@@ -72,17 +81,14 @@ pub enum DurableTargetState {
         installed_at_ms: u64,
         expires_at_ms: u64,
     },
-    Gone {
+    Closed {
+        disposition: Disposition,
         reason: String,
-        gone_at_ms: u64,
-    },
-    Terminated {
-        reason: String,
-        terminated_at_ms: u64,
+        at_ms: u64,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableTargetRecord {
     pub key: TargetKey,
     pub spec: TargetSpec,
@@ -134,8 +140,7 @@ impl DurableTargetRecord {
                 }
                 Ok(())
             }
-            DurableTargetState::Gone { reason, .. }
-            | DurableTargetState::Terminated { reason, .. } => validate_reason(reason),
+            DurableTargetState::Closed { reason, .. } => validate_reason(reason),
         }
     }
 

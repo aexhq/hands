@@ -53,7 +53,7 @@ fn physical(target_ref: impl Into<String>, generation: impl Into<String>) -> Phy
 
 fn request(now_ms: u64, reservation: &str, generation: &str) -> AcquireTarget {
     AcquireTarget {
-        key: TargetKey::default("root-1").unwrap(),
+        key: TargetKey::for_default_target("root-1").unwrap(),
         spec: target_spec(ConnectorClass::Allowlist),
         reservation_id: reservation.into(),
         generation: generation.into(),
@@ -428,11 +428,11 @@ async fn different_target_spec_is_a_permanent_conflict() {
 async fn plane_capacity_is_reserved_atomically_and_refunded_once() {
     let registry = MemoryTargetRegistry::with_capacity(2_048);
     let mut first = request(1, "reservation-1", "generation-1");
-    first.key = TargetKey::default("root-1").unwrap();
+    first.key = TargetKey::for_default_target("root-1").unwrap();
     let mut second = request(1, "reservation-2", "generation-2");
-    second.key = TargetKey::default("root-2").unwrap();
+    second.key = TargetKey::for_default_target("root-2").unwrap();
     let mut third = request(1, "reservation-3", "generation-3");
-    third.key = TargetKey::default("root-3").unwrap();
+    third.key = TargetKey::for_default_target("root-3").unwrap();
     let AcquireOutcome::Acquired(first_lease) = registry.acquire(&first).await.unwrap() else {
         panic!("first target reserves")
     };
@@ -456,12 +456,12 @@ async fn plane_capacity_is_reserved_atomically_and_refunded_once() {
         panic!("first target installs")
     };
     registry
-        .mark_terminated(&installed, "explicit cleanup", 3)
+        .mark_closed(&installed, Disposition::Terminated, "explicit cleanup", 3)
         .await
         .unwrap();
     // Idempotent terminal retry does not decrement twice.
     registry
-        .mark_terminated(&installed, "explicit cleanup", 3)
+        .mark_closed(&installed, Disposition::Terminated, "explicit cleanup", 3)
         .await
         .unwrap();
     assert_eq!(registry.reserved_mib(), 1_024);
@@ -481,7 +481,7 @@ async fn scheduled_hard_deadline_reconciliation_reclaims_abandoned_capacity() {
             &format!("reservation-{index}"),
             &format!("generation-{index}"),
         );
-        target.key = TargetKey::default(format!("root-{index}")).unwrap();
+        target.key = TargetKey::for_default_target(format!("root-{index}")).unwrap();
         let AcquireOutcome::Acquired(lease) = registry.acquire(&target).await.unwrap() else {
             panic!("abandoned target reserves")
         };
@@ -503,7 +503,12 @@ async fn scheduled_hard_deadline_reconciliation_reclaims_abandoned_capacity() {
     // its one capacity reservation while retaining the logical tombstone.
     for installed in &installed_targets {
         registry
-            .mark_terminated(installed, "physical target hard deadline reached", 901)
+            .mark_closed(
+                installed,
+                Disposition::Terminated,
+                "physical target hard deadline reached",
+                901,
+            )
             .await
             .unwrap();
     }
@@ -511,7 +516,10 @@ async fn scheduled_hard_deadline_reconciliation_reclaims_abandoned_capacity() {
     for installed in installed_targets {
         assert!(matches!(
             registry.get(&installed.key).await.unwrap().unwrap().state,
-            DurableTargetState::Terminated { .. }
+            DurableTargetState::Closed {
+                disposition: Disposition::Terminated,
+                ..
+            }
         ));
     }
 }
@@ -578,7 +586,12 @@ async fn additional_target_never_rematerializes_after_loss() {
         panic!("target installs")
     };
     registry
-        .mark_gone(&installed, "provider lifetime expired", 10)
+        .mark_closed(
+            &installed,
+            Disposition::Lost,
+            "provider lifetime expired",
+            10,
+        )
         .await
         .unwrap();
     let mut retry = first.clone();
@@ -609,7 +622,12 @@ async fn terminated_additional_id_remains_fenced_until_explicit_root_purge() {
         panic!("target installs")
     };
     registry
-        .mark_terminated(&installed, "explicit lifecycle operation", 10)
+        .mark_closed(
+            &installed,
+            Disposition::Terminated,
+            "explicit lifecycle operation",
+            10,
+        )
         .await
         .unwrap();
 
@@ -625,9 +643,12 @@ async fn terminated_additional_id_remains_fenced_until_explicit_root_purge() {
 
 #[test]
 fn identifiers_match_the_brain_contract_boundary() {
-    assert!(TargetKey::default("A._:-9").is_ok());
+    assert!(TargetKey::for_default_target("A._:-9").is_ok());
     for invalid in ["", "-starts-wrong", "has space", "é", &"a".repeat(129)] {
-        assert!(TargetKey::default(invalid).is_err(), "{invalid:?}");
+        assert!(
+            TargetKey::for_default_target(invalid).is_err(),
+            "{invalid:?}"
+        );
     }
 }
 
