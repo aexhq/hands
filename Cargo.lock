@@ -1623,6 +1623,7 @@ dependencies = [
  "hand-core",
  "hand-egress-gateway",
  "hand-lambda",
+ "hand-policy",
  "hand-wire",
  "hex",
  "ipnet",
@@ -1638,7 +1639,6 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "zeroize",
 ]
 
@@ -1649,15 +1649,16 @@ dependencies = [
  "async-trait",
  "cap-std",
  "globset",
+ "hand-policy",
  "hex",
  "regex",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
- "zeroize",
 ]
 
 [[package]]
@@ -1666,15 +1667,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "brain-protocol",
- "hex",
  "hickory-resolver",
  "idna",
  "ipnet",
  "p256",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1692,6 +1690,7 @@ dependencies = [
  "brain-protocol",
  "futures-util",
  "hand-core",
+ "hand-policy",
  "hand-wire",
  "hex",
  "libc",
@@ -1738,16 +1737,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hand-policy"
+version = "0.1.0"
+dependencies = [
+ "brain-protocol",
+ "serde",
+ "serde_jcs",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "hand-wire"
 version = "0.1.0"
 dependencies = [
  "brain",
  "brain-protocol",
- "hand-core",
+ "hand-policy",
  "serde",
- "serde_jcs",
- "serde_json",
- "zeroize",
 ]
 
 [[package]]

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/hand-core",
+    "crates/hand-policy",
     "crates/hand-egress-gateway",
     "crates/hand-guest",
     "crates/hand-lambda",

@@ -1,4 +1,8 @@
 //! Explicit live-image proofs for provider behavior and the direct-public connector boundary.
+//!
+//! Every canary follows one arc: seal random identities into a `RunPayload`, launch the exact
+//! image version, run its proof against the known target, and always terminate the target. The
+//! proofs differ only in their sealed network ceiling and their in-guest script.
 
 use std::{
     net::Ipv4Addr,
@@ -9,10 +13,10 @@ use anyhow::{Context as _, bail, ensure};
 use aws_sdk_lambdamicrovms::types::MicrovmState;
 use brain_protocol::contract::{HAND_CONTRACT_DIGEST, sandbox_execution_request_digest};
 use brain_protocol::hand::{
-    NetworkCeiling, ObserveRequest, SandboxExecutionRequest, TerminalOutcome,
+    NetworkCeiling, ObserveRequest, SandboxExecutionRequest, TerminalOutcome, TerminalResult,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
-use hand_core::connector::{ConnectorClass, ConnectorRef, GatewayAuthority};
+use hand_core::connector::{ConnectorCatalog, ConnectorClass, ConnectorRef, GatewayAuthority};
 use hand_core::materialization::ControlToken;
 use hand_wire::{
     AllowlistProxy, RequestCall, RequestFrame, ResponseFrame, ResponseReply, RunPayload,
@@ -36,11 +40,33 @@ pub struct NoRespawnCanaryConfig {
 pub struct NetworkBoundaryCanaryConfig {
     pub image_arn: String,
     pub image_version: String,
-    pub none_connector: ConnectorRef,
-    pub allowlist_connector: ConnectorRef,
-    pub public_connector: ConnectorRef,
+    pub connectors: ConnectorCatalog,
     pub gateway_authority: GatewayAuthority,
     pub customer_hand_hosts: [String; 2],
+}
+
+/// The two connector classes the restricted-network proof accepts. A separate type instead of
+/// `ConnectorClass` so the public variant is unrepresentable rather than runtime-rejected.
+#[derive(Clone, Copy)]
+enum RestrictedClass {
+    None,
+    Allowlist,
+}
+
+impl RestrictedClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Allowlist => "allowlist",
+        }
+    }
+
+    fn class(self) -> ConnectorClass {
+        match self {
+            Self::None => ConnectorClass::None,
+            Self::Allowlist => ConnectorClass::Allowlist,
+        }
+    }
 }
 
 /// Exercises every deployed connector class against the same exact image version. Restricted
@@ -50,41 +76,19 @@ pub async fn run_network_boundary_canary(
     control: &Control,
     cfg: NetworkBoundaryCanaryConfig,
 ) -> anyhow::Result<()> {
-    run_restricted_network_canary(
-        control,
-        &cfg.image_arn,
-        &cfg.image_version,
-        cfg.none_connector,
-        &cfg.gateway_authority,
-        ConnectorClass::None,
-    )
-    .await?;
-    run_restricted_network_canary(
-        control,
-        &cfg.image_arn,
-        &cfg.image_version,
-        cfg.allowlist_connector,
-        &cfg.gateway_authority,
-        ConnectorClass::Allowlist,
-    )
-    .await?;
-    run_public_network_canary(
-        control,
-        PublicNetworkCanaryConfig {
-            image_arn: cfg.image_arn,
-            image_version: cfg.image_version,
-            public_connector: cfg.public_connector,
-            customer_hand_hosts: cfg.customer_hand_hosts,
-        },
-    )
-    .await
-}
-
-struct PublicNetworkCanaryConfig {
-    image_arn: String,
-    image_version: String,
-    public_connector: ConnectorRef,
-    customer_hand_hosts: [String; 2],
+    validate_customer_hand_hosts(&cfg.customer_hand_hosts, control.region())?;
+    for class in [RestrictedClass::None, RestrictedClass::Allowlist] {
+        run_restricted_network_canary(
+            control,
+            &cfg.image_arn,
+            &cfg.image_version,
+            cfg.connectors.resolve(class.class()),
+            &cfg.gateway_authority,
+            class,
+        )
+        .await?;
+    }
+    run_public_network_canary(control, &cfg).await
 }
 
 struct KnownTargetSeal {
@@ -96,89 +100,86 @@ struct KnownTargetSeal {
     control_token: ControlToken,
 }
 
-async fn run_restricted_network_canary(
-    control: &Control,
-    image_arn: &str,
-    image_version: &str,
-    connector: ConnectorRef,
-    gateway: &GatewayAuthority,
-    class: ConnectorClass,
-) -> anyhow::Result<()> {
-    ensure!(
-        matches!(class, ConnectorClass::None | ConnectorClass::Allowlist),
-        "restricted network canary requires none or allowlist"
-    );
-    let label = match class {
-        ConnectorClass::None => "none",
-        ConnectorClass::Allowlist => "allowlist",
-        ConnectorClass::Public => unreachable!("validated restricted connector class"),
-    };
+/// Seals one canary run: random single-use identities plus the exact run payload. The
+/// `target_id` is filled in by [`with_canary_target`] after the provider launch.
+fn seal_canary_run(
+    label: &str,
+    connector: ConnectorClass,
+    network: NetworkCeiling,
+    allowlist_proxy: Option<AllowlistProxy>,
+    canary_exit: bool,
+) -> anyhow::Result<(KnownTargetSeal, RunPayload)> {
     let nonce = hex::encode(rand::random::<[u8; 12]>());
-    let operation_id = format!("{label}-network-canary-{nonce}");
-    let generation = format!("{label}-network-generation-{nonce}");
-    let root_id = format!("{label}-network-root-{nonce}");
-    let session_id = format!("{label}-network-session-{nonce}");
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock precedes Unix epoch")?
         .as_millis() as u64;
-    let network = match class {
-        ConnectorClass::None => NetworkCeiling::None,
-        ConnectorClass::Allowlist => serde_json::from_value(serde_json::json!({
-            "kind": "allowlist",
-            "destinations": [{
-                "protocol": "tls",
-                "host": "example.com",
-                "ports": [443]
-            }]
-        }))?,
-        ConnectorClass::Public => unreachable!("validated restricted connector class"),
+    let seal = KnownTargetSeal {
+        target_id: String::new(),
+        generation: format!("{label}-canary-generation-{nonce}"),
+        root_id: format!("{label}-canary-root-{nonce}"),
+        session_id: format!("{label}-canary-session-{nonce}"),
+        operation_id: format!("{label}-canary-{nonce}"),
+        control_token: canary_control_token(),
     };
-    // The release gate intentionally has no KMS signing authority. A syntactically harmless,
-    // invalid grant lets the guest configure its ordinary proxy environment while proving that
-    // the gateway itself rejects missing and invalid authentication.
-    let allowlist_proxy = matches!(class, ConnectorClass::Allowlist).then(|| AllowlistProxy {
-        authority: gateway.as_authority(),
-        capability: "invalid-release-canary-capability".into(),
-    });
-    let control_token = canary_control_token();
     let payload = RunPayload {
         contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
-        generation: generation.clone(),
+        generation: seal.generation.clone(),
         expires_at_ms: now_ms.saturating_add(CANARY_LIFETIME_MS),
-        root_id: root_id.clone(),
-        owner_session_id: session_id.clone(),
-        connector: class,
+        root_id: seal.root_id.clone(),
+        owner_session_id: seal.session_id.clone(),
+        connector,
         resource_class: "microvm-1gb".into(),
         resources: serde_json::from_value(serde_json::json!({
             "max_output_bytes": 4_096,
             "timeout_ms": 30_000
         }))?,
         network,
-        control_token: control_token.clone(),
+        control_token: seal.control_token.clone(),
         allowlist_proxy,
-        canary_exit_after_operation_id: None,
+        canary_exit_after_operation_id: canary_exit.then(|| seal.operation_id.clone()),
     };
+    Ok((seal, payload))
+}
+
+/// One canary's exact launch identity: the immutable image version plus the connector class ref
+/// it must run behind.
+struct CanaryLaunch<'a> {
+    image_arn: &'a str,
+    image_version: &'a str,
+    connector: &'a ConnectorRef,
+}
+
+/// Launches the sealed target, runs the proof body against it, and always terminates the target,
+/// merging proof and cleanup outcomes so neither failure can mask the other.
+async fn with_canary_target<Fut>(
+    control: &Control,
+    launch: CanaryLaunch<'_>,
+    label: &str,
+    seal: KnownTargetSeal,
+    payload: &RunPayload,
+    body: impl FnOnce(KnownTargetSeal) -> Fut,
+) -> anyhow::Result<()>
+where
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let vm = launch_canary_target(
         control,
-        image_arn,
-        image_version,
-        &serde_json::to_string(&payload)?,
-        &format!("hands-{operation_id}"),
-        &connector,
+        launch.image_arn,
+        launch.image_version,
+        &serde_json::to_string(payload)?,
+        &format!("hands-{}", seal.operation_id),
+        launch.connector,
     )
     .await
-    .with_context(|| format!("launching the {label} connector canary"))?;
-    let target = KnownTargetSeal {
+    .with_context(|| format!("launching the {label} canary"))?;
+    let seal = KnownTargetSeal {
         target_id: vm.id,
-        generation,
-        root_id,
-        session_id,
-        operation_id,
-        control_token,
+        ..seal
     };
-    let result = run_restricted_network_on_known_target(control, &target, gateway, class).await;
-    let cleanup = terminate_known_target(control, &target.target_id).await;
+    let target_id = seal.target_id.clone();
+    let result = body(seal).await;
+    let cleanup = terminate_known_target(control, &target_id).await;
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(canary), Ok(())) => Err(canary),
@@ -191,28 +192,130 @@ async fn run_restricted_network_canary(
     }
 }
 
-async fn run_restricted_network_on_known_target(
+/// Waits for the target to run and connects the guest framing socket through the authenticated
+/// provider endpoint.
+async fn connect_to_target(
     control: &Control,
-    target: &KnownTargetSeal,
-    gateway: &GatewayAuthority,
-    class: ConnectorClass,
-) -> anyhow::Result<()> {
+    seal: &KnownTargetSeal,
+) -> anyhow::Result<(LaunchedHand, launch::GuestSocket)> {
     let vm = launch::wait_for_state(
         control,
-        &target.target_id,
+        &seal.target_id,
         &MicrovmState::Running,
         STATE_TIMEOUT,
     )
     .await?;
-    let endpoint = vm
-        .endpoint
-        .context("restricted network canary target has no endpoint")?;
+    let endpoint = vm.endpoint.context("canary target has no endpoint")?;
     let hand = LaunchedHand {
-        microvm_id: target.target_id.clone(),
+        microvm_id: seal.target_id.clone(),
         endpoint: launch::normalise_endpoint(&endpoint),
-        auth_token: control.auth_token(&target.target_id).await?,
-        control_token: target.control_token.clone(),
+        auth_token: control.auth_token(&seal.target_id).await?,
+        control_token: seal.control_token.clone(),
     };
+    let socket = launch::connect(&hand).await?;
+    Ok((hand, socket))
+}
+
+/// Executes the sealed request and observes it through to its terminal receipt.
+async fn execute_and_observe(
+    socket: &mut launch::GuestSocket,
+    request_number: &mut u64,
+    request: SandboxExecutionRequest,
+    what: &str,
+) -> anyhow::Result<TerminalResult> {
+    let receipt = match call(socket, request_number, RequestCall::ExecuteSandbox(request)).await? {
+        ResponseReply::ExecuteSandbox(receipt) => receipt,
+        _ => bail!("{what} canary execute returned the wrong response variant"),
+    };
+    let observe: ObserveRequest = serde_json::from_value(serde_json::json!({
+        "cursor": "0",
+        "operation": receipt.operation,
+        "wait_ms": 30_000
+    }))?;
+    let observation = match call(socket, request_number, RequestCall::Observe(observe)).await? {
+        ResponseReply::Observe(observation) => observation,
+        _ => bail!("{what} canary observe returned the wrong response variant"),
+    };
+    observation
+        .terminal
+        .with_context(|| format!("{what} canary did not reach a terminal receipt"))
+}
+
+fn require_completed_stdout<'a>(
+    terminal: &'a TerminalResult,
+    what: &str,
+) -> anyhow::Result<&'a str> {
+    let diagnostic = terminal_diagnostic(terminal.inline.as_ref());
+    ensure!(
+        terminal.outcome == TerminalOutcome::Completed,
+        "{what} canary command failed: {diagnostic}"
+    );
+    terminal
+        .inline
+        .as_ref()
+        .and_then(|value| value.get("stdout"))
+        .and_then(|value| value.as_str())
+        .with_context(|| format!("{what} canary returned no stdout"))
+}
+
+async fn run_restricted_network_canary(
+    control: &Control,
+    image_arn: &str,
+    image_version: &str,
+    connector: &ConnectorRef,
+    gateway: &GatewayAuthority,
+    class: RestrictedClass,
+) -> anyhow::Result<()> {
+    let label = class.label();
+    let network = match class {
+        RestrictedClass::None => NetworkCeiling::None,
+        RestrictedClass::Allowlist => serde_json::from_value(serde_json::json!({
+            "kind": "allowlist",
+            "destinations": [{
+                "protocol": "tls",
+                "host": "example.com",
+                "ports": [443]
+            }]
+        }))?,
+    };
+    // The release gate intentionally has no KMS signing authority. A syntactically harmless,
+    // invalid grant lets the guest configure its ordinary proxy environment while proving that
+    // the gateway itself rejects missing and invalid authentication.
+    let allowlist_proxy = matches!(class, RestrictedClass::Allowlist).then(|| AllowlistProxy {
+        authority: gateway.as_authority(),
+        capability: "invalid-release-canary-capability".into(),
+    });
+    let (seal, payload) = seal_canary_run(
+        &format!("{label}-network"),
+        class.class(),
+        network,
+        allowlist_proxy,
+        false,
+    )?;
+    with_canary_target(
+        control,
+        CanaryLaunch {
+            image_arn,
+            image_version,
+            connector,
+        },
+        &format!("{label} connector"),
+        seal,
+        &payload,
+        |seal| async move {
+            run_restricted_network_on_known_target(control, &seal, gateway, class).await
+        },
+    )
+    .await
+}
+
+async fn run_restricted_network_on_known_target(
+    control: &Control,
+    target: &KnownTargetSeal,
+    gateway: &GatewayAuthority,
+    class: RestrictedClass,
+) -> anyhow::Result<()> {
+    let (_hand, mut socket) = connect_to_target(control, target).await?;
     let request = restricted_network_execution(
         &target.operation_id,
         &target.generation,
@@ -221,56 +324,20 @@ async fn run_restricted_network_on_known_target(
         gateway,
         class,
     )?;
-    let mut socket = launch::connect(&hand)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
     let mut request_number = 1u64;
-    let receipt = match call(
+    let terminal = execute_and_observe(
         &mut socket,
         &mut request_number,
-        RequestCall::ExecuteSandbox(request),
+        request,
+        "restricted network",
     )
-    .await?
-    {
-        ResponseReply::ExecuteSandbox(receipt) => receipt,
-        _ => bail!("restricted network canary execute returned the wrong response variant"),
-    };
-    let observe: ObserveRequest = serde_json::from_value(serde_json::json!({
-        "cursor": "0",
-        "operation": receipt.operation,
-        "wait_ms": 30_000
-    }))?;
-    let observation = match call(
-        &mut socket,
-        &mut request_number,
-        RequestCall::Observe(observe),
-    )
-    .await?
-    {
-        ResponseReply::Observe(observation) => observation,
-        _ => bail!("restricted network canary observe returned the wrong response variant"),
-    };
-    let terminal = observation
-        .terminal
-        .context("restricted network canary did not reach a terminal receipt")?;
-    let diagnostic = terminal_diagnostic(terminal.inline.as_ref());
+    .await?;
+    let stdout = require_completed_stdout(&terminal, "restricted network")?;
     ensure!(
-        terminal.outcome == TerminalOutcome::Completed,
-        "restricted network canary command failed: {diagnostic}"
-    );
-    let stdout = terminal
-        .inline
-        .as_ref()
-        .and_then(|value| value.get("stdout"))
-        .and_then(|value| value.as_str())
-        .context("restricted network canary returned no stdout")?;
-    let label = match class {
-        ConnectorClass::None => "none",
-        ConnectorClass::Allowlist => "allowlist",
-        ConnectorClass::Public => unreachable!("validated restricted connector class"),
-    };
-    ensure!(
-        stdout.starts_with(&format!("restricted_network_canary=ok class={label} ")),
+        stdout.starts_with(&format!(
+            "restricted_network_canary=ok class={} ",
+            class.label()
+        )),
         "restricted network canary returned an unexpected result"
     );
     Ok(())
@@ -283,65 +350,30 @@ async fn run_restricted_network_on_known_target(
 /// cannot pass without making release health depend on every third-party fixture staying online.
 async fn run_public_network_canary(
     control: &Control,
-    cfg: PublicNetworkCanaryConfig,
+    cfg: &NetworkBoundaryCanaryConfig,
 ) -> anyhow::Result<()> {
-    validate_customer_hand_hosts(&cfg.customer_hand_hosts)?;
-    let nonce = hex::encode(rand::random::<[u8; 12]>());
-    let operation_id = format!("network-canary-{nonce}");
-    let generation = format!("network-canary-generation-{nonce}");
-    let root_id = format!("network-canary-root-{nonce}");
-    let session_id = format!("network-canary-session-{nonce}");
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock precedes Unix epoch")?
-        .as_millis() as u64;
-    let control_token = canary_control_token();
-    let payload = RunPayload {
-        contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
-        generation: generation.clone(),
-        expires_at_ms: now_ms.saturating_add(CANARY_LIFETIME_MS),
-        root_id: root_id.clone(),
-        owner_session_id: session_id.clone(),
-        connector: ConnectorClass::Public,
-        resource_class: "microvm-1gb".into(),
-        resources: serde_json::from_value(serde_json::json!({
-            "max_output_bytes": 4_096,
-            "timeout_ms": 30_000
-        }))?,
-        network: NetworkCeiling::Public,
-        control_token: control_token.clone(),
-        allowlist_proxy: None,
-        canary_exit_after_operation_id: None,
-    };
-    let vm = launch_canary_target(
+    let (seal, payload) = seal_canary_run(
+        "network",
+        ConnectorClass::Public,
+        NetworkCeiling::Public,
+        None,
+        false,
+    )?;
+    with_canary_target(
         control,
-        &cfg.image_arn,
-        &cfg.image_version,
-        &serde_json::to_string(&payload)?,
-        &format!("hands-{operation_id}"),
-        &cfg.public_connector,
+        CanaryLaunch {
+            image_arn: &cfg.image_arn,
+            image_version: &cfg.image_version,
+            connector: cfg.connectors.resolve(ConnectorClass::Public),
+        },
+        "direct-public network",
+        seal,
+        &payload,
+        |seal| async move {
+            run_public_network_on_known_target(control, &seal, &cfg.customer_hand_hosts).await
+        },
     )
     .await
-    .context("launching the direct-public network canary")?;
-    let target = KnownTargetSeal {
-        target_id: vm.id,
-        generation,
-        root_id,
-        session_id,
-        operation_id,
-        control_token,
-    };
-    let result =
-        run_public_network_on_known_target(control, &target, &cfg.customer_hand_hosts).await;
-    let cleanup = terminate_known_target(control, &target.target_id).await;
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(canary), Ok(())) => Err(canary),
-        (Ok(()), Err(cleanup)) => Err(cleanup.context("canary passed but target cleanup failed")),
-        (Err(canary), Err(cleanup)) => {
-            Err(canary.context(format!("target cleanup also failed: {cleanup:#}")))
-        }
-    }
 }
 
 async fn run_public_network_on_known_target(
@@ -349,22 +381,7 @@ async fn run_public_network_on_known_target(
     target: &KnownTargetSeal,
     customer_hand_hosts: &[String; 2],
 ) -> anyhow::Result<()> {
-    let vm = launch::wait_for_state(
-        control,
-        &target.target_id,
-        &MicrovmState::Running,
-        STATE_TIMEOUT,
-    )
-    .await?;
-    let endpoint = vm
-        .endpoint
-        .context("network canary target has no endpoint")?;
-    let hand = LaunchedHand {
-        microvm_id: target.target_id.clone(),
-        endpoint: launch::normalise_endpoint(&endpoint),
-        auth_token: control.auth_token(&target.target_id).await?,
-        control_token: target.control_token.clone(),
-    };
+    let (_hand, mut socket) = connect_to_target(control, target).await?;
     let request = public_network_execution(
         &target.operation_id,
         &target.generation,
@@ -372,49 +389,10 @@ async fn run_public_network_on_known_target(
         &target.session_id,
         customer_hand_hosts,
     )?;
-    let mut socket = launch::connect(&hand)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
     let mut request_number = 1u64;
-    let receipt = match call(
-        &mut socket,
-        &mut request_number,
-        RequestCall::ExecuteSandbox(request),
-    )
-    .await?
-    {
-        ResponseReply::ExecuteSandbox(receipt) => receipt,
-        _ => bail!("network canary execute returned the wrong response variant"),
-    };
-    let observe: ObserveRequest = serde_json::from_value(serde_json::json!({
-        "cursor": "0",
-        "operation": receipt.operation,
-        "wait_ms": 30_000
-    }))?;
-    let observation = match call(
-        &mut socket,
-        &mut request_number,
-        RequestCall::Observe(observe),
-    )
-    .await?
-    {
-        ResponseReply::Observe(observation) => observation,
-        _ => bail!("network canary observe returned the wrong response variant"),
-    };
-    let terminal = observation
-        .terminal
-        .context("network canary did not reach a terminal receipt")?;
-    let diagnostic = terminal_diagnostic(terminal.inline.as_ref());
-    ensure!(
-        terminal.outcome == TerminalOutcome::Completed,
-        "network canary command failed: {diagnostic}"
-    );
-    let stdout = terminal
-        .inline
-        .as_ref()
-        .and_then(|value| value.get("stdout"))
-        .and_then(|value| value.as_str())
-        .context("network canary returned no stdout")?;
+    let terminal =
+        execute_and_observe(&mut socket, &mut request_number, request, "network").await?;
+    let stdout = require_completed_stdout(&terminal, "network")?;
     ensure!(
         stdout.starts_with("network_canary=ok "),
         "network canary returned an unexpected result"
@@ -429,61 +407,26 @@ pub async fn run_no_respawn_canary(
     http: &reqwest::Client,
     cfg: NoRespawnCanaryConfig,
 ) -> anyhow::Result<()> {
-    let nonce = hex::encode(rand::random::<[u8; 12]>());
-    let operation_id = format!("image-canary-{nonce}");
-    let generation = format!("image-canary-generation-{nonce}");
-    let root_id = format!("image-canary-root-{nonce}");
-    let session_id = format!("image-canary-session-{nonce}");
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock precedes Unix epoch")?
-        .as_millis() as u64;
-    let control_token = canary_control_token();
-    let payload = RunPayload {
-        contract_digest: HAND_CONTRACT_DIGEST.trim().into(),
-        generation: generation.clone(),
-        expires_at_ms: now_ms.saturating_add(CANARY_LIFETIME_MS),
-        root_id: root_id.clone(),
-        owner_session_id: session_id.clone(),
-        connector: ConnectorClass::None,
-        resource_class: "microvm-1gb".into(),
-        resources: serde_json::from_value(serde_json::json!({
-            "max_output_bytes": 4_096,
-            "timeout_ms": 30_000
-        }))?,
-        network: NetworkCeiling::None,
-        control_token: control_token.clone(),
-        allowlist_proxy: None,
-        canary_exit_after_operation_id: Some(operation_id.clone()),
-    };
-    let vm = launch_canary_target(
+    let (seal, payload) = seal_canary_run(
+        "image",
+        ConnectorClass::None,
+        NetworkCeiling::None,
+        None,
+        true,
+    )?;
+    with_canary_target(
         control,
-        &cfg.image_arn,
-        &cfg.image_version,
-        &serde_json::to_string(&payload)?,
-        &format!("hands-{operation_id}"),
-        &cfg.none_connector,
+        CanaryLaunch {
+            image_arn: &cfg.image_arn,
+            image_version: &cfg.image_version,
+            connector: &cfg.none_connector,
+        },
+        "no-respawn image",
+        seal,
+        &payload,
+        |seal| async move { run_on_known_target(control, http, &seal).await },
     )
     .await
-    .context("launching the no-respawn image canary")?;
-    let target = KnownTargetSeal {
-        target_id: vm.id,
-        generation,
-        root_id,
-        session_id,
-        operation_id,
-        control_token,
-    };
-    let result = run_on_known_target(control, http, &target).await;
-    let cleanup = terminate_known_target(control, &target.target_id).await;
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(canary), Ok(())) => Err(canary),
-        (Ok(()), Err(cleanup)) => Err(cleanup.context("canary passed but target cleanup failed")),
-        (Err(canary), Err(cleanup)) => {
-            Err(canary.context(format!("target cleanup also failed: {cleanup:#}")))
-        }
-    }
 }
 
 async fn run_on_known_target(
@@ -491,64 +434,22 @@ async fn run_on_known_target(
     http: &reqwest::Client,
     target: &KnownTargetSeal,
 ) -> anyhow::Result<()> {
-    let vm = launch::wait_for_state(
-        control,
-        &target.target_id,
-        &MicrovmState::Running,
-        STATE_TIMEOUT,
-    )
-    .await?;
-    let endpoint = vm.endpoint.context("canary target has no endpoint")?;
-    let mut hand = LaunchedHand {
-        microvm_id: target.target_id.clone(),
-        endpoint: launch::normalise_endpoint(&endpoint),
-        auth_token: control.auth_token(&target.target_id).await?,
-        control_token: target.control_token.clone(),
-    };
+    let (mut hand, mut socket) = connect_to_target(control, target).await?;
     let request = canary_execution(
         &target.operation_id,
         &target.generation,
         &target.root_id,
         &target.session_id,
     )?;
-    let mut socket = launch::connect(&hand)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
     let mut request_number = 1u64;
-    let receipt = match call(
+    let terminal = execute_and_observe(
         &mut socket,
         &mut request_number,
-        RequestCall::ExecuteSandbox(request.clone()),
+        request.clone(),
+        "no-respawn image",
     )
-    .await?
-    {
-        ResponseReply::ExecuteSandbox(receipt) => receipt,
-        _ => bail!("canary execute returned the wrong response variant"),
-    };
-    let observe: ObserveRequest = serde_json::from_value(serde_json::json!({
-        "cursor": "0",
-        "operation": receipt.operation,
-        "wait_ms": 30_000
-    }))?;
-    let observation = match call(
-        &mut socket,
-        &mut request_number,
-        RequestCall::Observe(observe),
-    )
-    .await?
-    {
-        ResponseReply::Observe(observation) => observation,
-        _ => bail!("canary observe returned the wrong response variant"),
-    };
-    let terminal = observation
-        .terminal
-        .context("canary effect did not reach a terminal receipt")?;
-    let diagnostic = terminal
-        .inline
-        .as_ref()
-        .and_then(|value| value.get("error"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("no error detail");
+    .await?;
+    let diagnostic = terminal_diagnostic(terminal.inline.as_ref());
     ensure!(
         terminal.outcome == TerminalOutcome::Completed,
         "canary marker effect ended as {} with exit code {:?}: {diagnostic}",
@@ -649,13 +550,24 @@ fn connector_routed_special_use_ipv4_fixtures() -> Vec<&'static str> {
         .collect()
 }
 
+/// Wraps a canary module script (with the shared probe helper spliced in) into the in-guest
+/// heredoc command.
+fn canary_node_command(marker: &str, script: &str) -> String {
+    format!(
+        "node --input-type=module <<'{marker}'\n{}\n{marker}",
+        script
+            .replace("__PROBE__", include_str!("canary/probe.mjs").trim_end())
+            .trim_end()
+    )
+}
+
 fn restricted_network_execution(
     operation_id: &str,
     generation: &str,
     root_id: &str,
     session_id: &str,
     gateway: &GatewayAuthority,
-    class: ConnectorClass,
+    class: RestrictedClass,
 ) -> anyhow::Result<SandboxExecutionRequest> {
     ensure!(
         gateway.host().parse::<Ipv4Addr>().is_ok(),
@@ -675,10 +587,10 @@ fn restricted_network_execution(
         !controls.is_empty(),
         "canonical public control set is empty"
     );
-    let (label, network, require_gateway) = match class {
-        ConnectorClass::None => ("none", serde_json::json!({"kind": "none"}), false),
-        ConnectorClass::Allowlist => (
-            "allowlist",
+    let label = class.label();
+    let (network, require_gateway) = match class {
+        RestrictedClass::None => (serde_json::json!({"kind": "none"}), false),
+        RestrictedClass::Allowlist => (
             serde_json::json!({
                 "kind": "allowlist",
                 "destinations": [{
@@ -689,127 +601,26 @@ fn restricted_network_execution(
             }),
             true,
         ),
-        ConnectorClass::Public => bail!("restricted network canary cannot use public"),
     };
 
-    let command = r#"node --input-type=module <<'AEX_RESTRICTED_NETWORK_CANARY'
-import dns from "node:dns";
-import net from "node:net";
-
-const connectorClass = __CLASS__;
-const denied = __DENIED__;
-const controls = __CONTROLS__;
-const gateway = __GATEWAY__;
-const requireGateway = __REQUIRE_GATEWAY__;
-
-function probe(host, port) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const socket = net.connect({ host, port });
-    const finish = (reachable) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(reachable);
-    };
-    const timer = setTimeout(() => finish(false), 1500);
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-  });
-}
-
-function dnsOutcome(host) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (outcome) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(outcome);
-    };
-    const timer = setTimeout(() => finish("timeout"), 3000);
-    dns.lookup(host, (error) => finish(error ? "blocked" : "resolved"));
-  });
-}
-
-function gatewayStatus(request) {
-  return new Promise((resolve) => {
-    let settled = false;
-    let response = "";
-    const socket = net.connect({ host: gateway.host, port: gateway.port });
-    const finish = (status) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(status);
-    };
-    const timer = setTimeout(() => finish(null), 3000);
-    socket.once("connect", () => socket.write(request));
-    socket.on("data", (chunk) => {
-      response += chunk.toString("ascii");
-      const lineEnd = response.indexOf("\r\n");
-      if (lineEnd === -1) return;
-      const match = /^HTTP\/1\.1 ([0-9]{3}) /.exec(response.slice(0, lineEnd));
-      finish(match ? Number(match[1]) : null);
-    });
-    socket.once("error", () => finish(null));
-    socket.once("end", () => finish(null));
-  });
-}
-
-const dnsState = await dnsOutcome("example.com");
-if (dnsState !== "blocked") {
-  throw new Error(`restricted connector DNS was not fail-closed: ${dnsState}`);
-}
-
-const directHosts = [...new Set([...denied, ...controls])];
-if (!requireGateway) directHosts.push(gateway.host);
-const directResults = await Promise.all(directHosts.map(async (host) => [
-  host,
-  (await Promise.all([53, 80, 443, 8443].map((port) => probe(host, port)))).some(Boolean),
-]));
-const reachableDirect = directResults.filter(([, reachable]) => reachable).map(([host]) => host);
-if (reachableDirect.length !== 0) {
-  throw new Error(`restricted connector accepted direct TCP: ${reachableDirect.join(",")}`);
-}
-
-if (requireGateway) {
-  const health = await gatewayStatus(
-    `GET /healthz HTTP/1.1\r\nHost: ${gateway.host}\r\nConnection: close\r\n\r\n`,
-  );
-  if (health !== 200) throw new Error(`allowlist gateway health was not reachable: ${health}`);
-  const unauthenticated = await gatewayStatus(
-    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nConnection: close\r\n\r\n",
-  );
-  if (unauthenticated !== 407) {
-    throw new Error(`allowlist gateway accepted or misclassified missing auth: ${unauthenticated}`);
-  }
-  const invalid = await gatewayStatus(
-    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer invalid-release-canary-capability\r\nConnection: close\r\n\r\n",
-  );
-  if (invalid !== 403) {
-    throw new Error(`allowlist gateway accepted or misclassified invalid auth: ${invalid}`);
-  }
-}
-
-process.stdout.write(`restricted_network_canary=ok class=${connectorClass} denied=${denied.length} controls=${controls.length}\n`);
-AEX_RESTRICTED_NETWORK_CANARY"#
-        .replace("__CLASS__", &serde_json::to_string(label)?)
-        .replace("__DENIED__", &serde_json::to_string(&denied)?)
-        .replace("__CONTROLS__", &serde_json::to_string(&controls)?)
-        .replace(
-            "__GATEWAY__",
-            &serde_json::to_string(&serde_json::json!({
-                "host": gateway.host(),
-                "port": gateway.port().get()
-            }))?,
-        )
-        .replace(
-            "__REQUIRE_GATEWAY__",
-            if require_gateway { "true" } else { "false" },
-        );
+    let command = canary_node_command(
+        "AEX_RESTRICTED_NETWORK_CANARY",
+        &include_str!("canary/restricted-network.mjs")
+            .replace("__CLASS__", &serde_json::to_string(label)?)
+            .replace("__DENIED__", &serde_json::to_string(&denied)?)
+            .replace("__CONTROLS__", &serde_json::to_string(&controls)?)
+            .replace(
+                "__GATEWAY__",
+                &serde_json::to_string(&serde_json::json!({
+                    "host": gateway.host(),
+                    "port": gateway.port().get()
+                }))?,
+            )
+            .replace(
+                "__REQUIRE_GATEWAY__",
+                if require_gateway { "true" } else { "false" },
+            ),
+    );
     let mut request: SandboxExecutionRequest = serde_json::from_value(serde_json::json!({
         "execution_id": operation_id,
         "expected_generation": generation,
@@ -851,198 +662,23 @@ fn public_network_execution(
         !controls.is_empty(),
         "canonical public control set is empty"
     );
-    validate_customer_hand_hosts(customer_hand_hosts)?;
     let http_surfaces = [
         serde_json::json!({"host": "aex.dev", "path": "/"}),
         serde_json::json!({"host": "api.aex.dev", "path": "/v1/rates"}),
         serde_json::json!({"host": "api-dev.aex.dev", "path": "/v1/rates"}),
     ];
 
-    let command = r#"node --input-type=module <<'AEX_NETWORK_CANARY'
-import https from "node:https";
-import net from "node:net";
-
-const denied = __DENIED__;
-const controls = __CONTROLS__;
-const httpSurfaces = __HTTP_SURFACES__;
-const customerHandHosts = __CUSTOMER_HAND_HOSTS__;
-
-function probe(host, port) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const socket = net.connect({ host, port });
-    const finish = (reachable) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(reachable);
-    };
-    const timer = setTimeout(() => finish(false), 1500);
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-  });
-}
-
-async function anyReachable(host, ports) {
-  const outcomes = await Promise.all(ports.map((port) => probe(host, port)));
-  return outcomes.some(Boolean);
-}
-
-function requestStatus(module, options) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (status) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(status);
-    };
-    const request = module.request(options);
-    const timer = setTimeout(() => {
-      request.destroy();
-      finish(null);
-    }, 3000);
-    request.once("response", (response) => {
-      response.resume();
-      finish(response.statusCode ?? null);
-    });
-    request.once("upgrade", (response, socket) => {
-      socket.destroy();
-      finish(response.statusCode ?? 101);
-    });
-    request.once("error", () => finish(null));
-    request.end();
-  });
-}
-
-function requestText(module, options, maxBytes) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const request = module.request(options);
-    const timer = setTimeout(() => {
-      request.destroy();
-      finish(null);
-    }, 3000);
-    request.once("response", (response) => {
-      if (response.statusCode !== 200) {
-        response.resume();
-        finish(null);
-        return;
-      }
-      const chunks = [];
-      let bytes = 0;
-      response.on("data", (chunk) => {
-        bytes += chunk.length;
-        if (bytes > maxBytes) {
-          response.destroy();
-          finish(null);
-          return;
-        }
-        chunks.push(chunk);
-      });
-      response.once("end", () => finish(Buffer.concat(chunks).toString("utf8").trim()));
-      response.once("error", () => finish(null));
-    });
-    request.once("error", () => finish(null));
-    request.end();
-  });
-}
-
-const specialResults = await Promise.all(
-  denied.map(async (host) => [host, await anyReachable(host, [80, 443])]),
-);
-const reachableSpecial = specialResults.filter(([, reachable]) => reachable).map(([host]) => host);
-if (reachableSpecial.length !== 0) {
-  throw new Error(`special-use destinations accepted TCP: ${reachableSpecial.join(",")}`);
-}
-
-const controlResults = await Promise.all(
-  controls.map(async (host) => [host, await anyReachable(host, [53, 80, 443])]),
-);
-const reachableControls = controlResults.filter(([, reachable]) => reachable).map(([host]) => host);
-if (reachableControls.length === 0) {
-  throw new Error("no public control was reachable");
-}
-
-const rawPublicSource = await requestText(https, {
-  hostname: "checkip.amazonaws.com",
-  path: "/",
-  port: 443,
-  method: "GET",
-}, 64);
-const observedPublicSource = net.isIP(rawPublicSource ?? "") === 4
-  ? rawPublicSource
-  : "unavailable";
-
-const aexSurfaceResults = await Promise.all(httpSurfaces.map(async (surface) => ({
-  surface,
-  status: await requestStatus(https, {
-    hostname: surface.host,
-    path: surface.path,
-    port: 443,
-    method: "GET",
-  }),
-})));
-for (const { surface, status } of aexSurfaceResults) {
-  if (status !== 403) {
-    throw new Error(
-      `Aex HTTPS surface did not return the expected source denial: ${surface.host} status=${status} source=${observedPublicSource}`,
+    let command = canary_node_command(
+        "AEX_NETWORK_CANARY",
+        &include_str!("canary/public-network.mjs")
+            .replace("__DENIED__", &serde_json::to_string(&denied)?)
+            .replace("__CONTROLS__", &serde_json::to_string(&controls)?)
+            .replace("__HTTP_SURFACES__", &serde_json::to_string(&http_surfaces)?)
+            .replace(
+                "__CUSTOMER_HAND_HOSTS__",
+                &serde_json::to_string(customer_hand_hosts)?,
+            ),
     );
-  }
-}
-
-const customerHandResults = await Promise.all(customerHandHosts.map(async (host) => ({
-  host,
-  websocketStatus: await requestStatus(https, {
-    hostname: host,
-    path: "/v1",
-    port: 443,
-    method: "GET",
-    headers: {
-      Connection: "Upgrade",
-      Upgrade: "websocket",
-      "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
-      "Sec-WebSocket-Version": "13",
-    },
-  }),
-  managementStatus: await requestStatus(https, {
-    hostname: host,
-    // Use the documented API Gateway connection-id shape so the request reaches IAM
-    // authentication instead of failing earlier as an invalid identifier.
-    path: "/v1/@connections/L0SM9cOFvHcCIhw%3D",
-    port: 443,
-    method: "POST",
-    headers: { "Content-Length": "0" },
-  }),
-})));
-for (const { host, websocketStatus, managementStatus } of customerHandResults) {
-  if (websocketStatus !== 401 && websocketStatus !== 403) {
-    throw new Error(`customer Hand WebSocket did not return an authentication denial: ${host}`);
-  }
-  if (managementStatus !== 401 && managementStatus !== 403) {
-    throw new Error(`customer Hand Management API did not return an authentication denial: ${host}`);
-  }
-}
-
-process.stdout.write(`network_canary=ok denied=${denied.length} controls=${controls.length} surfaces=${httpSurfaces.length + customerHandHosts.length} source=${observedPublicSource}\n`);
-AEX_NETWORK_CANARY"#
-        .replace("__DENIED__", &serde_json::to_string(&denied)?)
-        .replace("__CONTROLS__", &serde_json::to_string(&controls)?)
-        .replace(
-            "__HTTP_SURFACES__",
-            &serde_json::to_string(&http_surfaces)?,
-        )
-        .replace(
-            "__CUSTOMER_HAND_HOSTS__",
-            &serde_json::to_string(customer_hand_hosts)?,
-        );
     let mut request: SandboxExecutionRequest = serde_json::from_value(serde_json::json!({
         "execution_id": operation_id,
         "expected_generation": generation,
@@ -1066,8 +702,9 @@ AEX_NETWORK_CANARY"#
     Ok(request)
 }
 
-fn validate_customer_hand_hosts(hosts: &[String; 2]) -> anyhow::Result<()> {
+fn validate_customer_hand_hosts(hosts: &[String; 2], region: &str) -> anyhow::Result<()> {
     ensure!(hosts[0] != hosts[1], "customer Hand hosts must be distinct");
+    let suffix = format!(".execute-api.{region}.amazonaws.com");
     for host in hosts {
         ensure!(
             host.len() <= 253
@@ -1077,7 +714,7 @@ fn validate_customer_hand_hosts(hosts: &[String; 2]) -> anyhow::Result<()> {
                         || byte.is_ascii_digit()
                         || matches!(byte, b'.' | b'-')
                 })
-                && host.ends_with(".execute-api.us-east-1.amazonaws.com")
+                && host.ends_with(&suffix)
                 && host.split('.').all(|label| {
                     !label.is_empty()
                         && label.len() <= 63
@@ -1189,26 +826,43 @@ async fn assert_persistent_502(
     let deadline = tokio::time::Instant::now() + STATE_TIMEOUT;
     let mut consecutive = 0usize;
     while tokio::time::Instant::now() < deadline {
-        let state = control.get(&hand.microvm_id).await?.state;
-        let status = http
+        // The state read only decorates the probe log; a transient control-plane blip must not
+        // abort a destructive gate that has a live VM outstanding.
+        let state = match control.get(&hand.microvm_id).await {
+            Ok(vm) => Some(vm.state),
+            Err(ControlError::Retryable(_) | ControlError::Throttled(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        // A transport failure is not a 502 observation: the consecutive run restarts and only
+        // the deadline can fail the gate.
+        let status = match http
             .get(format!("{}/", hand.endpoint))
             .header(AUTH_HEADER, &hand.auth_token)
             .timeout(PROBE_TIMEOUT)
             .send()
-            .await?
-            .status();
-        tracing::info!(microvm = %hand.microvm_id, ?state, %status, phase, "no-respawn canary probe");
-        if status.as_u16() == 502 {
-            consecutive += 1;
-            if consecutive == REQUIRED_CONSECUTIVE_502 {
-                return Ok(());
+            .await
+        {
+            Ok(response) => Some(response.status()),
+            Err(error) => {
+                tracing::info!(microvm = %hand.microvm_id, %error, phase, "no-respawn canary probe transport error");
+                consecutive = 0;
+                None
             }
-        } else {
-            ensure!(
-                !status.is_success(),
-                "image canary endpoint rearmed during {phase}"
-            );
-            consecutive = 0;
+        };
+        tracing::info!(microvm = %hand.microvm_id, ?state, ?status, phase, "no-respawn canary probe");
+        if let Some(status) = status {
+            if status.as_u16() == 502 {
+                consecutive += 1;
+                if consecutive == REQUIRED_CONSECUTIVE_502 {
+                    return Ok(());
+                }
+            } else {
+                ensure!(
+                    !status.is_success(),
+                    "image canary endpoint rearmed during {phase}"
+                );
+                consecutive = 0;
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1372,7 +1026,7 @@ mod tests {
     #[test]
     fn restricted_connector_canaries_cover_dns_direct_tcp_and_gateway_auth() {
         let gateway = GatewayAuthority::parse("10.42.0.10:8443").unwrap();
-        for class in [ConnectorClass::None, ConnectorClass::Allowlist] {
+        for class in [RestrictedClass::None, RestrictedClass::Allowlist] {
             let request = restricted_network_execution(
                 "restricted-network-operation",
                 "restricted-network-generation",
@@ -1404,7 +1058,7 @@ mod tests {
                 }
             }
             match class {
-                ConnectorClass::None => {
+                RestrictedClass::None => {
                     assert!(matches!(request.network, NetworkCeiling::None));
                     assert!(
                         request
@@ -1413,7 +1067,7 @@ mod tests {
                             .contains("const requireGateway = false;")
                     );
                 }
-                ConnectorClass::Allowlist => {
+                RestrictedClass::Allowlist => {
                     assert!(matches!(request.network, NetworkCeiling::Allowlist(_)));
                     assert!(
                         request
@@ -1425,18 +1079,20 @@ mod tests {
                     assert!(request.input.command.contains("unauthenticated !== 407"));
                     assert!(request.input.command.contains("invalid !== 403"));
                 }
-                ConnectorClass::Public => unreachable!(),
             }
         }
     }
 
     #[test]
-    fn customer_hand_canary_hosts_are_two_distinct_us_east_1_api_gateway_hosts() {
+    fn customer_hand_canary_hosts_are_two_distinct_regional_api_gateway_hosts() {
         assert!(
-            validate_customer_hand_hosts(&[
-                "dev123.execute-api.us-east-1.amazonaws.com".into(),
-                "prd456.execute-api.us-east-1.amazonaws.com".into(),
-            ])
+            validate_customer_hand_hosts(
+                &[
+                    "dev123.execute-api.us-east-1.amazonaws.com".into(),
+                    "prd456.execute-api.us-east-1.amazonaws.com".into(),
+                ],
+                "us-east-1"
+            )
             .is_ok()
         );
         for invalid in [
@@ -1453,7 +1109,7 @@ mod tests {
                 "prd456.execute-api.us-east-1.amazonaws.com".into(),
             ],
         ] {
-            assert!(validate_customer_hand_hosts(&invalid).is_err());
+            assert!(validate_customer_hand_hosts(&invalid, "us-east-1").is_err());
         }
     }
 

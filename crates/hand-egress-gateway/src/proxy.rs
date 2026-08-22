@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::capability::{MAX_ENCODED_TOKEN_BYTES, now_ms, verify_token};
+use crate::capability::{MAX_ENCODED_TOKEN_BYTES, VerifiedCapability, now_ms, verify_token};
 use crate::config::Config;
 use crate::policy::{AuthorizedTarget, authorize};
 
@@ -140,36 +140,75 @@ async fn handle_http(
     setup_permit: OwnedSemaphorePermit,
     deadline: tokio::time::Instant,
 ) -> Result<(), ProxyError> {
-    let request = read_http_header(&mut client, first, deadline).await?;
-    let parsed = match parse_connect(&request) {
-        Ok(parsed) => parsed,
+    // Every rejection funnels through one place, so a new check cannot forget its HTTP answer.
+    let established = match connect_setup(
+        &mut client,
+        first,
+        config,
+        tunnels,
+        roots,
+        setup_permit,
+        deadline,
+    )
+    .await
+    {
+        Ok(established) => established,
         Err(error) => {
-            write_http_error(&mut client, 400, "Bad Request").await?;
+            match error.http_response() {
+                Some((407, _)) => {
+                    client
+                            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\nProxy-Authenticate: Bearer\r\n\r\n")
+                            .await?;
+                }
+                Some((status, reason)) => {
+                    write_http_error(&mut client, status, reason).await?;
+                }
+                None => {}
+            }
             return Err(error);
         }
     };
-    let Some(token) = parsed.token else {
-        client
-            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\nProxy-Authenticate: Bearer\r\n\r\n")
-            .await?;
-        return Err(ProxyError::Authentication);
-    };
-    let capability = match verify_token(&token, &config.public_key, now_ms()) {
-        Ok(capability) => capability,
-        Err(error) => {
-            write_http_error(&mut client, 403, "Forbidden").await?;
-            return Err(error.into());
-        }
-    };
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    tunnel(
+        client,
+        established.upstream,
+        established.target,
+        config,
+        deadline,
+        established.capability_expires_at_ms,
+        established.guards,
+    )
+    .await
+}
+
+/// Everything a CONNECT needs before the 200 is written: the connected upstream, the authorized
+/// target, and the capacity guards the tunnel must hold.
+struct EstablishedConnect {
+    upstream: TcpStream,
+    target: AuthorizedTarget,
+    capability_expires_at_ms: u64,
+    guards: TunnelGuards,
+}
+
+async fn connect_setup(
+    client: &mut TcpStream,
+    first: u8,
+    config: &Config,
+    tunnels: Arc<Semaphore>,
+    roots: Arc<RootQuotas>,
+    setup_permit: OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
+) -> Result<EstablishedConnect, ProxyError> {
+    let request = read_http_header(client, first, deadline).await?;
+    let capability = authenticate(&request, config)?;
+    let parsed = parse_connect(&request)?;
     let capability_expires_at_ms = capability.capability.expires_at_ms;
-    let root_permit = match roots.acquire(&capability.capability.root_id) {
-        Some(permit) => permit,
-        None => {
-            write_http_error(&mut client, 429, "Too Many Requests").await?;
-            return Err(ProxyError::RootCapacity);
-        }
-    };
-    let target = match tokio::time::timeout_at(
+    let root_permit = roots
+        .acquire(&capability.capability.root_id)
+        .ok_or(ProxyError::RootCapacity)?;
+    let target = tokio::time::timeout_at(
         deadline,
         authorize(
             &capability,
@@ -180,49 +219,36 @@ async fn handle_http(
         ),
     )
     .await
-    {
-        Ok(Ok(target)) => target,
-        Ok(Err(error)) => {
-            write_http_error(&mut client, 403, "Forbidden").await?;
-            return Err(error.into());
-        }
-        Err(_) => {
-            write_http_error(&mut client, 504, "Gateway Timeout").await?;
-            return Err(ProxyError::SetupTimeout);
-        }
-    };
-    let tunnel_permit = match tokio::time::timeout_at(deadline, tunnels.acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        _ => {
-            write_http_error(&mut client, 503, "Service Unavailable").await?;
-            return Err(ProxyError::Capacity);
-        }
-    };
+    .map_err(|_| ProxyError::SetupTimeout)??;
+    let tunnel_permit = tokio::time::timeout_at(deadline, tunnels.acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(ProxyError::Capacity)?;
+    // The setup slot converts into a tunnel slot here, before the upstream dial: a slow dial
+    // must consume relay capacity, not the bounded handshake budget.
     drop(setup_permit);
-    let upstream = match tokio::time::timeout_at(deadline, TcpStream::connect(target.address)).await
-    {
-        Ok(Ok(stream)) => stream,
-        _ => {
-            write_http_error(&mut client, 502, "Bad Gateway").await?;
-            return Err(ProxyError::Upstream);
-        }
-    };
-    client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-    tunnel(
-        client,
+    let upstream = tokio::time::timeout_at(deadline, TcpStream::connect(target.address))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(ProxyError::Upstream)?;
+    Ok(EstablishedConnect {
         upstream,
         target,
-        config,
-        deadline,
         capability_expires_at_ms,
-        TunnelGuards {
+        guards: TunnelGuards {
             _global: tunnel_permit,
             _root: root_permit,
         },
-    )
-    .await
+    })
+}
+
+/// Verifies the bearer capability on the CONNECT request.
+fn authenticate(request: &str, config: &Config) -> Result<VerifiedCapability, ProxyError> {
+    let parsed = parse_connect(request)?;
+    let token = parsed.token.ok_or(ProxyError::Authentication)?;
+    Ok(verify_token(&token, &config.public_key, now_ms())?)
 }
 
 struct ConnectRequest<'a> {
@@ -529,6 +555,29 @@ enum ProxyError {
     Policy(#[from] crate::policy::PolicyError),
     #[error(transparent)]
     Tls(#[from] crate::tls::TlsError),
+}
+
+impl ProxyError {
+    /// The HTTP answer a pre-tunnel rejection owes the client. `None` means the failure has no
+    /// HTTP context (broken socket) or happened after the 200 was written (tunnel-phase errors).
+    fn http_response(&self) -> Option<(u16, &'static str)> {
+        match self {
+            ProxyError::MalformedRequest => Some((400, "Bad Request")),
+            ProxyError::Authentication => Some((407, "Proxy Authentication Required")),
+            ProxyError::Capability(_) | ProxyError::Policy(_) => Some((403, "Forbidden")),
+            ProxyError::RootCapacity => Some((429, "Too Many Requests")),
+            ProxyError::RequestTooLarge => Some((431, "Request Header Fields Too Large")),
+            ProxyError::Upstream => Some((502, "Bad Gateway")),
+            ProxyError::Capacity => Some((503, "Service Unavailable")),
+            ProxyError::SetupTimeout => Some((504, "Gateway Timeout")),
+            ProxyError::Io(_)
+            | ProxyError::UnsupportedProtocol
+            | ProxyError::RelayLimit
+            | ProxyError::CapabilityExpired
+            | ProxyError::SniMismatch
+            | ProxyError::Tls(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]

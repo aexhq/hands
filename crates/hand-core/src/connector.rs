@@ -6,14 +6,9 @@ use std::num::NonZeroU16;
 
 use serde::{Deserialize, Serialize};
 
-/// The only managed-sandbox connector classes in the MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectorClass {
-    None,
-    Public,
-    Allowlist,
-}
+// The class vocabulary lives in `hand-policy`; this re-export keeps catalog consumers on one
+// import path.
+pub use hand_policy::connector::ConnectorClass;
 
 /// An opaque platform connector identity. Hands never derives an ARN from tenant input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

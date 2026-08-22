@@ -16,6 +16,7 @@ brain.workspace = true
 brain-protocol.workspace = true
 hand-lambda = { path = "../hand-lambda" }
 hand-core = { path = "../hand-core" }
+hand-policy = { path = "../hand-policy" }
 hand-egress-gateway = { path = "../hand-egress-gateway" }
 hand-wire = { path = "../hand-wire" }
 
@@ -41,5 +42,4 @@ tokio-util.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 zeroize.workspace = true

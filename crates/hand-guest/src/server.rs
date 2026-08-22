@@ -26,7 +26,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio_util::io::ReaderStream;
 
-use crate::errors::invalid;
+use crate::errors::{hand_error, invalid, status_for};
 use crate::hand::Hand;
 use crate::hooks;
 
@@ -220,7 +220,12 @@ async fn serve_connection(hand: Arc<Hand>, mut socket: WebSocket) {
         };
         let frame = match serde_json::from_str::<RequestFrame>(&text) {
             Ok(frame) => frame,
-            Err(_) => continue,
+            Err(error) => {
+                // No decodable request_id means no addressable error frame; at least be visible
+                // instead of letting the caller block until its own timeout.
+                tracing::warn!(%error, "undecodable request frame was dropped");
+                continue;
+            }
         };
         let request_id = frame.request_id.clone();
         let result = if frame.contract_digest != HAND_CONTRACT_DIGEST.trim() {
@@ -256,7 +261,29 @@ async fn serve_connection(hand: Arc<Hand>, mut socket: WebSocket) {
                     std::process::abort();
                 }
             }
-            _ => break,
+            // A response one byte over the frame bound must surface as an addressable error, not
+            // as a silent connection drop the client can only read as Hand loss.
+            _ => {
+                let refusal = ResponseFrame {
+                    request_id: response.request_id,
+                    result: Err(hand_error(
+                        brain_protocol::hand::HandErrorCode::ResourceExhausted,
+                        false,
+                        "response exceeded the wire frame bound and was withheld",
+                    )),
+                };
+                match serde_json::to_string(&refusal) {
+                    Ok(text) => {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "error frame did not serialize; closing");
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -566,7 +593,7 @@ fn reply<T: serde::Serialize>(
             Json(serde_json::to_value(value).expect("install receipt serializes")),
         ),
         Err(error) => (
-            StatusCode::CONFLICT,
+            status_for(error.code),
             Json(serde_json::json!({"error": error.message.as_str(), "code": error.code})),
         ),
     }

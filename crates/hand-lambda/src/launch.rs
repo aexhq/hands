@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use aws_sdk_lambdamicrovms::types::MicrovmState;
-use hand_core::connector::ConnectorRef;
 use hand_core::materialization::ControlToken;
 use hand_wire::{CONTROL_AUTH_HEADER, RunPayload};
 
@@ -49,34 +48,9 @@ pub struct LaunchedTarget {
     pub microvm_id: String,
 }
 
-/// The run-hook payload the guest expects (`hand_guest::hooks::RunPayload`).
+/// The run-hook payload the guest expects (`hand_wire::RunPayload`).
 pub fn run_payload(payload: &RunPayload) -> anyhow::Result<String> {
     serde_json::to_string(payload).context("serializing the closed Hand run payload")
-}
-
-/// Convenience launch for release canaries that always terminate their known target and do not
-/// participate in durable crash recovery. Production target materialization uses
-/// [`launch_exact`] after persisting the full request.
-///
-/// Readiness is deliberately after that CAS. Losing a wait/readiness response must never discard a
-/// provider identity that is already known or strand its charged capacity until the eight-hour
-/// uncertainty wall.
-pub async fn launch(
-    control: &Control,
-    image_arn: &str,
-    image_version: &str,
-    run_data: &str,
-    client_token: &str,
-    egress_connector: &ConnectorRef,
-) -> Result<LaunchedTarget, LaunchFailure> {
-    let request = control.exact_run_request(
-        image_arn,
-        image_version,
-        run_data,
-        client_token,
-        egress_connector,
-    );
-    launch_exact(control, &request).await
 }
 
 /// Replays a complete request that was durably sealed before the first provider dispatch. AWS
@@ -91,7 +65,7 @@ pub async fn launch_exact(
 }
 
 /// `RunMicrovm` returns the endpoint as a bare host (`mvm-….on.aws`); make it a scheme-qualified
-/// origin with no trailing slash, so `probe` and `ws_url` can build URLs off it directly.
+/// origin with no trailing slash, so `ws_url` and endpoint probes can build URLs off it directly.
 #[must_use]
 pub fn normalise_endpoint(endpoint: &str) -> String {
     let host = endpoint

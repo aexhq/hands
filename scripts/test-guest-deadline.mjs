@@ -70,6 +70,26 @@ async function call(method, params) {
   return response;
 }
 
+const TARGET = {
+  binding_ref: "sandbox-binding-ci",
+  kind: "additional",
+  root_id: "root-ci",
+  sandbox_id: "sandbox-ci",
+  session_id: "session-ci",
+};
+
+// Seals a request in place: the canonical digest is computed over the value without its own
+// request_digest (and any listed non-canonical fields), exactly as the guest re-derives it.
+function sealed(value, omit = []) {
+  const projection = { ...value };
+  delete projection.request_digest;
+  for (const field of omit) delete projection[field];
+  value.request_digest = createHash("sha256")
+    .update(canonicalJson(projection))
+    .digest("hex");
+  return value;
+}
+
 function execution(id, prefix, timeoutMs) {
   const value = {
     execution_id: id,
@@ -85,20 +105,9 @@ function execution(id, prefix, timeoutMs) {
     network: { kind: "none" },
     request_digest: "0".repeat(64),
     resources: { max_output_bytes: 1024, timeout_ms: timeoutMs },
-    target: {
-      binding_ref: "sandbox-binding-ci",
-      kind: "additional",
-      root_id: "root-ci",
-      sandbox_id: "sandbox-ci",
-      session_id: "session-ci",
-    },
+    target: { ...TARGET },
   };
-  const digestProjection = { ...value };
-  delete digestProjection.request_digest;
-  value.request_digest = createHash("sha256")
-    .update(canonicalJson(digestProjection))
-    .digest("hex");
-  return value;
+  return sealed(value);
 }
 
 function stdinRequest(executionId, operationId, text, eof = false) {
@@ -108,21 +117,10 @@ function stdinRequest(executionId, operationId, text, eof = false) {
     expected_generation: "generation-ci",
     operation_id: operationId,
     request_digest: "0".repeat(64),
-    target: {
-      binding_ref: "sandbox-binding-ci",
-      kind: "additional",
-      root_id: "root-ci",
-      sandbox_id: "sandbox-ci",
-      session_id: "session-ci",
-    },
+    target: { ...TARGET },
     text,
   };
-  const digestProjection = { ...value };
-  delete digestProjection.request_digest;
-  value.request_digest = createHash("sha256")
-    .update(canonicalJson(digestProjection))
-    .digest("hex");
-  return value;
+  return sealed(value);
 }
 
 function sandboxExecution(executionId, command, timeoutMs, interactive = false) {
@@ -133,20 +131,9 @@ function sandboxExecution(executionId, command, timeoutMs, interactive = false) 
     network: { kind: "none" },
     request_digest: "0".repeat(64),
     resources: { max_output_bytes: 65536, timeout_ms: timeoutMs },
-    target: {
-      binding_ref: "sandbox-binding-ci",
-      kind: "additional",
-      root_id: "root-ci",
-      sandbox_id: "sandbox-ci",
-      session_id: "session-ci",
-    },
+    target: { ...TARGET },
   };
-  const projection = { ...value };
-  delete projection.request_digest;
-  value.request_digest = createHash("sha256")
-    .update(canonicalJson(projection))
-    .digest("hex");
-  return value;
+  return sealed(value);
 }
 
 const deadlineExecution = execution("deadline-execution-ci", "deadline", 250);
@@ -249,41 +236,55 @@ export default {
   },
 };
 `);
-const bundleDigest = createHash("sha256").update(bundle).digest("hex");
-const descriptor = {
-  bundle_digest: bundleDigest,
-  bytes: bundle.length,
-  contract_digest: contractDigest,
-  description: "Per-binding procfs isolation fixture.",
-  object: {
-    bytes: bundle.length,
-    object_id: "proc-secret-bundle-ci",
-    sha256: bundleDigest,
-  },
-  required_env: ["PROC_SECRET"],
-  runtime: "node22",
-  tool_name: "proc_secret_fixture",
-};
-await postInstall(
-  `/internal/bundles/${bundleDigest}`,
-  Buffer.concat([Buffer.from(`${JSON.stringify({ descriptor })}\n`), bundle]),
-  "application/octet-stream",
-);
-await postInstall("/internal/bindings", {
-  binding_ref: "proc-secret-binding-ci",
-  binding: {
-    binding_id: "proc-secret-binding-ci",
-    bundle: descriptor,
-    capability: "proc_secret_fixture",
+// Installs one fixture bundle plus its sealed binding; both installs derive from one descriptor.
+async function installFixtureBinding(bundleBytes, options) {
+  const digest = createHash("sha256").update(bundleBytes).digest("hex");
+  const descriptor = {
+    bundle_digest: digest,
+    bytes: bundleBytes.length,
     contract_digest: contractDigest,
-    implementation_identity: "b".repeat(64),
-    policy_digest: "c".repeat(64),
-    realm: "aex_managed",
-    realm_id: "aex",
-    required_capabilities: ["execution"],
-    root_id: "root-ci",
-    session_id: "session-ci",
-  },
+    description: options.description,
+    object: {
+      bytes: bundleBytes.length,
+      object_id: options.objectId,
+      sha256: digest,
+    },
+    required_env: options.requiredEnv,
+    runtime: "node22",
+    tool_name: options.toolName,
+  };
+  await postInstall(
+    `/internal/bundles/${digest}`,
+    Buffer.concat([Buffer.from(`${JSON.stringify({ descriptor })}\n`), bundleBytes]),
+    "application/octet-stream",
+  );
+  await postInstall("/internal/bindings", {
+    binding_ref: options.bindingRef,
+    binding: {
+      binding_id: options.bindingRef,
+      bundle: descriptor,
+      capability: options.toolName,
+      contract_digest: contractDigest,
+      implementation_identity: options.implementationIdentity,
+      policy_digest: options.policyDigest,
+      realm: "aex_managed",
+      realm_id: "aex",
+      required_capabilities: ["execution"],
+      root_id: "root-ci",
+      session_id: "session-ci",
+    },
+  });
+  return descriptor;
+}
+
+await installFixtureBinding(bundle, {
+  bindingRef: "proc-secret-binding-ci",
+  toolName: "proc_secret_fixture",
+  description: "Per-binding procfs isolation fixture.",
+  objectId: "proc-secret-bundle-ci",
+  requiredEnv: ["PROC_SECRET"],
+  implementationIdentity: "b".repeat(64),
+  policyDigest: "c".repeat(64),
 });
 
 const attackerBundle = Buffer.from(`
@@ -338,41 +339,14 @@ export default {
   }),
 };
 `);
-const attackerDigest = createHash("sha256").update(attackerBundle).digest("hex");
-const attackerDescriptor = {
-  bundle_digest: attackerDigest,
-  bytes: attackerBundle.length,
-  contract_digest: contractDigest,
+await installFixtureBinding(attackerBundle, {
+  bindingRef: "proc-attacker-binding-ci",
+  toolName: "proc_attacker_fixture",
   description: "Different-binding procfs attacker fixture.",
-  object: {
-    bytes: attackerBundle.length,
-    object_id: "proc-attacker-bundle-ci",
-    sha256: attackerDigest,
-  },
-  required_env: [],
-  runtime: "node22",
-  tool_name: "proc_attacker_fixture",
-};
-await postInstall(
-  `/internal/bundles/${attackerDigest}`,
-  Buffer.concat([Buffer.from(`${JSON.stringify({ descriptor: attackerDescriptor })}\n`), attackerBundle]),
-  "application/octet-stream",
-);
-await postInstall("/internal/bindings", {
-  binding_ref: "proc-attacker-binding-ci",
-  binding: {
-    binding_id: "proc-attacker-binding-ci",
-    bundle: attackerDescriptor,
-    capability: "proc_attacker_fixture",
-    contract_digest: contractDigest,
-    implementation_identity: "d".repeat(64),
-    policy_digest: "e".repeat(64),
-    realm: "aex_managed",
-    realm_id: "aex",
-    required_capabilities: ["execution"],
-    root_id: "root-ci",
-    session_id: "session-ci",
-  },
+  objectId: "proc-attacker-bundle-ci",
+  requiredEnv: [],
+  implementationIdentity: "d".repeat(64),
+  policyDigest: "e".repeat(64),
 });
 await postInstall("/internal/secrets", {
   env_names: ["PROC_SECRET"],
@@ -400,13 +374,7 @@ const managedEnvelope = (operationId, bindingRef, capability, input) => {
     trace: {},
     turn_id: "turn-ci",
   };
-  const projection = { ...envelope };
-  delete projection.request_digest;
-  delete projection.trace;
-  envelope.request_digest = createHash("sha256")
-    .update(canonicalJson(projection))
-    .digest("hex");
-  return envelope;
+  return sealed(envelope, ["trace"]);
 };
 const primaryEnvelope = managedEnvelope(
   "proc-secret-primary-operation-ci",
@@ -548,11 +516,7 @@ assert.equal(sameBindingObservation.terminal.outcome, "cancelled");
 const blockedExecution = execution("blocked-stdin-execution-ci", "blocked-stdin", 60_000);
 blockedExecution.input.command = "sleep 60";
 blockedExecution.input.interactive = true;
-const blockedProjection = { ...blockedExecution };
-delete blockedProjection.request_digest;
-blockedExecution.request_digest = createHash("sha256")
-  .update(canonicalJson(blockedProjection))
-  .digest("hex");
+sealed(blockedExecution);
 const blockedReceipt = await call("execute_sandbox", blockedExecution);
 let refusedWrite;
 for (let index = 0; index < 64; index += 1) {
@@ -575,11 +539,7 @@ assert.equal(refusedReplay.replayed, true);
 const readerExecution = execution("reader-stdin-execution-ci", "reader-stdin", 10_000);
 readerExecution.input.command = "IFS= read -r value; printf '%s' \"$value\"";
 readerExecution.input.interactive = true;
-const readerProjection = { ...readerExecution };
-delete readerProjection.request_digest;
-readerExecution.request_digest = createHash("sha256")
-  .update(canonicalJson(readerProjection))
-  .digest("hex");
+sealed(readerExecution);
 const readerReceipt = await call("execute_sandbox", readerExecution);
 const readerWrite = stdinRequest(
   readerExecution.execution_id,

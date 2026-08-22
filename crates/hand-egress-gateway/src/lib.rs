@@ -12,8 +12,9 @@ mod tls;
 
 pub use capability::{
     Capability, CapabilityDestination, CapabilityError, DestinationProtocol,
-    MAX_CAPABILITY_PAYLOAD_BYTES, MAX_ENCODED_TOKEN_BYTES, VerifiedCapability, encode_signed_token,
-    unsigned_capability_bytes, verify_token,
+    MAX_CAPABILITY_PAYLOAD_BYTES, MAX_DESTINATIONS, MAX_ENCODED_TOKEN_BYTES,
+    MAX_GENERATION_LIFETIME_MS, VerifiedCapability, encode_signed_token, unsigned_capability_bytes,
+    verify_token,
 };
 pub use config::{Config, ConfigError};
 pub use policy::{AuthorizedTarget, PolicyError};

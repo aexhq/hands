@@ -16,7 +16,8 @@ use sha2::{Digest as _, Sha256};
 
 pub const LOGICAL_WORKSPACE: &str = "/workspace";
 pub const MAX_LIVE_FILE_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_LIVE_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+pub use hand_policy::MAX_OBJECT_BYTES as MAX_LIVE_OBJECT_BYTES;
+pub const MAX_LOGICAL_PATH_BYTES: usize = 4096;
 pub const MAX_SEARCH_ENTRIES: usize = 100_000;
 pub const MAX_SEARCH_PATH_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -115,7 +116,7 @@ impl LiveFiles {
             .open_dir(cap_path(&relative))
             .map_err(map_directory)?;
         validate_cursor(cursor)?;
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, crate::page::MAX_PAGE);
         let mut entries = bounded_directory_entries(&directory, MAX_SEARCH_ENTRIES)?;
         entries.sort_by_key(cap_std::fs::DirEntry::file_name);
         let mut projected = Vec::with_capacity(limit + 1);
@@ -356,7 +357,7 @@ impl LiveFiles {
         let base = self.relative(logical_path)?;
         self.root.open_dir(cap_path(&base)).map_err(map_directory)?;
         validate_cursor(cursor)?;
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, crate::page::MAX_PAGE);
         let mut projected = Vec::with_capacity(limit + 1);
         let mut pending = vec![base.clone()];
         let mut paths = Vec::new();
@@ -515,12 +516,17 @@ fn cap_path(relative: &Path) -> &Path {
     }
 }
 
-fn page(mut entries: Vec<LiveFileEntry>, limit: usize) -> LiveFilePage {
-    let next_cursor = (entries.len() > limit).then(|| entries[limit - 1].path.clone());
-    entries.truncate(limit);
+impl crate::page::PageIdentity for LiveFileEntry {
+    fn page_identity(&self) -> &str {
+        &self.path
+    }
+}
+
+fn page(entries: Vec<LiveFileEntry>, limit: usize) -> LiveFilePage {
+    let paged = crate::page::page(entries, limit);
     LiveFilePage {
-        entries,
-        next_cursor,
+        entries: paged.items,
+        next_cursor: paged.next_cursor,
     }
 }
 
@@ -561,7 +567,8 @@ fn regular_file_entry(
 
 fn validate_cursor(cursor: Option<&str>) -> Result<(), LiveFileError> {
     if cursor.is_some_and(|cursor| {
-        cursor.len() > 4096 || !(cursor == LOGICAL_WORKSPACE || cursor.starts_with("/workspace/"))
+        cursor.len() > MAX_LOGICAL_PATH_BYTES
+            || !(cursor == LOGICAL_WORKSPACE || cursor.starts_with("/workspace/"))
     }) {
         Err(LiveFileError::InvalidCursor)
     } else {

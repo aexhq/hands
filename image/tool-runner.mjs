@@ -13,21 +13,38 @@ const abort = new AbortController();
 process.on("SIGTERM", () => abort.abort(new Error("tool call cancelled")));
 process.on("SIGINT", () => abort.abort(new Error("tool call cancelled")));
 
+// The request is parsed and validated before any customer code can run: a malformed frame or a
+// bad output ceiling must fail fast with a diagnostic, never after tool side effects.
 let request;
+try {
+  request = JSON.parse(readFileSync(0, "utf8"));
+  if (
+    request === null
+    || typeof request !== "object"
+    || request.seal === null
+    || typeof request.seal !== "object"
+    || !Number.isSafeInteger(request.max_output_bytes)
+    || request.max_output_bytes < 1
+  ) {
+    throw new TypeError("tool request frame is malformed");
+  }
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`invalid tool request: ${message}\n`);
+  process.exit(65);
+}
+
 let resultFrameStarted = false;
 
-const writeResult = (value, inline) => {
-  if (!Number.isSafeInteger(request.max_output_bytes) || request.max_output_bytes < 1) {
-    throw new TypeError("Tool request has an invalid output ceiling");
-  }
+const writeResult = (maxOutputBytes, value, inline) => {
   const encodedInline = JSON.stringify(inline);
-  if (encodedInline === undefined || Buffer.byteLength(encodedInline) > request.max_output_bytes) {
+  if (encodedInline === undefined || Buffer.byteLength(encodedInline) > maxOutputBytes) {
     throw new RangeError("Tool result exceeds the sealed output ceiling");
   }
   const encoded = JSON.stringify(value);
   // Rust applies the authoritative RFC 8785 check to `inline`. This wrapper has only a fixed
   // discriminator and is allowed bounded headroom in the supervisor-owned IPC file.
-  if (Buffer.byteLength(encoded) > request.max_output_bytes + 4096) {
+  if (Buffer.byteLength(encoded) > maxOutputBytes + 4096) {
     throw new RangeError("Tool result envelope exceeds its bounded IPC ceiling");
   }
   const body = Buffer.from(encoded);
@@ -46,7 +63,6 @@ const writeResult = (value, inline) => {
 };
 
 try {
-  request = JSON.parse(readFileSync(0, "utf8"));
   const bundleBytes = await readFile(bundlePath);
   const bundleDigest = createHash("sha256").update(bundleBytes).digest("hex");
   if (bundleDigest !== request.seal.bundle_digest) {
@@ -94,13 +110,13 @@ try {
     : value;
   const normalizedOutput = output === undefined ? null : output;
   JSON.stringify(normalizedOutput);
-  writeResult({ ok: true, output: normalizedOutput }, normalizedOutput);
+  writeResult(request.max_output_bytes, { ok: true, output: normalizedOutput }, normalizedOutput);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${message}\n`);
   if (!resultFrameStarted) {
     try {
-      writeResult({ ok: false, error: message }, { error: message });
+      writeResult(request.max_output_bytes, { ok: false, error: message }, { error: message });
     } catch (writeError) {
       process.stderr.write(`could not send tool result: ${String(writeError)}\n`);
     }

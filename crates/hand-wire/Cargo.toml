@@ -14,8 +14,5 @@ workspace = true
 [dependencies]
 brain.workspace = true
 brain-protocol.workspace = true
-hand-core = { path = "../hand-core" }
+hand-policy = { path = "../hand-policy" }
 serde.workspace = true
-serde_json.workspace = true
-serde_jcs.workspace = true
-zeroize.workspace = true

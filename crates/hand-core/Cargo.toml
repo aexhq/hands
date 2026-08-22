@@ -11,19 +11,23 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Exposes the in-memory registry double for conformance tests in dependent crates.
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
 cap-std.workspace = true
 globset.workspace = true
 hex.workspace = true
 regex.workspace = true
+hand-policy = { path = "../hand-policy" }
 serde.workspace = true
+serde_jcs.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

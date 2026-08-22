@@ -21,8 +21,8 @@ use aws_sdk_lambdamicrovms::types::{
 };
 use sha2::Digest as _;
 
-use crate::AGENT_PORT;
-use crate::control::Control;
+use crate::control::{Control, ControlError, read_error};
+use crate::{AGENT_PORT, SUPERVISOR_UID, TOOL_GID, TOOL_UID};
 
 /// The container base, pinned by digest (resolved from public ECR on 2026-08-18). A tag is a
 /// moving reference; a digest is the bytes. Public ECR rather than Docker Hub because the AWS
@@ -130,9 +130,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HAND_TOOL_DIR=/var/hand/tools \
     HAND_TOOL_RUNNER=/usr/local/lib/hand/tool-runner.mjs \
     HAND_TOOL_BOUNDARY_LIBRARY=/usr/local/lib/hand/tool-boundary.so \
-    HAND_SUPERVISOR_UID=1001 \
-    HAND_TOOL_UID=1000 \
-    HAND_TOOL_GID=1000 \
+    HAND_SUPERVISOR_UID={SUPERVISOR_UID} \
+    HAND_TOOL_UID={TOOL_UID} \
+    HAND_TOOL_GID={TOOL_GID} \
     HAND_LISTEN=0.0.0.0:{AGENT_PORT}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -156,9 +156,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     userdel -f ubuntu 2>/dev/null || true; \
     groupdel ubuntu 2>/dev/null || true; \
-    useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 --user-group agent \
-    && groupadd --gid 1001 hand \
-    && useradd --uid 1001 --gid hand --groups agent --no-create-home --home-dir /nonexistent hand \
+    useradd --create-home --home-dir /home/agent --shell /bin/bash --uid {TOOL_UID} --user-group agent \
+    && groupadd --gid {SUPERVISOR_UID} hand \
+    && useradd --uid {SUPERVISOR_UID} --gid hand --groups agent --no-create-home --home-dir /nonexistent hand \
     && mkdir -p /workspace /var/hand/ops /var/hand/bindings /var/hand/objects /var/hand/file-staging /var/hand/tools /usr/local/lib/hand \
     && chown -R agent:agent /workspace /home/agent \
     && chmod 2770 /workspace /home/agent \
@@ -202,7 +202,7 @@ RUN chown root:hand /usr/local/bin/hand-guest \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/tool-boundary.so)" = "0:0:555" \
     && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/proc-secret-static)" = "0:0:555" \
     && ! readelf -l /usr/local/lib/hand/proc-secret-static | grep -q INTERP \
-    && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:1001:750" \
+    && test "$(stat -c '%u:%g:%a' /usr/local/lib/hand/control-listener)" = "0:{SUPERVISOR_UID}:750" \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)" \
     && test -z "$(getcap -r / 2>/dev/null)"
 
@@ -297,27 +297,22 @@ impl PublishOperation {
 /// AWS treats a client token as an idempotency key for the complete API request, not merely the
 /// uploaded bytes. Hash every variable request identity field and the validated runtime connector
 /// policy with unambiguous length prefixes. The schema marker represents the fixed fields (hooks,
-/// ARM64, image-build internet egress, and capabilities).
-fn publish_client_token(
-    operation: PublishOperation,
-    region: &str,
-    image_identifier: &str,
-    cfg: &PublishConfig,
-    artifact_key: &str,
-) -> String {
+/// ARM64, image-build internet egress, and capabilities). The client token and the resume
+/// fingerprint are the same digest over different identity prefixes, so they cannot drift apart.
+fn publish_request_digest(identity: &[&str], cfg: &PublishConfig, artifact_key: &str) -> String {
     let mut digest = sha2::Sha256::new();
-    for field in [
-        PUBLISH_REQUEST_TOKEN_SCHEMA,
-        operation.as_str(),
-        region,
-        image_identifier,
-        &cfg.source_sha,
-        &cfg.name,
-        &cfg.bucket,
-        &cfg.build_role_arn,
-        &cfg.log_group,
-        artifact_key,
-    ] {
+    for field in [PUBLISH_REQUEST_TOKEN_SCHEMA]
+        .into_iter()
+        .chain(identity.iter().copied())
+        .chain([
+            cfg.source_sha.as_str(),
+            cfg.name.as_str(),
+            cfg.bucket.as_str(),
+            cfg.build_role_arn.as_str(),
+            cfg.log_group.as_str(),
+            artifact_key,
+        ])
+    {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field.as_bytes());
     }
@@ -330,28 +325,22 @@ fn publish_client_token(
     hex::encode(&digest.finalize()[..16])
 }
 
-fn publish_request_fingerprint(region: &str, cfg: &PublishConfig, artifact_key: &str) -> String {
-    let mut digest = sha2::Sha256::new();
-    for field in [
-        PUBLISH_REQUEST_TOKEN_SCHEMA,
-        region,
-        &cfg.source_sha,
-        &cfg.name,
-        &cfg.bucket,
-        &cfg.build_role_arn,
-        &cfg.log_group,
+fn publish_client_token(
+    operation: PublishOperation,
+    region: &str,
+    image_identifier: &str,
+    cfg: &PublishConfig,
+    artifact_key: &str,
+) -> String {
+    publish_request_digest(
+        &[operation.as_str(), region, image_identifier],
+        cfg,
         artifact_key,
-    ] {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field.as_bytes());
-    }
-    let mut connectors = cfg.egress_connectors.clone();
-    connectors.sort();
-    for connector in connectors {
-        digest.update((connector.len() as u64).to_be_bytes());
-        digest.update(connector.as_bytes());
-    }
-    hex::encode(&digest.finalize()[..16])
+    )
+}
+
+fn publish_request_fingerprint(region: &str, cfg: &PublishConfig, artifact_key: &str) -> String {
+    publish_request_digest(&[region], cfg, artifact_key)
 }
 
 pub fn validate_source_sha(source_sha: &str) -> anyhow::Result<()> {
@@ -439,43 +428,66 @@ pub async fn publish(
 ) -> anyhow::Result<PublishedImage> {
     validate_source_sha(&cfg.source_sha)?;
     validated_connectors(&cfg.egress_connectors, control.region())?;
-    let image_build_egress = image_build_egress_connector(control.region());
     let key = artifact_key(&zip);
     let request_fingerprint = publish_request_fingerprint(control.region(), cfg, &key);
     let description = publish_description(&cfg.source_sha, &request_fingerprint);
-    let exists = find_image_arn(control, &cfg.name).await?;
+    let existing_arn = find_image_arn(control, &cfg.name).await?;
 
-    if let Some(arn) = exists.as_deref() {
-        let versions = control
-            .sdk()
-            .list_microvm_image_versions()
-            .image_identifier(arn)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("list_microvm_image_versions: {}", detail(&e)))?;
-        let newest = versions
-            .items()
-            .iter()
-            .max_by_key(|version| version_ord(version.image_version()));
-        if let Some(version) =
-            newest.filter(|version| version.description() == Some(description.as_str()))
-        {
-            tracing::info!(%arn, source_sha = %cfg.source_sha, "resuming existing source publication");
-            return wait_for_build(control, arn, version.image_version(), &description).await;
-        }
+    if let Some(arn) = existing_arn.as_deref()
+        && let Some(version) = resumable_version(control, arn, &description).await?
+    {
+        tracing::info!(%arn, source_sha = %cfg.source_sha, "resuming existing source publication");
+        return wait_for_build(control, arn, &version, &description).await;
     }
 
+    let uri = upload_context(s3, cfg, &key, zip).await?;
+    let (arn, version) =
+        register_image(control, existing_arn, cfg, &description, uri, &key).await?;
+    tracing::info!(%arn, %version, "image registration accepted; AWS is building");
+    wait_for_build(control, &arn, &version, &description).await
+}
+
+/// The newest version whose description carries this exact request fingerprint, if any.
+async fn resumable_version(
+    control: &Control,
+    arn: &str,
+    description: &str,
+) -> anyhow::Result<Option<String>> {
+    let versions = control
+        .sdk()
+        .list_microvm_image_versions()
+        .image_identifier(arn)
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("list_microvm_image_versions"))?;
+    Ok(versions
+        .items()
+        .iter()
+        .max_by_key(|version| version_ord(version.image_version()))
+        .filter(|version| version.description() == Some(description))
+        .map(|version| version.image_version().to_owned()))
+}
+
+async fn upload_context(
+    s3: &aws_sdk_s3::Client,
+    cfg: &PublishConfig,
+    key: &str,
+    zip: Vec<u8>,
+) -> anyhow::Result<String> {
     let uri = format!("s3://{}/{key}", cfg.bucket);
     s3.put_object()
         .bucket(&cfg.bucket)
-        .key(&key)
+        .key(key)
         .body(aws_sdk_s3::primitives::ByteStream::from(zip))
         .send()
         .await
         .context("uploading image context to S3")?;
     tracing::info!(%uri, "context uploaded");
+    Ok(uri)
+}
 
-    let hooks = Hooks::builder()
+fn publish_hooks() -> Hooks {
+    Hooks::builder()
         .port(i32::from(AGENT_PORT))
         .microvm_hooks(
             MicrovmHooks::builder()
@@ -497,84 +509,73 @@ pub async fn publish(
                 .validate_timeout_in_seconds(120)
                 .build(),
         )
-        .build();
+        .build()
+}
+
+/// Registers a new image or a new version of an existing one. The shared request field list is
+/// written once inside the macro, so create and update cannot drift apart.
+async fn register_image(
+    control: &Control,
+    existing_arn: Option<String>,
+    cfg: &PublishConfig,
+    description: &str,
+    uri: String,
+    key: &str,
+) -> anyhow::Result<(String, String)> {
     let logging = Logging::CloudWatch(
         CloudWatchLogging::builder()
             .log_group(&cfg.log_group)
             .log_stream(&cfg.name)
             .build(),
     );
+    let cpu = CpuConfiguration::builder()
+        .architecture(Architecture::Arm64)
+        .build()
+        .context("cpu configuration")?;
+    let resources = Resources::builder()
+        .minimum_memory_in_mib(MVP_TARGET_MEMORY_MIB as i32)
+        .build()
+        .context("resources")?;
+    macro_rules! with_image_spec {
+        ($builder:expr, $client_token:expr) => {
+            $builder
+                .base_image_arn(base_image_arn(control.region()))
+                .build_role_arn(&cfg.build_role_arn)
+                .description(description)
+                .code_artifact(CodeArtifact::Uri(uri))
+                .logging(logging)
+                .egress_network_connectors(image_build_egress_connector(control.region()))
+                .cpu_configurations(cpu)
+                .resources(resources)
+                .additional_os_capabilities(Capability::All)
+                .hooks(publish_hooks())
+                .client_token($client_token)
+                .send()
+                .await
+        };
+    }
     let sdk = control.sdk();
-    let (arn, version) = if let Some(arn) = exists {
+    if let Some(arn) = existing_arn {
         let client_token =
-            publish_client_token(PublishOperation::Update, control.region(), &arn, cfg, &key);
-        let out = sdk
-            .update_microvm_image()
-            .image_identifier(&arn)
-            .base_image_arn(base_image_arn(control.region()))
-            .build_role_arn(&cfg.build_role_arn)
-            .description(&description)
-            .code_artifact(CodeArtifact::Uri(uri))
-            .logging(logging)
-            .egress_network_connectors(image_build_egress.clone())
-            .cpu_configurations(
-                CpuConfiguration::builder()
-                    .architecture(Architecture::Arm64)
-                    .build()
-                    .context("cpu configuration")?,
-            )
-            .resources(
-                Resources::builder()
-                    .minimum_memory_in_mib(MVP_TARGET_MEMORY_MIB as i32)
-                    .build()
-                    .context("resources")?,
-            )
-            .additional_os_capabilities(Capability::All)
-            .hooks(hooks)
-            .client_token(&client_token)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("update_microvm_image: {}", detail(&e)))?;
-        (out.image_arn().to_owned(), out.image_version().to_owned())
+            publish_client_token(PublishOperation::Update, control.region(), &arn, cfg, key);
+        let out = with_image_spec!(
+            sdk.update_microvm_image().image_identifier(&arn),
+            &client_token
+        )
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("update_microvm_image"))?;
+        Ok((out.image_arn().to_owned(), out.image_version().to_owned()))
     } else {
         let client_token = publish_client_token(
             PublishOperation::Create,
             control.region(),
             &cfg.name,
             cfg,
-            &key,
+            key,
         );
-        let out = sdk
-            .create_microvm_image()
-            .name(&cfg.name)
-            .base_image_arn(base_image_arn(control.region()))
-            .build_role_arn(&cfg.build_role_arn)
-            .description(&description)
-            .code_artifact(CodeArtifact::Uri(uri))
-            .logging(logging)
-            .egress_network_connectors(image_build_egress)
-            .cpu_configurations(
-                CpuConfiguration::builder()
-                    .architecture(Architecture::Arm64)
-                    .build()
-                    .context("cpu configuration")?,
-            )
-            .resources(
-                Resources::builder()
-                    .minimum_memory_in_mib(MVP_TARGET_MEMORY_MIB as i32)
-                    .build()
-                    .context("resources")?,
-            )
-            .additional_os_capabilities(Capability::All)
-            .hooks(hooks)
-            .client_token(&client_token)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("create_microvm_image: {}", detail(&e)))?;
-        (out.image_arn().to_owned(), out.image_version().to_owned())
-    };
-    tracing::info!(%arn, %version, "image registration accepted; AWS is building");
-    wait_for_build(control, &arn, &version, &description).await
+        let out = with_image_spec!(sdk.create_microvm_image().name(&cfg.name), &client_token)
+            .map_err(|e| anyhow::Error::new(read_error(&e)).context("create_microvm_image"))?;
+        Ok((out.image_arn().to_owned(), out.image_version().to_owned()))
+    }
 }
 
 /// Polls until the exact accepted version leaves PENDING/IN_PROGRESS. AWS's builds run minutes,
@@ -588,13 +589,29 @@ pub async fn wait_for_build(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
     let sdk = control.sdk();
     loop {
-        let version = sdk
+        let version = match sdk
             .get_microvm_image_version()
             .image_identifier(image_arn)
             .image_version(image_version)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("get_microvm_image_version: {}", detail(&e)))?;
+            .map_err(|e| read_error(&e))
+        {
+            Ok(version) => version,
+            // A transient read failure must not abort a build that AWS is still running.
+            Err(ControlError::Retryable(cause) | ControlError::Throttled(cause)) => {
+                tracing::debug!(%cause, "image build state read deferred");
+                anyhow::ensure!(
+                    tokio::time::Instant::now() <= deadline,
+                    "image build did not finish within 30 minutes"
+                );
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("get_microvm_image_version"));
+            }
+        };
         anyhow::ensure!(
             version.description() == Some(expected_description),
             "accepted image version does not match the requested source publication"
@@ -638,7 +655,7 @@ pub async fn rebuild_due(
         .image_version(image_version)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("get_microvm_image_version: {}", detail(&e)))?;
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("get_microvm_image_version"))?;
     let base_arn = ours.base_image_arn().to_owned();
     let our_base = ours.base_image_version().unwrap_or("0").to_owned();
     let managed = sdk
@@ -646,7 +663,9 @@ pub async fn rebuild_due(
         .image_identifier(&base_arn)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("list_managed_microvm_image_versions: {}", detail(&e)))?;
+        .map_err(|e| {
+            anyhow::Error::new(read_error(&e)).context("list_managed_microvm_image_versions")
+        })?;
     let newest = managed
         .items()
         .iter()
@@ -666,6 +685,49 @@ fn version_ord(v: &str) -> (u64, u64) {
     (major, minor)
 }
 
+/// Rejects any guest binary that is not an aarch64 ELF before packing: the MicroVM image is
+/// ARM64-only, and a wrong-architecture binary would fail only inside AWS's build minutes later.
+pub fn validate_aarch64_elf(bytes: &[u8]) -> anyhow::Result<()> {
+    const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+    const EM_AARCH64: u8 = 0xb7;
+    anyhow::ensure!(
+        bytes.len() > 19 && bytes[..4] == ELF_MAGIC && bytes[18] == EM_AARCH64,
+        "guest binary is not an aarch64 ELF"
+    );
+    Ok(())
+}
+
+/// One printable row per registered version of an image.
+pub struct VersionSummary {
+    pub version: String,
+    pub state: String,
+    pub status: String,
+    pub base_version: String,
+}
+
+pub async fn version_summaries(
+    control: &Control,
+    image_arn: &str,
+) -> anyhow::Result<Vec<VersionSummary>> {
+    let versions = control
+        .sdk()
+        .list_microvm_image_versions()
+        .image_identifier(image_arn)
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::new(read_error(&e)).context("list_microvm_image_versions"))?;
+    Ok(versions
+        .items()
+        .iter()
+        .map(|version| VersionSummary {
+            version: version.image_version().to_owned(),
+            state: format!("{:?}", version.state()),
+            status: format!("{:?}", version.status()),
+            base_version: version.base_image_version().unwrap_or("?").to_owned(),
+        })
+        .collect())
+}
+
 /// The ARN of the image named `name`, if it exists. Accepts an ARN and returns it unchanged.
 pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Option<String>> {
     if name.starts_with("arn:") {
@@ -679,7 +741,7 @@ pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Opt
             .set_next_token(next)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("list_microvm_images: {}", detail(&e)))?;
+            .map_err(|e| anyhow::Error::new(read_error(&e)).context("list_microvm_images"))?;
         for item in out.items() {
             if item.name() == name {
                 return Ok(Some(item.image_arn().to_owned()));
@@ -691,24 +753,6 @@ pub async fn find_image_arn(control: &Control, name: &str) -> anyhow::Result<Opt
         }
     }
 }
-
-/// Grumble: `SdkError` Display hides the service message; this pulls it out.
-fn detail<E: ProvideErrorMetadataExt, R>(
-    e: &aws_sdk_lambdamicrovms::error::SdkError<E, R>,
-) -> String {
-    match e {
-        aws_sdk_lambdamicrovms::error::SdkError::ServiceError(s) => format!(
-            "{}: {}",
-            s.err().code().unwrap_or("service error"),
-            s.err().message().unwrap_or("no message")
-        ),
-        other => other.to_string(),
-    }
-}
-
-/// Alias so the helpers stay generic over every operation's error type.
-pub trait ProvideErrorMetadataExt: aws_sdk_lambdamicrovms::error::ProvideErrorMetadata {}
-impl<T: aws_sdk_lambdamicrovms::error::ProvideErrorMetadata> ProvideErrorMetadataExt for T {}
 
 #[cfg(test)]
 mod tests {
@@ -943,11 +987,11 @@ mod tests {
             "image/Dockerfile installs npm {NPM_VERSION}"
         );
         for shared in [
-            "HAND_SUPERVISOR_UID=1001",
-            "HAND_TOOL_UID=1000",
-            "HAND_TOOL_GID=1000",
-            "HAND_LISTEN=0.0.0.0:8080",
-            "PATH=/workspace/.hand/bin:/workspace/.hand/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            &format!("HAND_SUPERVISOR_UID={SUPERVISOR_UID}"),
+            &format!("HAND_TOOL_UID={TOOL_UID}"),
+            &format!("HAND_TOOL_GID={TOOL_GID}"),
+            &format!("HAND_LISTEN=0.0.0.0:{AGENT_PORT}"),
+            &"PATH=/workspace/.hand/bin:/workspace/.hand/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         ] {
             assert!(
                 dev.contains(shared) && dockerfile().contains(shared),
@@ -961,7 +1005,7 @@ mod tests {
         assert_eq!(MVP_TARGET_MEMORY_MIB, 1_024);
         let df = dockerfile();
         assert!(df.contains("@sha256:"), "base must be digest-pinned");
-        assert!(df.contains("EXPOSE 8080"));
+        assert!(df.contains(&format!("EXPOSE {AGENT_PORT}")));
         assert!(df.contains(&format!("node-v{NODE_VERSION}-linux-arm64.tar.xz")));
         assert!(df.contains(NODE_ARM64_SHA256));
         assert!(df.contains(&format!(r#"test "$(node --version)" = "v{NODE_VERSION}""#)));
@@ -991,9 +1035,13 @@ mod tests {
         assert!(boot.contains("umask 0002"));
         assert!(!df.contains("setcap cap_kill,cap_setuid,cap_setgid=ep"));
         assert!(df.contains("control-listener.c"));
-        assert!(df.contains("0:1001:750"));
+        assert!(df.contains(&format!("0:{SUPERVISOR_UID}:750")));
         assert!(df.contains("chown hand:agent /var/hand"));
         assert!(df.contains("chmod 0710 /var/hand"));
+        assert!(listener.contains(&format!("CONTROL_PORT = {AGENT_PORT},")));
+        assert!(listener.contains(&format!("SUPERVISOR_UID = {SUPERVISOR_UID},")));
+        assert!(listener.contains(&format!("SUPERVISOR_GID = {SUPERVISOR_UID},")));
+        assert!(listener.contains(&format!("\"0.0.0.0:{AGENT_PORT}\"")));
         assert!(listener.contains("setenv(\"HAND_LISTEN_FD\", listener_number, 1)"));
         assert!(listener.contains("PR_SET_KEEPCAPS"));
         assert!(listener.contains("PR_CAP_AMBIENT_RAISE"));
@@ -1014,6 +1062,27 @@ mod tests {
         assert!(df.contains(r#"stat -c '%d:%g' /workspace"#));
         assert!(df.contains(r#"stat -c '%a' /var/hand/file-staging)" = 2700"#));
         assert!(boot.contains("swapon"));
+
+        // CI's adversarial guest-runtime jobs prove `image/hand-boot.sh`; production boots the
+        // generated script. The shared boundary properties must never drift apart.
+        let dev_boot = include_str!("../../../image/hand-boot.sh");
+        let port_reserve = format!("$(( {AGENT_PORT} + 1 ))");
+        for (name, script) in [
+            ("generated", boot.as_str()),
+            ("image/hand-boot.sh", dev_boot),
+        ] {
+            for property in [
+                "ip_unprivileged_port_start",
+                port_reserve.as_str(),
+                "unprivileged_userns_clone",
+                "max_user_namespaces",
+                "ulimit -c 0",
+                "umask 0002",
+                "exec /usr/local/lib/hand/control-listener /usr/local/bin/hand-guest",
+            ] {
+                assert!(script.contains(property), "{name} lost: {property}");
+            }
+        }
     }
 
     #[test]

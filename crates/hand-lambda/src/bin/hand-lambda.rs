@@ -61,6 +61,14 @@ enum ImageCommand {
     Status {
         name: String,
     },
+    /// Exits non-zero when the version's recorded MicroVM base is no longer the newest managed
+    /// base version (AWS retires bases on its own calendar; an EXPIRED base cannot run).
+    RebuildDue {
+        #[arg(long)]
+        image_arn: String,
+        #[arg(long)]
+        image_version: String,
+    },
     Dockerfile,
     /// Destructive dev release gate: launches and always terminates one exact image version.
     Canary {
@@ -88,7 +96,7 @@ enum ImageCommand {
         #[arg(long)]
         gateway_authority: String,
         /// Host-only API Gateway names from the dev and production Platform outputs.
-        #[arg(long = "customer-hand-host", required = true, action = clap::ArgAction::Append)]
+        #[arg(long = "customer-hand-host", required = true, num_args = 2, action = clap::ArgAction::Append)]
         customer_hand_hosts: Vec<String>,
         #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
         confirm_dev_network_canary: bool,
@@ -105,9 +113,10 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
-    let control = Control::from_env(&cli.region).await?;
+    let aws = hand_lambda::aws_config(&cli.region).await;
+    let control = Control::from_sdk_config(&aws, &cli.region)?;
     match cli.command {
-        Command::Image { command } => image_command(&control, &cli.region, command).await,
+        Command::Image { command } => image_command(&control, &aws, command).await,
         Command::List => {
             for vm in control.list().await? {
                 println!("{}\t{:?}", vm.id, vm.state);
@@ -132,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn image_command(
     control: &Control,
-    region: &str,
+    aws: &aws_config::SdkConfig,
     command: ImageCommand,
 ) -> anyhow::Result<()> {
     match command {
@@ -146,13 +155,8 @@ async fn image_command(
             none_connector,
             confirm_dev_image_canary,
         } => {
-            anyhow::ensure!(
-                confirm_dev_image_canary,
-                "--confirm-dev-image-canary is required"
-            );
-            let http = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?;
+            debug_assert!(confirm_dev_image_canary, "clap enforces the flag");
+            let http = hand_lambda::endpoint_http_client_builder().build()?;
             run_no_respawn_canary(
                 control,
                 &http,
@@ -174,10 +178,7 @@ async fn image_command(
             customer_hand_hosts,
             confirm_dev_network_canary,
         } => {
-            anyhow::ensure!(
-                confirm_dev_network_canary,
-                "--confirm-dev-network-canary is required"
-            );
+            debug_assert!(confirm_dev_network_canary, "clap enforces the flag");
             let customer_hand_hosts: [String; 2] =
                 customer_hand_hosts.try_into().map_err(|_| {
                     anyhow::anyhow!(
@@ -189,11 +190,11 @@ async fn image_command(
                 NetworkBoundaryCanaryConfig {
                     image_arn,
                     image_version,
-                    none_connector: hand_core::connector::ConnectorRef::parse(none_connector)?,
-                    allowlist_connector: hand_core::connector::ConnectorRef::parse(
-                        allowlist_connector,
-                    )?,
-                    public_connector: hand_core::connector::ConnectorRef::parse(public_connector)?,
+                    connectors: hand_core::connector::ConnectorCatalog::new(
+                        hand_core::connector::ConnectorRef::parse(none_connector)?,
+                        hand_core::connector::ConnectorRef::parse(public_connector)?,
+                        hand_core::connector::ConnectorRef::parse(allowlist_connector)?,
+                    ),
                     gateway_authority: hand_core::connector::GatewayAuthority::parse(
                         &gateway_authority,
                     )?,
@@ -213,17 +214,10 @@ async fn image_command(
         } => {
             let bytes =
                 std::fs::read(&binary).with_context(|| format!("reading {}", binary.display()))?;
-            anyhow::ensure!(
-                bytes.len() > 19 && bytes[..4] == [0x7f, b'E', b'L', b'F'] && bytes[18] == 0xb7,
-                "{} is not an aarch64 ELF binary",
-                binary.display()
-            );
+            image::validate_aarch64_elf(&bytes)
+                .with_context(|| format!("validating {}", binary.display()))?;
             let zip = image::pack_zip(&bytes)?;
-            let aws = aws_config::from_env()
-                .region(aws_config::Region::new(region.to_owned()))
-                .load()
-                .await;
-            let s3 = aws_sdk_s3::Client::new(&aws);
+            let s3 = aws_sdk_s3::Client::new(aws);
             let published = image::publish(
                 control,
                 &s3,
@@ -241,23 +235,27 @@ async fn image_command(
             println!("{}\t{}", published.image_arn, published.image_version);
             Ok(())
         }
+        ImageCommand::RebuildDue {
+            image_arn,
+            image_version,
+        } => match image::rebuild_due(control, &image_arn, &image_version).await? {
+            Some(newest) => bail!(
+                "rebuild due: managed base version {newest} is newer than the recorded base of \
+                 {image_arn}@{image_version}"
+            ),
+            None => {
+                println!("current");
+                Ok(())
+            }
+        },
         ImageCommand::Status { name } => {
             let Some(arn) = image::find_image_arn(control, &name).await? else {
                 bail!("no image named {name}");
             };
-            let versions = control
-                .sdk()
-                .list_microvm_image_versions()
-                .image_identifier(&arn)
-                .send()
-                .await?;
-            for version in versions.items() {
+            for version in image::version_summaries(control, &arn).await? {
                 println!(
-                    "{}\t{:?}\t{:?}\tbase={}",
-                    version.image_version(),
-                    version.state(),
-                    version.status(),
-                    version.base_image_version().unwrap_or("?")
+                    "{}\t{}\t{}\tbase={}",
+                    version.version, version.state, version.status, version.base_version
                 );
             }
             Ok(())

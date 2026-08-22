@@ -161,21 +161,30 @@ struct RunnerResult {
 }
 
 pub async fn execute_bundle(request: BundleExecution) -> ExecutionResult {
+    run_execution("Tool execution", execute_bundle_inner(&request)).await
+}
+
+/// One terminal projection for every executor: timing, cancellation, deadline, and failure map
+/// identically whether the child was a Tool runner or a sandbox shell.
+async fn run_execution<F>(subject: &str, run: F) -> ExecutionResult
+where
+    F: std::future::Future<Output = Result<ExecutionResult, Failure>>,
+{
     let started = Instant::now();
-    match execute_bundle_inner(&request).await {
+    match run.await {
         Ok(mut result) => {
             result.duration_ms = started.elapsed().as_millis() as u64;
             result
         }
         Err(Failure::Cancelled) => failure(
             TerminalOutcome::Cancelled,
-            "Tool execution was cancelled",
+            &format!("{subject} was cancelled"),
             started,
             None,
         ),
         Err(Failure::Deadline) => failure(
             TerminalOutcome::DeadlineExceeded,
-            "Tool execution exceeded its deadline",
+            &format!("{subject} exceeded its deadline"),
             started,
             None,
         ),
@@ -284,22 +293,20 @@ async fn execute_bundle_inner(request: &BundleExecution) -> Result<ExecutionResu
     let mut result_task = tokio::spawn(read_framed_result(result_reader, result_limit));
     let stdout_task = tokio::spawn(read_bounded(stdout, MAX_DIAGNOSTIC_BYTES));
     let stderr_task = tokio::spawn(read_bounded(stderr, MAX_DIAGNOSTIC_BYTES));
+    let aborts = [
+        request_task.abort_handle(),
+        result_task.abort_handle(),
+        stdout_task.abort_handle(),
+        stderr_task.abort_handle(),
+    ];
     let status = tokio::select! {
         status = child.wait() => status.map_err(|error| Failure::message(format!("Tool wait failed: {error}")))?,
         () = request.cancellation.cancelled() => {
-            terminate_process_group(&mut child, process_id).await;
-            request_task.abort();
-            result_task.abort();
-            stdout_task.abort();
-            stderr_task.abort();
+            teardown(&mut child, process_id, &aborts, None).await;
             return Err(Failure::Cancelled);
         }
         () = wait_for_wall_deadline(deadline_at_ms) => {
-            terminate_process_group(&mut child, process_id).await;
-            request_task.abort();
-            result_task.abort();
-            stdout_task.abort();
-            stderr_task.abort();
+            teardown(&mut child, process_id, &aborts, None).await;
             return Err(Failure::Deadline);
         }
     };
@@ -368,28 +375,7 @@ async fn execute_bundle_inner(_request: &BundleExecution) -> Result<ExecutionRes
 }
 
 pub async fn execute_shell(request: ShellExecution) -> ExecutionResult {
-    let started = Instant::now();
-    match execute_shell_inner(&request).await {
-        Ok(mut result) => {
-            result.duration_ms = started.elapsed().as_millis() as u64;
-            result
-        }
-        Err(Failure::Cancelled) => failure(
-            TerminalOutcome::Cancelled,
-            "sandbox execution was cancelled",
-            started,
-            None,
-        ),
-        Err(Failure::Deadline) => failure(
-            TerminalOutcome::DeadlineExceeded,
-            "sandbox execution exceeded its deadline",
-            started,
-            None,
-        ),
-        Err(Failure::Message { message, exit_code }) => {
-            failure(TerminalOutcome::Failed, &message, started, exit_code)
-        }
-    }
+    run_execution("sandbox execution", execute_shell_inner(&request)).await
 }
 
 async fn execute_shell_inner(request: &ShellExecution) -> Result<ExecutionResult, Failure> {
@@ -433,20 +419,15 @@ async fn execute_shell_inner(request: &ShellExecution) -> Result<ExecutionResult
         .min(crate::config::MAX_OPERATION_OUTPUT_BYTES as usize);
     let stdout_task = tokio::spawn(read_bounded(child.stdout.take(), output_limit + 1));
     let stderr_task = tokio::spawn(read_bounded(child.stderr.take(), output_limit + 1));
+    let aborts = [stdout_task.abort_handle(), stderr_task.abort_handle()];
     let status = tokio::select! {
         status = child.wait() => status.map_err(|error| Failure::message(format!("sandbox wait failed: {error}")))?,
         () = request.cancellation.cancelled() => {
-            terminate_process_group(&mut child, process_id).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            if let Some(control) = &request.control { control.close().await; }
+            teardown(&mut child, process_id, &aborts, request.control.as_deref()).await;
             return Err(Failure::Cancelled);
         }
         () = wait_for_wall_deadline(deadline_at_ms) => {
-            terminate_process_group(&mut child, process_id).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            if let Some(control) = &request.control { control.close().await; }
+            teardown(&mut child, process_id, &aborts, request.control.as_deref()).await;
             return Err(Failure::Deadline);
         }
     };
@@ -581,17 +562,53 @@ async fn read_framed_result(
     Ok(bytes)
 }
 
+/// How a post-child I/O task ended inside the bounded settle window.
+enum Settled<T> {
+    Done(T),
+    /// The task itself died (panic or abort) before producing its value.
+    Stopped,
+    /// The task did not finish inside the window and was aborted.
+    Unsettled,
+}
+
+/// Terminates the whole child process group and stops every dependent I/O task; the shell path
+/// also closes its interactive stdin control.
+async fn teardown(
+    child: &mut tokio::process::Child,
+    process_id: Option<u32>,
+    aborts: &[tokio::task::AbortHandle],
+    control: Option<&InteractiveControl>,
+) {
+    terminate_process_group(child, process_id).await;
+    for abort in aborts {
+        abort.abort();
+    }
+    if let Some(control) = control {
+        control.close().await;
+    }
+}
+
+/// Awaits one post-child I/O task for the bounded settle window; a task that will not settle is
+/// aborted rather than awaited forever.
+async fn settle<T>(task: &mut tokio::task::JoinHandle<T>) -> Settled<T> {
+    match tokio::time::timeout(POST_CHILD_IO_TIMEOUT, &mut *task).await {
+        Ok(Ok(value)) => Settled::Done(value),
+        Ok(Err(_)) => Settled::Stopped,
+        Err(_) => {
+            task.abort();
+            Settled::Unsettled
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn settle_request_writer(
     task: &mut tokio::task::JoinHandle<Result<(), Failure>>,
 ) -> Result<(), Failure> {
-    match tokio::time::timeout(POST_CHILD_IO_TIMEOUT, &mut *task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(Failure::message("Tool request writer stopped unexpectedly")),
-        Err(_) => {
-            task.abort();
-            Err(Failure::message("Tool request writer did not settle"))
-        }
+    match settle(task).await {
+        Settled::Done(result) => result,
+        Settled::Stopped => Err(Failure::message("Tool request writer stopped unexpectedly")),
+        Settled::Unsettled => Err(Failure::message("Tool request writer did not settle")),
     }
 }
 
@@ -599,27 +616,21 @@ async fn settle_request_writer(
 async fn settle_result_reader(
     task: &mut tokio::task::JoinHandle<Result<Vec<u8>, Failure>>,
 ) -> Result<Vec<u8>, Failure> {
-    match tokio::time::timeout(POST_CHILD_IO_TIMEOUT, &mut *task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(Failure::message("Tool result reader stopped unexpectedly")),
-        Err(_) => {
-            task.abort();
-            Err(Failure::message(
-                "Tool runner produced no complete result frame",
-            ))
-        }
+    match settle(task).await {
+        Settled::Done(result) => result,
+        Settled::Stopped => Err(Failure::message("Tool result reader stopped unexpectedly")),
+        Settled::Unsettled => Err(Failure::message(
+            "Tool runner produced no complete result frame",
+        )),
     }
 }
 
 async fn settle_bounded_reader(
     mut task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
 ) -> Option<std::io::Result<Vec<u8>>> {
-    match tokio::time::timeout(POST_CHILD_IO_TIMEOUT, &mut task).await {
-        Ok(Ok(bytes)) => Some(bytes),
-        _ => {
-            task.abort();
-            None
-        }
+    match settle(&mut task).await {
+        Settled::Done(bytes) => Some(bytes),
+        Settled::Stopped | Settled::Unsettled => None,
     }
 }
 
@@ -934,20 +945,8 @@ fn diagnostic(prefix: &str, stdout: &[u8], stderr: &[u8]) -> String {
             message.push_str(&format!("\n{name}: {}", String::from_utf8_lossy(bytes)));
         }
     }
-    truncate_utf8(&mut message, MAX_DIAGNOSTIC_BYTES);
+    crate::errors::truncate_utf8(&mut message, MAX_DIAGNOSTIC_BYTES);
     message
-}
-
-#[cfg(unix)]
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
 }
 
 fn failure(
@@ -1070,5 +1069,28 @@ mod tests {
                 .await
                 .expect("an oversized header must be rejected without reading its body");
         assert!(result.is_err());
+    }
+
+    /// The Tool IPC contract exists in two languages: this supervisor and
+    /// `image/tool-runner.mjs`. Pin the runner's literals to the Rust constants so a change on
+    /// either side fails the build instead of silently producing a mismatched frame protocol.
+    #[cfg(unix)]
+    #[test]
+    fn the_tool_runner_carries_the_supervisor_ipc_contract() {
+        let runner = include_str!("../../../image/tool-runner.mjs");
+        assert!(
+            runner.contains(&format!(
+                "maxOutputBytes + {RESULT_ENVELOPE_HEADROOM_BYTES}"
+            )),
+            "runner envelope headroom must match RESULT_ENVELOPE_HEADROOM_BYTES"
+        );
+        assert!(
+            runner.contains(&format!("writeSync({RESULT_FD}, frame")),
+            "runner must write frames to the supervisor result fd"
+        );
+        assert!(
+            runner.contains("writeUInt32BE"),
+            "runner must length-prefix frames big-endian, as the supervisor reads them"
+        );
     }
 }

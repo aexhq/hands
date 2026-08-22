@@ -267,13 +267,11 @@ impl Control {
         }
     }
 
-    pub async fn from_env(region: &str) -> anyhow::Result<Self> {
-        let cfg = aws_config::from_env()
-            .region(aws_config::Region::new(region.to_owned()))
-            .load()
-            .await;
+    /// Builds a paced control plane from an already-loaded shared `SdkConfig` (see
+    /// [`crate::aws_config`]); pacing bounds still come from the environment.
+    pub fn from_sdk_config(aws: &aws_config::SdkConfig, region: &str) -> anyhow::Result<Self> {
         Ok(Self::with_pacing(
-            Client::new(&cfg),
+            Client::new(aws),
             region,
             ControlPacingConfig::from_env()?,
         ))
@@ -294,10 +292,10 @@ impl Control {
                     tracing::debug!(
                         attempt,
                         delay_ms = delay.as_millis(),
+                        %message,
                         "provider throttled lifecycle operation"
                     );
                     tokio::time::sleep(delay).await;
-                    let _ = message;
                 }
                 result => return result,
             }
@@ -339,28 +337,6 @@ impl Control {
             run_hook_payload: run_hook_payload.to_owned(),
             client_token: client_token.to_owned(),
         }
-    }
-
-    /// Launches one MicroVM attempt. AWS defines `client_token` as this request's idempotency key.
-    /// The caller durably seals the token and every RunMicrovm parameter before dispatch and
-    /// replays that byte-identical request after an ambiguous response. The returned target must
-    /// still be durably installed before any guest effect is sent.
-    pub async fn run(
-        &self,
-        image_arn: &str,
-        image_version: &str,
-        run_hook_payload: &str,
-        client_token: &str,
-        egress_connector: &ConnectorRef,
-    ) -> Result<Microvm, ControlError> {
-        let request = self.exact_run_request(
-            image_arn,
-            image_version,
-            run_hook_payload,
-            client_token,
-            egress_connector,
-        );
-        self.run_exact(&request).await
     }
 
     /// Validates a sealed request without comparing it to mutable deployment defaults. An old
@@ -534,7 +510,7 @@ impl Control {
             .ok_or_else(|| ControlError::Fatal("response carried no auth token".into()))
     }
 
-    pub async fn list(&self) -> Result<Vec<Microvm>, ControlError> {
+    pub async fn list(&self) -> Result<Vec<MicrovmSummary>, ControlError> {
         let mut vms = Vec::new();
         let mut next: Option<String> = None;
         loop {
@@ -546,10 +522,9 @@ impl Control {
                 .await
                 .map_err(|e| read_error(&e))?;
             for item in out.items() {
-                vms.push(Microvm {
+                vms.push(MicrovmSummary {
                     id: item.microvm_id().to_owned(),
                     state: item.state().clone(),
-                    endpoint: None,
                 });
             }
             next = out.next_token().map(str::to_owned);
@@ -559,13 +534,21 @@ impl Control {
         }
     }
 
-    pub fn sdk(&self) -> &Client {
+    pub(crate) fn sdk(&self) -> &Client {
         &self.client
     }
 
     pub fn region(&self) -> &str {
         &self.region
     }
+}
+
+/// A listing row. `ListMicrovms` does not return endpoints, so the summary deliberately has no
+/// endpoint field instead of an ambiguous `None`.
+#[derive(Debug, Clone)]
+pub struct MicrovmSummary {
+    pub id: String,
+    pub state: MicrovmState,
 }
 
 /// Whether a VM state means the hand can never come back.
@@ -625,7 +608,7 @@ fn effect_error<E: ProvideErrorMetadata, R>(e: &SdkError<E, R>) -> ControlError 
     sdk_error(e, true)
 }
 
-fn read_error<E: ProvideErrorMetadata, R>(e: &SdkError<E, R>) -> ControlError {
+pub(crate) fn read_error<E: ProvideErrorMetadata, R>(e: &SdkError<E, R>) -> ControlError {
     sdk_error(e, false)
 }
 
