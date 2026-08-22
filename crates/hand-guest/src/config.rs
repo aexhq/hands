@@ -20,6 +20,8 @@ pub const MAX_RETAINED_TERMINAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OPERATION_OUTPUT_BYTES: u64 = brain_protocol::MAX_TOOL_TERMINAL_INLINE_BYTES as u64;
 pub const MAX_OPERATION_TIMEOUT_MS: u64 = MAX_TARGET_LIFETIME_MS;
 pub const MAX_WAIT_MS: u64 = 30_000;
+/// How long an exact stdin retry waits for the identical in-flight write to settle.
+pub const MAX_STDIN_REPLAY_WAIT_MS: u64 = 2_000;
 pub const MAX_TARGET_LIFETIME_MS: u64 = 8 * 60 * 60 * 1_000;
 /// A physical generation refuses unbounded binding preparation. Managed bindings receive a
 /// distinct kernel uid from this range; the ordinary additional-sandbox shell remains

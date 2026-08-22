@@ -65,7 +65,7 @@ impl Hand {
         }
         let lock = file_effect_lock_index(&request.effect.operation_id);
         let _guard = self.effects.locks[lock].lock().await;
-        match self.claim_file_effect(request.effect.clone()).await? {
+        match self.claim_file_effect_unlocked(request.effect.clone()).await? {
             FileEffectReservation::Replay(result) => return Ok(*result),
             FileEffectReservation::New => {}
         }
@@ -139,7 +139,19 @@ impl Hand {
             .await
     }
 
+    /// Every public file-effect entry point serializes on the per-operation shard lock, so the
+    /// socket-driven reserve/claim/complete sequence and the in-process write path can never
+    /// interleave on one operation.
     pub async fn reserve_file_effect(
+        &self,
+        identity: FileEffectIdentity,
+    ) -> Result<FileEffectReservation, HandError> {
+        let lock = file_effect_lock_index(&identity.operation_id);
+        let _guard = self.effects.locks[lock].lock().await;
+        self.reserve_file_effect_unlocked(identity).await
+    }
+
+    async fn reserve_file_effect_unlocked(
         &self,
         identity: FileEffectIdentity,
     ) -> Result<FileEffectReservation, HandError> {
@@ -157,6 +169,15 @@ impl Hand {
     }
 
     pub async fn claim_file_effect(
+        &self,
+        identity: FileEffectIdentity,
+    ) -> Result<FileEffectReservation, HandError> {
+        let lock = file_effect_lock_index(&identity.operation_id);
+        let _guard = self.effects.locks[lock].lock().await;
+        self.claim_file_effect_unlocked(identity).await
+    }
+
+    async fn claim_file_effect_unlocked(
         &self,
         identity: FileEffectIdentity,
     ) -> Result<FileEffectReservation, HandError> {

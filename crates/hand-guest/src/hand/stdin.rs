@@ -7,7 +7,11 @@ pub(crate) struct StdinBook {
 }
 
 pub(crate) enum StdinRecord {
-    InFlight { request_digest: Digest },
+    InFlight {
+        request_digest: Digest,
+        /// Wakes exact concurrent retries when the in-flight write settles.
+        completed: Arc<Notify>,
+    },
     Complete(Box<WriteStdinReceipt>),
 }
 
@@ -49,10 +53,11 @@ impl Hand {
             (meta.stdin.clone(), meta.operation.clone())
         };
         // Reserve globally, then release the book lock before touching a potentially full pipe.
-        // Exact concurrent retries wait on the short bounded write; unrelated executions never
-        // queue behind a hostile shell that refuses to read stdin.
-        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
+        // An exact concurrent retry awaits the in-flight write's completion signal (bounded);
+        // unrelated executions never queue behind a hostile shell that refuses to read stdin.
+        let wait_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(MAX_STDIN_REPLAY_WAIT_MS);
+        let completed = loop {
             let mut writes = self.stdin.book.lock().await;
             match writes.records.get(request.operation_id.as_str()) {
                 Some(StdinRecord::Complete(existing)) => {
@@ -67,9 +72,24 @@ impl Hand {
                         return Err(stdin_conflict());
                     }
                 }
-                Some(StdinRecord::InFlight { request_digest }) => {
+                Some(StdinRecord::InFlight {
+                    request_digest,
+                    completed,
+                }) => {
                     if request_digest != &request.request_digest {
                         return Err(stdin_conflict());
+                    }
+                    let completed = completed.clone();
+                    let notified = completed.notified();
+                    tokio::pin!(notified);
+                    // Register interest before releasing the book lock, so a completion between
+                    // unlock and await cannot be missed.
+                    notified.as_mut().enable();
+                    drop(writes);
+                    if tokio::time::timeout_at(wait_deadline, notified).await.is_err() {
+                        return Err(unavailable(
+                            "an exact stdin write is still completing; observe and retry",
+                        ));
                     }
                 }
                 None => {
@@ -80,23 +100,18 @@ impl Hand {
                             "stdin idempotency retention is full for this sandbox generation",
                         ));
                     }
+                    let completed = Arc::new(Notify::new());
                     writes.records.insert(
                         request.operation_id.to_string(),
                         StdinRecord::InFlight {
                             request_digest: request.request_digest.clone(),
+                            completed: completed.clone(),
                         },
                     );
-                    break;
+                    break completed;
                 }
             }
-            drop(writes);
-            if tokio::time::Instant::now() >= wait_deadline {
-                return Err(unavailable(
-                    "an exact stdin write is still completing; observe and retry",
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        };
 
         // Empty text without EOF is an observation-only poll. Otherwise the byte bound is
         // PIPE_BUF on supported Linux images, so the one append is all-or-nothing; EOF closes the
@@ -123,7 +138,7 @@ impl Hand {
         };
         let mut writes = self.stdin.book.lock().await;
         match writes.records.get(request.operation_id.as_str()) {
-            Some(StdinRecord::InFlight { request_digest })
+            Some(StdinRecord::InFlight { request_digest, .. })
                 if request_digest == &request.request_digest =>
             {
                 writes.records.insert(
@@ -133,6 +148,8 @@ impl Hand {
             }
             _ => return Err(stdin_conflict()),
         }
+        drop(writes);
+        completed.notify_waiters();
         Ok(receipt)
     }
 }

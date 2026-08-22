@@ -47,7 +47,7 @@ use crate::config::{
     Config, MANAGED_BINDING_UID_MIN, MANAGED_BINDING_UID_SPAN, MAX_CONCURRENT_OPERATIONS,
     MAX_OPERATION_OUTPUT_BYTES, MAX_OPERATION_TIMEOUT_MS, MAX_PREPARED_BINDINGS,
     MAX_RETAINED_OPERATIONS, MAX_RETAINED_STDIN_WRITES, MAX_RETAINED_TERMINAL_BYTES,
-    MAX_TARGET_LIFETIME_MS, MAX_WAIT_MS, ToolIdentity, wall_ms,
+    MAX_STDIN_REPLAY_WAIT_MS, MAX_TARGET_LIFETIME_MS, MAX_WAIT_MS, ToolIdentity, wall_ms,
 };
 use crate::errors::{
     ack_store_error, file_effect_store_error, generation_conflict, hand_error, invalid,
