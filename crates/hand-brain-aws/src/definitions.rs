@@ -308,32 +308,13 @@ fn parse_record(
 }
 
 fn validate_identifier(value: &str, field: &'static str) -> Result<(), DefinitionError> {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(DefinitionError::InvalidIdentity(field));
-    };
-    if value.len() > 128
-        || !value.is_ascii()
-        || !first.is_ascii_alphanumeric()
-        || chars.any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-')))
-    {
-        return Err(DefinitionError::InvalidIdentity(field));
-    }
-    Ok(())
+    hand_policy::identity::validate_identifier(value, field)
+        .map_err(|error| DefinitionError::InvalidIdentity(error.field))
 }
 
 fn validate_digest(value: &str) -> Result<(), DefinitionError> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        Ok(())
-    } else {
-        Err(DefinitionError::Corrupt(
-            "definition digest is invalid".into(),
-        ))
-    }
+    hand_policy::identity::validate_digest(value, "digest")
+        .map_err(|_| DefinitionError::Corrupt("definition digest is invalid".into()))
 }
 
 fn conditional_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, R>) -> bool {

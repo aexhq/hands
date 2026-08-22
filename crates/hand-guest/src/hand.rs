@@ -27,12 +27,14 @@ use hand_core::connector::ConnectorClass;
 use hand_core::files::{LiveFileEntry, LiveFileError, LiveFileKind, LiveFiles};
 use hand_core::operation::{OperationError, OperationRegistry, OperationState, Reservation};
 use hand_core::resources::{ResourceRequest, ResourceSupport};
+use hand_policy::guest_env::{
+    environment_name_is_valid, reserved_tool_environment, secret_material_fits,
+};
 use hand_wire::{
     FileEffectIdentity, FileEffectKind, FileEffectReservation, FileEffectStoredResult,
     GuestFileWriteRequest, GuestFileWriteSource, InstallBindingRequest, InstallBundleMetadata,
     InstallObjectMetadata, InstallReceipt, InstallSecretsRequest, MAX_INLINE_FILE_BYTES,
-    RunPayload, TargetRuntimeStatus, environment_name_is_valid, reserved_tool_environment,
-    secret_material_fits,
+    RunPayload, TargetRuntimeStatus,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
@@ -626,10 +628,10 @@ impl Hand {
             return Err(generation_conflict());
         }
         let declared = request.env_names.iter().cloned().collect::<BTreeSet<_>>();
-        if !secret_material_fits(&request.env_names, &request.values) {
-            return Err(invalid(
-                "secret material is outside the canonical bounded environment union",
-            ));
+        if let Err(refusal) = secret_material_fits(&request.env_names, &request.values) {
+            return Err(invalid(format!(
+                "secret material is outside the canonical bounded environment union: {refusal}"
+            )));
         }
         if declared.iter().any(|name| reserved_tool_environment(name)) {
             return Err(invalid(

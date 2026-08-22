@@ -1623,6 +1623,7 @@ dependencies = [
  "hand-core",
  "hand-egress-gateway",
  "hand-lambda",
+ "hand-policy",
  "hand-wire",
  "hex",
  "ipnet",
@@ -1648,6 +1649,7 @@ dependencies = [
  "async-trait",
  "cap-std",
  "globset",
+ "hand-policy",
  "hex",
  "regex",
  "serde",
@@ -1657,7 +1659,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "zeroize",
 ]
 
 [[package]]
@@ -1689,6 +1690,7 @@ dependencies = [
  "brain-protocol",
  "futures-util",
  "hand-core",
+ "hand-policy",
  "hand-wire",
  "hex",
  "libc",
@@ -1735,15 +1737,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hand-policy"
+version = "0.1.0"
+dependencies = [
+ "brain-protocol",
+ "serde",
+ "serde_jcs",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "hand-wire"
 version = "0.1.0"
 dependencies = [
  "brain",
  "brain-protocol",
- "hand-core",
+ "hand-policy",
  "serde",
- "serde_jcs",
- "zeroize",
 ]
 
 [[package]]

@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 pub const LOGICAL_WORKSPACE: &str = "/workspace";
 pub const MAX_LIVE_FILE_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_LIVE_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+pub use hand_policy::MAX_OBJECT_BYTES as MAX_LIVE_OBJECT_BYTES;
 pub const MAX_SEARCH_ENTRIES: usize = 100_000;
 pub const MAX_SEARCH_PATH_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;

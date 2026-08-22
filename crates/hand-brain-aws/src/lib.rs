@@ -56,12 +56,15 @@ use hand_lambda::control::{
     Control, ControlError, ControlPacingConfig, ExactRunMicrovmRequest, is_terminated,
 };
 use hand_lambda::launch::{self, LaunchFailure};
+use hand_policy::MAX_OBJECT_BYTES;
+use hand_policy::guest_env::{
+    environment_name_is_valid, reserved_tool_environment, secret_material_fits,
+};
 use hand_wire::{
     AllowlistProxy, FileEffectIdentity, FileEffectKind, FileEffectReservation,
     FileEffectStoredResult, GuestFileWriteRequest, GuestFileWriteSource, InstallBindingRequest,
     InstallBundleMetadata, InstallObjectMetadata, InstallSecretsRequest, RequestCall,
-    ResponseReply, RunPayload, environment_name_is_valid, reserved_tool_environment,
-    secret_material_fits,
+    ResponseReply, RunPayload,
 };
 use ipnet::Ipv4Net;
 use sha2::{Digest as _, Sha256};
@@ -89,7 +92,6 @@ const FILE_EFFECT_LOCK_SHARDS: usize = 64;
 const DEFAULT_BUNDLE_CACHE_MAX_MIB: u64 = 128;
 const DEFAULT_BUNDLE_FETCH_MAX_MIB: u64 = 32;
 const MAX_CONFIGURED_BUNDLE_CACHE_MIB: u64 = 512;
-const MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 // A process crash anywhere around RunMicrovm cannot prove whether a VM was created. The reserved
 // capacity therefore stays unavailable for the provider's full eight-hour VM wall plus skew;
 // only an explicit KnownNoTarget response refunds early. Reclaiming a shorter lease could launch
@@ -1199,12 +1201,14 @@ impl AwsHand {
             })
             .await?;
         let mut values = material.into_env();
-        if !secret_material_fits(&env_names, &values) {
+        if let Err(refusal) = secret_material_fits(&env_names, &values) {
             zeroize_secret_values(&mut values);
             return Err(error(
                 HandErrorCode::CapabilityUnavailable,
                 false,
-                "secret delivery returned material outside the declared bounded environment",
+                format!(
+                    "secret delivery returned material outside the declared bounded environment: {refusal}"
+                ),
             ));
         }
         let mut payload = InstallSecretsRequest {
@@ -2454,7 +2458,8 @@ impl GenerationLauncher {
             .map_err(|_| invalid("provider launch request cannot be sealed"))?;
         let encoded = String::from_utf8(bytes)
             .map_err(|_| invalid("provider launch request is not UTF-8"))?;
-        DurableLaunchRequest::new(encoded).map_err(materialization_error)
+        DurableLaunchRequest::new(encoded)
+            .map_err(|error| materialization_error(error.into()))
     }
 
     fn decode_launch(

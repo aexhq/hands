@@ -14,10 +14,9 @@ use brain_protocol::hand::{
     SandboxFileRequest, SandboxFileWriteResult, SandboxTarget, SealedBinding, SubmitReceipt,
     SubmitRequest, WriteStdinReceipt, WriteStdinRequest,
 };
-use hand_core::connector::ConnectorClass;
-use hand_core::materialization::ControlToken;
+use hand_policy::connector::ConnectorClass;
+use hand_policy::secret::ControlToken;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize as _;
 
 /// Inline file reads/writes are capped at 1 MiB decoded. A 2 MiB frame admits their padded base64
 /// plus the exact request/response envelope without making the WebSocket allocation unbounded.
@@ -28,7 +27,7 @@ pub const MAX_WIRE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_BUNDLE_INSTALL_BYTES: usize = brain_protocol::MAX_SESSION_BUNDLE_BYTES;
 pub const MAX_INSTALL_METADATA_BYTES: usize = 64 * 1024;
 pub const MAX_INSTALL_BODY_BYTES: usize = MAX_BUNDLE_INSTALL_BYTES + MAX_INSTALL_METADATA_BYTES + 1;
-pub const MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+pub use hand_policy::MAX_OBJECT_BYTES;
 pub const OBJECT_METADATA_HEADER: &str = "x-aex-object-metadata";
 pub const FILE_ENTRY_HEADER: &str = "x-aex-file-entry";
 pub const CONTROL_AUTH_HEADER: &str = "x-aex-hand-control";
@@ -182,94 +181,6 @@ pub struct InstallSecretsRequest {
     pub values: std::collections::HashMap<String, String>,
 }
 
-#[must_use]
-pub fn environment_name_is_valid(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= brain_protocol::MAX_SESSION_SECRET_NAME_BYTES
-        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
-        && bytes[1..]
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-}
-
-#[must_use]
-pub fn reserved_tool_environment(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    name.starts_with("LD_")
-        || name.starts_with("HAND_")
-        || name.starts_with("AEX_")
-        || matches!(
-            name.as_str(),
-            "PATH"
-                | "HOME"
-                | "USER"
-                | "LOGNAME"
-                | "LANG"
-                | "TERM"
-                | "CI"
-                | "IFS"
-                | "ENV"
-                | "BASH_ENV"
-                | "SHELLOPTS"
-                | "PS4"
-                | "NODE_OPTIONS"
-                | "NODE_PATH"
-                | "NODE_REPL_EXTERNAL_MODULE"
-                | "HTTP_PROXY"
-                | "HTTPS_PROXY"
-                | "ALL_PROXY"
-                | "NO_PROXY"
-                | "GIT_TERMINAL_PROMPT"
-                | "CARGO_HOME"
-                | "RUSTUP_HOME"
-                | "GOPATH"
-                | "GOMODCACHE"
-                | "NPM_CONFIG_PREFIX"
-                | "NPM_CONFIG_CACHE"
-                | "PIP_CACHE_DIR"
-                | "PIPX_HOME"
-                | "PIPX_BIN_DIR"
-                | "UV_CACHE_DIR"
-                | "GCONV_PATH"
-                | "LOCPATH"
-                | "NLSPATH"
-                | "OPENSSL_CONF"
-                | "OPENSSL_MODULES"
-                | "SSLKEYLOGFILE"
-        )
-}
-
-/// Applies Brain's exact custody-document boundary again at both trusted-adapter and guest
-/// ingress. The temporary canonical encoding is immediately zeroized; callers separately zeroize
-/// the owned strings after delivery.
-#[must_use]
-pub fn secret_material_fits(
-    env_names: &[String],
-    values: &std::collections::HashMap<String, String>,
-) -> bool {
-    if env_names.len() > brain_protocol::MAX_SESSION_SECRET_NAMES
-        || values.len() != env_names.len()
-        || env_names.iter().enumerate().any(|(index, name)| {
-            !environment_name_is_valid(name)
-                || env_names[..index].iter().any(|prior| prior == name)
-                || !values.contains_key(name)
-        })
-        || values.values().any(|value| {
-            value.len() > brain_protocol::MAX_SESSION_SECRET_VALUE_UTF8_BYTES
-                || value.contains('\0')
-        })
-    {
-        return false;
-    }
-    let Ok(mut canonical) = serde_jcs::to_vec(values) else {
-        return false;
-    };
-    let fits = canonical.len() <= brain_protocol::MAX_SESSION_SECRET_DOCUMENT_BYTES;
-    canonical.zeroize();
-    fits
-}
-
 /// Private trusted-adapter projection of a canonical file write. A canonical object source also
 /// carries a one-purpose storage GET authority; the hosted Hand consumes that authority while
 /// staging bytes and must never forward it into the hostile MicroVM.
@@ -343,25 +254,4 @@ mod tests {
         assert!(padded_base64_bytes + 16 * 1024 < MAX_WIRE_FRAME_BYTES);
     }
 
-    #[test]
-    fn secret_document_accepts_the_brain_exact_boundary_and_rejects_plus_one() {
-        let names = vec!["A".into()];
-        let exact_value = format!("{}aaaaaaaa", "é".repeat(2040));
-        let exact = std::collections::HashMap::from([("A".into(), exact_value)]);
-        assert_eq!(
-            serde_jcs::to_vec(&exact).unwrap().len(),
-            brain_protocol::MAX_SESSION_SECRET_DOCUMENT_BYTES
-        );
-        assert!(secret_material_fits(&names, &exact));
-
-        let oversized_value = format!("{}aaaaaaaa€", "é".repeat(2039));
-        let oversized = std::collections::HashMap::from([("A".into(), oversized_value)]);
-        assert_eq!(
-            serde_jcs::to_vec(&oversized).unwrap().len(),
-            brain_protocol::MAX_SESSION_SECRET_DOCUMENT_BYTES + 1
-        );
-        assert!(!secret_material_fits(&names, &oversized));
-        assert!(!environment_name_is_valid("A-B"));
-        assert!(!environment_name_is_valid("9TOKEN"));
-    }
 }

@@ -11,7 +11,6 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use zeroize::Zeroize as _;
 
 use crate::connector::ConnectorClass;
 
@@ -23,111 +22,19 @@ pub const MAX_TARGET_PAGE: usize = 100;
 /// lease deadline as `retry_after_ms` would turn an ordinary first-call race into an eight-hour
 /// outage even though the installed target is normally visible within seconds.
 pub const MAX_MATERIALIZATION_POLL_MS: u64 = 1_000;
-pub const MAX_DURABLE_LAUNCH_REQUEST_BYTES: usize = 64 * 1024;
-const CONTROL_TOKEN_PREFIX: &str = "control-";
-const CONTROL_TOKEN_HEX_BYTES: usize = 32;
 
-/// Generation-scoped bearer for the in-guest supervisor channel. The provider JWE authenticates
-/// traffic at the public provider endpoint, but an untrusted Tool shares the guest network
-/// namespace and can bypass that proxy. This second bearer is delivered only in the sealed run
-/// payload and retained with the installed routing row. It is never exposed through Brain's
-/// public Hand contract, formatting, logs, or Tool environments.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ControlToken(String);
+// The secret newtypes live in the vocabulary crate; this re-export keeps every consumer of the
+// materialization contract on one import path.
+pub use hand_policy::secret::{
+    ControlToken, DurableLaunchRequest, MAX_DURABLE_LAUNCH_REQUEST_BYTES, SecretError,
+};
 
-impl ControlToken {
-    pub fn new(value: impl Into<String>) -> Result<Self, MaterializationError> {
-        let value = value.into();
-        let Some(hex) = value.strip_prefix(CONTROL_TOKEN_PREFIX) else {
-            return Err(MaterializationError::InvalidControlToken);
-        };
-        if hex.len() != CONTROL_TOKEN_HEX_BYTES * 2
-            || !hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(MaterializationError::InvalidControlToken);
+impl From<SecretError> for MaterializationError {
+    fn from(error: SecretError) -> Self {
+        match error {
+            SecretError::InvalidControlToken => MaterializationError::InvalidControlToken,
+            SecretError::InvalidLaunchRequest => MaterializationError::InvalidLaunchRequest,
         }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for ControlToken {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ControlToken([redacted])")
-    }
-}
-
-impl serde::Serialize for ControlToken {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ControlToken {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error as _;
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(D::Error::custom)
-    }
-}
-
-impl Drop for ControlToken {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-/// Exact provider request retained only while a target is materializing. It can contain a
-/// short-lived private-network bearer, so formatting is always redacted and dropped storage is
-/// zeroized. The registry persists these bytes before provider dispatch and removes them on install.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DurableLaunchRequest(String);
-
-impl DurableLaunchRequest {
-    pub fn new(value: impl Into<String>) -> Result<Self, MaterializationError> {
-        let value = value.into();
-        if value.is_empty() || value.len() > MAX_DURABLE_LAUNCH_REQUEST_BYTES {
-            return Err(MaterializationError::InvalidLaunchRequest);
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    fn validate(&self) -> Result<(), MaterializationError> {
-        if self.0.is_empty() || self.0.len() > MAX_DURABLE_LAUNCH_REQUEST_BYTES {
-            Err(MaterializationError::InvalidLaunchRequest)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl std::fmt::Debug for DurableLaunchRequest {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("DurableLaunchRequest([redacted])")
-    }
-}
-
-impl Drop for DurableLaunchRequest {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -1099,18 +1006,8 @@ fn transition_installed(
 }
 
 fn validate_identifier(value: &str, field: &'static str) -> Result<(), MaterializationError> {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err(MaterializationError::InvalidIdentity(field));
-    };
-    if value.len() > 128
-        || !value.is_ascii()
-        || !first.is_ascii_alphanumeric()
-        || chars.any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-')))
-    {
-        return Err(MaterializationError::InvalidIdentity(field));
-    }
-    Ok(())
+    hand_policy::identity::validate_identifier(value, field)
+        .map_err(|error| MaterializationError::InvalidIdentity(error.field))
 }
 
 fn validate_bounded_token(
@@ -1118,25 +1015,13 @@ fn validate_bounded_token(
     field: &'static str,
     max: usize,
 ) -> Result<(), MaterializationError> {
-    if value.is_empty()
-        || value.len() > max
-        || !value.is_ascii()
-        || value.chars().any(char::is_whitespace)
-    {
-        return Err(MaterializationError::InvalidIdentity(field));
-    }
-    Ok(())
+    hand_policy::identity::validate_bounded_token(value, field, max)
+        .map_err(|error| MaterializationError::InvalidIdentity(error.field))
 }
 
 fn validate_digest(value: &str, field: &'static str) -> Result<(), MaterializationError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(MaterializationError::InvalidIdentity(field));
-    }
-    Ok(())
+    hand_policy::identity::validate_digest(value, field)
+        .map_err(|error| MaterializationError::InvalidIdentity(error.field))
 }
 
 fn validate_reason(reason: &str) -> Result<(), MaterializationError> {
@@ -1846,7 +1731,7 @@ mod tests {
         ] {
             assert_eq!(
                 ControlToken::new(invalid).unwrap_err(),
-                MaterializationError::InvalidControlToken
+                SecretError::InvalidControlToken
             );
         }
     }

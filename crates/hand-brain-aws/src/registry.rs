@@ -818,7 +818,7 @@ fn parse_record(
                 .map(|value| value.as_ref().to_vec())
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .ok_or_else(|| corrupt("missing binary launch_request"))
-                .and_then(DurableLaunchRequest::new)?,
+                .and_then(|value| DurableLaunchRequest::new(value).map_err(Into::into))?,
             attempt_id: string(ATTEMPT_ID)?,
             attempt_expires_at_ms: number(ATTEMPT_EXPIRES_AT_MS)?,
             target_expires_at_ms: number("expires_at_ms")?,
@@ -832,7 +832,7 @@ fn parse_record(
                 .map(|value| value.as_ref().to_vec())
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .ok_or_else(|| corrupt("missing binary control_token"))
-                .and_then(ControlToken::new)?,
+                .and_then(|value| ControlToken::new(value).map_err(Into::into))?,
             installed_at_ms: number("installed_at_ms")?,
             expires_at_ms: number("expires_at_ms")?,
         },

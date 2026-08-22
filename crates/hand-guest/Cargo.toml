@@ -19,6 +19,7 @@ path = "src/main.rs"
 brain-protocol.workspace = true
 brain.workspace = true
 hand-core = { path = "../hand-core" }
+hand-policy = { path = "../hand-policy" }
 hand-wire = { path = "../hand-wire" }
 anyhow.workspace = true
 axum.workspace = true
