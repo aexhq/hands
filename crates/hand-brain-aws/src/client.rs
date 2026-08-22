@@ -510,7 +510,9 @@ fn endpoint_response_error(status: reqwest::StatusCode, operation: &str) -> Hand
     }
 }
 
-fn control_error(error_value: ControlError) -> HandError {
+/// One classification for every provider control failure. The provider's own message text stays
+/// out of the public Hand contract; scope and pacing survive as structured details.
+pub(crate) fn control_error(error_value: ControlError) -> HandError {
     match error_value {
         ControlError::Gone(_) => error(HandErrorCode::SandboxGone, false, "sandbox is gone"),
         ControlError::Capacity {

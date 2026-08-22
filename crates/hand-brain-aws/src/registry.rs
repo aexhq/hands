@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use crate::dynamo::{conditional_failure, n, s};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
@@ -876,14 +877,6 @@ fn conditional_result<E: ProvideErrorMetadata, R>(
     }
 }
 
-fn conditional_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, R>) -> bool {
-    matches!(
-        error,
-        SdkError::ServiceError(service)
-            if service.err().code() == Some("ConditionalCheckFailedException")
-    )
-}
-
 fn transaction_cancelled<E: ProvideErrorMetadata, R>(error: &SdkError<E, R>) -> bool {
     matches!(
         error,
@@ -975,23 +968,7 @@ fn storage_error<E: ProvideErrorMetadata, R>(
     operation: &str,
     error: &SdkError<E, R>,
 ) -> MaterializationError {
-    let description = match error {
-        SdkError::ServiceError(service) => format!(
-            "{}: {}",
-            service.err().code().unwrap_or("service error"),
-            service.err().message().unwrap_or("")
-        ),
-        other => other.to_string(),
-    };
-    MaterializationError::Storage(format!("{operation}: {description}"))
-}
-
-fn s(value: impl Into<String>) -> AttributeValue {
-    AttributeValue::S(value.into())
-}
-
-fn n(value: u64) -> AttributeValue {
-    AttributeValue::N(value.to_string())
+    MaterializationError::Storage(crate::dynamo::storage_detail(operation, error))
 }
 
 fn corrupt(message: impl Into<String>) -> MaterializationError {

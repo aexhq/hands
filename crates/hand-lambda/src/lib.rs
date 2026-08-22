@@ -38,3 +38,21 @@ pub const MAX_DURATION_SECONDS: u64 = 28_800;
 
 /// Endpoint auth token lifetime. `CreateMicrovmAuthToken` accepts minutes, max 60.
 pub const TOKEN_TTL_SECONDS: u64 = 3_600;
+
+/// One `SdkConfig` per process: every AWS client in a command derives from this single load, so
+/// region and credential-provider resolution cannot silently diverge between clients.
+pub async fn aws_config(region: &str) -> aws_config::SdkConfig {
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_owned()))
+        .load()
+        .await
+}
+
+/// Builder for every client that talks to a MicroVM endpoint: no ambient proxy (guest JWE and
+/// one-purpose object authorities must never be forwarded through one) and no redirects.
+#[must_use]
+pub fn endpoint_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+}

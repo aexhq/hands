@@ -113,9 +113,10 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
     let cli = Cli::parse();
-    let control = Control::from_env(&cli.region).await?;
+    let aws = hand_lambda::aws_config(&cli.region).await;
+    let control = Control::from_sdk_config(&aws, &cli.region)?;
     match cli.command {
-        Command::Image { command } => image_command(&control, &cli.region, command).await,
+        Command::Image { command } => image_command(&control, &aws, command).await,
         Command::List => {
             for vm in control.list().await? {
                 println!("{}\t{:?}", vm.id, vm.state);
@@ -140,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn image_command(
     control: &Control,
-    region: &str,
+    aws: &aws_config::SdkConfig,
     command: ImageCommand,
 ) -> anyhow::Result<()> {
     match command {
@@ -158,9 +159,7 @@ async fn image_command(
                 confirm_dev_image_canary,
                 "--confirm-dev-image-canary is required"
             );
-            let http = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?;
+            let http = hand_lambda::endpoint_http_client_builder().build()?;
             run_no_respawn_canary(
                 control,
                 &http,
@@ -227,11 +226,7 @@ async fn image_command(
                 binary.display()
             );
             let zip = image::pack_zip(&bytes)?;
-            let aws = aws_config::from_env()
-                .region(aws_config::Region::new(region.to_owned()))
-                .load()
-                .await;
-            let s3 = aws_sdk_s3::Client::new(&aws);
+            let s3 = aws_sdk_s3::Client::new(aws);
             let published = image::publish(
                 control,
                 &s3,

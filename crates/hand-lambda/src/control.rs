@@ -267,13 +267,11 @@ impl Control {
         }
     }
 
-    pub async fn from_env(region: &str) -> anyhow::Result<Self> {
-        let cfg = aws_config::from_env()
-            .region(aws_config::Region::new(region.to_owned()))
-            .load()
-            .await;
+    /// Builds a paced control plane from an already-loaded shared `SdkConfig` (see
+    /// [`crate::aws_config`]); pacing bounds still come from the environment.
+    pub fn from_sdk_config(aws: &aws_config::SdkConfig, region: &str) -> anyhow::Result<Self> {
         Ok(Self::with_pacing(
-            Client::new(&cfg),
+            Client::new(aws),
             region,
             ControlPacingConfig::from_env()?,
         ))

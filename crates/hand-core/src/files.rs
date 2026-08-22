@@ -115,7 +115,7 @@ impl LiveFiles {
             .open_dir(cap_path(&relative))
             .map_err(map_directory)?;
         validate_cursor(cursor)?;
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, crate::page::MAX_PAGE);
         let mut entries = bounded_directory_entries(&directory, MAX_SEARCH_ENTRIES)?;
         entries.sort_by_key(cap_std::fs::DirEntry::file_name);
         let mut projected = Vec::with_capacity(limit + 1);
@@ -356,7 +356,7 @@ impl LiveFiles {
         let base = self.relative(logical_path)?;
         self.root.open_dir(cap_path(&base)).map_err(map_directory)?;
         validate_cursor(cursor)?;
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, crate::page::MAX_PAGE);
         let mut projected = Vec::with_capacity(limit + 1);
         let mut pending = vec![base.clone()];
         let mut paths = Vec::new();
@@ -515,12 +515,17 @@ fn cap_path(relative: &Path) -> &Path {
     }
 }
 
-fn page(mut entries: Vec<LiveFileEntry>, limit: usize) -> LiveFilePage {
-    let next_cursor = (entries.len() > limit).then(|| entries[limit - 1].path.clone());
-    entries.truncate(limit);
+impl crate::page::PageIdentity for LiveFileEntry {
+    fn page_identity(&self) -> &str {
+        &self.path
+    }
+}
+
+fn page(entries: Vec<LiveFileEntry>, limit: usize) -> LiveFilePage {
+    let paged = crate::page::page(entries, limit);
     LiveFilePage {
-        entries,
-        next_cursor,
+        entries: paged.items,
+        next_cursor: paged.next_cursor,
     }
 }
 

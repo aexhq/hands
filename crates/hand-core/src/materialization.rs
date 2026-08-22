@@ -16,7 +16,7 @@ use crate::connector::ConnectorClass;
 
 pub const TARGET_KEY_PREFIX: &str = "target:";
 pub const DEFAULT_TARGET_KEY: &str = "target:default";
-pub const MAX_TARGET_PAGE: usize = 100;
+pub use crate::page::MAX_PAGE as MAX_TARGET_PAGE;
 /// A durable uncertainty lease can span the provider's full target lifetime, but callers waiting
 /// on the worker that owns a normal launch must poll on a short bounded cadence. Exposing the
 /// lease deadline as `retry_after_ms` would turn an ordinary first-call race into an eight-hour
@@ -411,10 +411,12 @@ pub enum InstallOutcome {
     ReservationLost,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetPage {
-    pub items: Vec<DurableTargetRecord>,
-    pub next_cursor: Option<String>,
+pub type TargetPage = crate::page::Page<DurableTargetRecord>;
+
+impl crate::page::PageIdentity for DurableTargetRecord {
+    fn page_identity(&self) -> &str {
+        &self.key.target_key
+    }
 }
 
 /// Durable storage operations needed by target materialization.
@@ -888,7 +890,7 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
         validate_identifier(root_id, "root_id")?;
         let limit = limit.clamp(1, MAX_TARGET_PAGE);
         let records = self.records.lock().map_err(|_| poisoned())?;
-        let mut items: Vec<_> = records
+        let items: Vec<_> = records
             .values()
             .filter(|record| {
                 record.key.root_id == root_id
@@ -897,9 +899,7 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
             .take(limit + 1)
             .cloned()
             .collect();
-        let next_cursor = (items.len() > limit).then(|| items[limit - 1].key.target_key.clone());
-        items.truncate(limit);
-        Ok(TargetPage { items, next_cursor })
+        Ok(crate::page::page(items, limit))
     }
 }
 

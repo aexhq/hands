@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use crate::dynamo::{conditional_failure, n, s};
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -317,35 +318,11 @@ fn validate_digest(value: &str) -> Result<(), DefinitionError> {
         .map_err(|_| DefinitionError::Corrupt("definition digest is invalid".into()))
 }
 
-fn conditional_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, R>) -> bool {
-    matches!(
-        error,
-        SdkError::ServiceError(service)
-            if service.err().code() == Some("ConditionalCheckFailedException")
-    )
-}
-
 fn storage_error<E: ProvideErrorMetadata, R>(
     operation: &str,
     error: &SdkError<E, R>,
 ) -> DefinitionError {
-    let description = match error {
-        SdkError::ServiceError(service) => format!(
-            "{}: {}",
-            service.err().code().unwrap_or("service error"),
-            service.err().message().unwrap_or("")
-        ),
-        other => other.to_string(),
-    };
-    DefinitionError::Storage(format!("{operation}: {description}"))
-}
-
-fn s(value: impl Into<String>) -> AttributeValue {
-    AttributeValue::S(value.into())
-}
-
-fn n(value: u64) -> AttributeValue {
-    AttributeValue::N(value.to_string())
+    DefinitionError::Storage(crate::dynamo::storage_detail(operation, error))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

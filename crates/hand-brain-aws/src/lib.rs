@@ -8,6 +8,7 @@
 //! reconcile that target row so a lost supervisor can be terminated and its capacity refunded.
 
 pub mod client;
+mod dynamo;
 pub mod definitions;
 pub mod registry;
 
@@ -71,7 +72,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use zeroize::Zeroize as _;
 
-use crate::client::{GuestClient, error, temporary};
+use crate::client::{GuestClient, control_error, error, temporary};
 use crate::definitions::{
     DefinitionError, DefinitionKind, DefinitionRecord, DynamoDefinitionRegistry,
 };
@@ -224,21 +225,14 @@ pub struct HandPlane {
 
 impl HandPlane {
     pub async fn from_env(cfg: HandPlaneConfig) -> anyhow::Result<Self> {
-        let aws = aws_config::from_env()
-            .region(aws_config::Region::new(cfg.region.clone()))
-            .load()
-            .await;
+        let aws = hand_lambda::aws_config(&cfg.region).await;
         let control = Control::with_pacing(
             aws_sdk_lambdamicrovms::Client::new(&aws),
             cfg.region.clone(),
             ControlPacingConfig::from_env()?,
         );
-        let http = reqwest::Client::builder()
+        let http = hand_lambda::endpoint_http_client_builder()
             .pool_max_idle_per_host(64)
-            // Guest JWE and one-purpose object authorities must never be forwarded through an
-            // ambient host proxy. Network routing is an explicit Hand/platform responsibility.
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("HTTP client configuration");
         let db = aws_sdk_dynamodb::Client::new(&aws);
@@ -684,12 +678,22 @@ fn zeroize_secret_values(values: &mut HashMap<String, String>) {
     values.clear();
 }
 
-fn secret_install_lock_index(target_ref: &str, session_id: &str) -> usize {
+/// One shard derivation for every lock array: SHA-256 over NUL-joined parts, first 8 bytes.
+fn shard_index(parts: &[&str], shards: usize) -> usize {
     let mut digest = Sha256::new();
-    digest.update(target_ref.as_bytes());
-    digest.update([0]);
-    digest.update(session_id.as_bytes());
-    usize::from(digest.finalize()[0]) % SECRET_INSTALL_LOCK_SHARDS
+    for (position, part) in parts.iter().enumerate() {
+        if position > 0 {
+            digest.update([0]);
+        }
+        digest.update(part.as_bytes());
+    }
+    let digest = digest.finalize();
+    let prefix = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
+    prefix as usize % shards
+}
+
+fn secret_install_lock_index(target_ref: &str, session_id: &str) -> usize {
+    shard_index(&[target_ref, session_id], SECRET_INSTALL_LOCK_SHARDS)
 }
 
 /// Supervisor-owned temporary object. It has no stable external name, is mode 0600, and is
@@ -2343,9 +2347,7 @@ fn file_effect_identity(request: &SandboxCopyRequest, kind: FileEffectKind) -> F
 }
 
 fn file_effect_lock_index(operation_id: &str) -> usize {
-    let digest = Sha256::digest(operation_id.as_bytes());
-    let prefix = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
-    prefix as usize % FILE_EFFECT_LOCK_SHARDS
+    shard_index(&[operation_id], FILE_EFFECT_LOCK_SHARDS)
 }
 
 struct GenerationLauncher {
@@ -3475,31 +3477,6 @@ fn materialization_error(error_value: MaterializationError) -> HandError {
     }
 }
 
-fn control_error(error_value: ControlError) -> HandError {
-    match error_value {
-        ControlError::Gone(_) => error(HandErrorCode::SandboxGone, false, "sandbox is gone"),
-        ControlError::Capacity {
-            scope,
-            retry_after_ms,
-            message,
-        } => {
-            let mut value = error(HandErrorCode::ResourceExhausted, true, message);
-            value.details.insert("scope".into(), scope.into());
-            value
-                .details
-                .insert("retry_after_ms".into(), retry_after_ms.into());
-            value
-        }
-        ControlError::Retryable(_) | ControlError::Throttled(_) | ControlError::Unknown(_) => {
-            temporary("sandbox provider is temporarily unavailable")
-        }
-        ControlError::Fatal(_) => error(
-            HandErrorCode::CapabilityUnavailable,
-            false,
-            "sandbox provider configuration is invalid",
-        ),
-    }
-}
 
 #[cfg(test)]
 mod tests {
