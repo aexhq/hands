@@ -846,7 +846,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 [[package]]
 name = "brain"
 version = "0.1.0"
-source = "git+https://github.com/aexhq/brain?rev=ca29e5ecda3c86b32ad303c6048ca7158776bbbb#ca29e5ecda3c86b32ad303c6048ca7158776bbbb"
+source = "git+https://github.com/aexhq/brain?rev=23f71d6148b9fcf81b031517fafe8c4b411d9119#23f71d6148b9fcf81b031517fafe8c4b411d9119"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -878,7 +878,7 @@ dependencies = [
 [[package]]
 name = "brain-protocol"
 version = "0.1.0"
-source = "git+https://github.com/aexhq/brain?rev=ca29e5ecda3c86b32ad303c6048ca7158776bbbb#ca29e5ecda3c86b32ad303c6048ca7158776bbbb"
+source = "git+https://github.com/aexhq/brain?rev=23f71d6148b9fcf81b031517fafe8c4b411d9119#23f71d6148b9fcf81b031517fafe8c4b411d9119"
 dependencies = [
  "chrono",
  "hex",
