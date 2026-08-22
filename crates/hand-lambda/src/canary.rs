@@ -1014,7 +1014,9 @@ const customerHandResults = await Promise.all(customerHandHosts.map(async (host)
   }),
   managementStatus: await requestStatus(https, {
     hostname: host,
-    path: "/v1/@connections/aex-network-canary",
+    // Use the documented API Gateway connection-id shape so the request reaches IAM
+    // authentication instead of failing earlier as an invalid identifier.
+    path: "/v1/@connections/L0SM9cOFvHcCIhw%3D",
     port: 443,
     method: "POST",
     headers: { "Content-Length": "0" },
@@ -1358,7 +1360,13 @@ mod tests {
             assert!(request.input.command.contains(host), "{host}");
         }
         assert!(request.input.command.contains("Sec-WebSocket-Key"));
-        assert!(request.input.command.contains("@connections"));
+        assert!(
+            request
+                .input
+                .command
+                .contains("@connections/L0SM9cOFvHcCIhw%3D")
+        );
+        assert!(!request.input.command.contains("aex-network-canary"));
     }
 
     #[test]
