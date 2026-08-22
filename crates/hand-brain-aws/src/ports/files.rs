@@ -187,92 +187,112 @@ impl SandboxFilesPort for AwsHand {
         }
         match request.direction {
             SandboxCopyRequestDirection::Import => {
-                let object = request
-                    .object
-                    .as_ref()
-                    .ok_or_else(|| invalid("import requires an object reference"))?;
-                let staged =
-                    fetch_object(self.plane.guest.http(), &request.transfer, object).await?;
-                let result = self.install_object(&installed, object, &staged).await;
-                self.settle_guest_result(&installed, result).await?;
-                let write = GuestFileWriteRequest {
-                    effect: identity,
-                    expected_generation: request.expected_generation.to_string(),
-                    overwrite: request.overwrite,
-                    path: request.path.to_string(),
-                    source: GuestFileWriteSource::InstalledObject {
-                        object: object.clone(),
-                    },
-                    target: request.target,
-                };
-                match self
-                    .guest_rpc(&installed, RequestCall::WriteFile(write))
-                    .await?
-                {
-                    ResponseReply::WriteFile(FileEffectStoredResult::Copy(result)) => Ok(result),
-                    _ => Err(wrong_reply("import")),
-                }
+                self.transfer_import(request, &installed, identity).await
             }
             SandboxCopyRequestDirection::Export => {
-                let read: SandboxFileRequest = serde_json::from_value(serde_json::json!({
-                    "expected_generation": request.expected_generation,
-                    "path": request.path,
-                    "target": request.target
-                }))
-                .map_err(|_| invalid("export request cannot be projected"))?;
-                validate_transfer_authority(
-                    &request.transfer,
-                    ObjectTransferAuthorityMethod::Put,
-                    0,
-                )?;
-                let result = self.plane.guest.export_file(&installed, &read).await;
-                let (mut file, response) = self.settle_guest_result(&installed, result).await?;
-                let staged = stage_response(
-                    response,
-                    request.transfer.max_bytes.get().min(MAX_OBJECT_BYTES),
-                    request.transfer.expires_at_ms.get(),
-                )
-                .await?;
-                match self.claim_file_effect(&installed, identity).await? {
-                    FileEffectReservation::Replay(result) => {
-                        let FileEffectStoredResult::Copy(result) = *result else {
-                            return Err(temporary("guest replayed the wrong copy claim kind"));
-                        };
-                        return Ok(result);
-                    }
-                    FileEffectReservation::New => {}
-                }
-                put_object(self.plane.guest.http(), &request.transfer, &staged).await?;
-                // The Tool may mutate an open file while it is copied. Publish the exact streamed
-                // snapshot identity, not stale pre-stream metadata from the opened path.
-                file.bytes = staged.bytes;
-                file.sha256 = Some(staged.sha256.parse().expect("digest"));
-                let object = ObjectReference {
-                    bytes: staged.bytes,
-                    media_type: None,
-                    object_id: request.transfer.object_id.clone(),
-                    sha256: staged.sha256.parse().expect("digest"),
-                };
-                let result = SandboxCopyResult {
-                    file,
-                    object: Some(object),
-                    operation_id: request.operation_id,
-                    replayed: false,
-                    request_digest: request.request_digest,
-                };
-                match self
-                    .guest_rpc(
-                        &installed,
-                        RequestCall::CompleteFileEffect(FileEffectStoredResult::Copy(result)),
-                    )
-                    .await?
-                {
-                    ResponseReply::CompleteFileEffect(FileEffectStoredResult::Copy(result)) => {
-                        Ok(result)
-                    }
-                    _ => Err(wrong_reply("copy completion")),
-                }
+                self.transfer_export(request, &installed, identity).await
             }
+        }
+    }
+}
+
+impl AwsHand {
+    /// Import: consume the GET authority host-side, install the staged object into the guest,
+    /// and let the guest perform the two-phase file effect against the installed object.
+    async fn transfer_import(
+        &self,
+        request: SandboxCopyRequest,
+        installed: &InstalledTarget,
+        identity: FileEffectIdentity,
+    ) -> HandResult<SandboxCopyResult> {
+        let object = request
+            .object
+            .as_ref()
+            .ok_or_else(|| invalid("import requires an object reference"))?;
+        let staged = fetch_object(self.plane.guest.http(), &request.transfer, object).await?;
+        let result = self.install_object(installed, object, &staged).await;
+        self.settle_guest_result(installed, result).await?;
+        let write = GuestFileWriteRequest {
+            effect: identity,
+            expected_generation: request.expected_generation.to_string(),
+            overwrite: request.overwrite,
+            path: request.path.to_string(),
+            source: GuestFileWriteSource::InstalledObject {
+                object: object.clone(),
+            },
+            target: request.target,
+        };
+        match self
+            .guest_rpc(installed, RequestCall::WriteFile(write))
+            .await?
+        {
+            ResponseReply::WriteFile(FileEffectStoredResult::Copy(result)) => Ok(result),
+            _ => Err(wrong_reply("import")),
+        }
+    }
+
+    /// Export: stream the live file out of the guest, stage it host-side, consume the PUT
+    /// authority, and record the exact streamed snapshot identity as the effect result.
+    async fn transfer_export(
+        &self,
+        request: SandboxCopyRequest,
+        installed: &InstalledTarget,
+        identity: FileEffectIdentity,
+    ) -> HandResult<SandboxCopyResult> {
+        let read = SandboxFileRequest {
+            expected_generation: request.expected_generation.clone(),
+            path: request
+                .path
+                .as_str()
+                .parse()
+                .map_err(|_| invalid("export path cannot be projected"))?,
+            target: request.target.clone(),
+        };
+        validate_transfer_authority(&request.transfer, ObjectTransferAuthorityMethod::Put, 0)?;
+        let result = self.plane.guest.export_file(installed, &read).await;
+        let (mut file, response) = self.settle_guest_result(installed, result).await?;
+        let staged = stage_response(
+            response,
+            request.transfer.max_bytes.get().min(MAX_OBJECT_BYTES),
+            request.transfer.expires_at_ms.get(),
+        )
+        .await?;
+        match self.claim_file_effect(installed, identity).await? {
+            FileEffectReservation::Replay(result) => {
+                let FileEffectStoredResult::Copy(result) = *result else {
+                    return Err(temporary("guest replayed the wrong copy claim kind"));
+                };
+                return Ok(result);
+            }
+            FileEffectReservation::New => {}
+        }
+        put_object(self.plane.guest.http(), &request.transfer, &staged).await?;
+        // The Tool may mutate an open file while it is copied. Publish the exact streamed
+        // snapshot identity, not stale pre-stream metadata from the opened path.
+        file.bytes = staged.bytes;
+        file.sha256 = Some(staged.sha256.parse().expect("digest"));
+        let object = ObjectReference {
+            bytes: staged.bytes,
+            media_type: None,
+            object_id: request.transfer.object_id.clone(),
+            sha256: staged.sha256.parse().expect("digest"),
+        };
+        let result = SandboxCopyResult {
+            file,
+            object: Some(object),
+            operation_id: request.operation_id,
+            replayed: false,
+            request_digest: request.request_digest,
+        };
+        match self
+            .guest_rpc(
+                installed,
+                RequestCall::CompleteFileEffect(FileEffectStoredResult::Copy(result)),
+            )
+            .await?
+        {
+            ResponseReply::CompleteFileEffect(FileEffectStoredResult::Copy(result)) => Ok(result),
+            _ => Err(wrong_reply("copy completion")),
         }
     }
 }

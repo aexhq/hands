@@ -355,11 +355,8 @@ impl AwsHand {
         }
         let installed_key = format!("secret-session:{}", envelope.session_id.as_str());
         if self
-            .prepared_targets
-            .read()
+            .already_installed(&route.target_ref, &installed_key)
             .await
-            .get(&route.target_ref)
-            .is_some_and(|items| items.contains(&installed_key))
         {
             return Ok(());
         }
@@ -371,11 +368,8 @@ impl AwsHand {
             secret_install_lock_index(route.target_ref.as_str(), envelope.session_id.as_str());
         let _secret_install_guard = self.secret_install_locks[secret_lock].lock().await;
         if self
-            .prepared_targets
-            .read()
+            .already_installed(&route.target_ref, &installed_key)
             .await
-            .get(&route.target_ref)
-            .is_some_and(|items| items.contains(&installed_key))
         {
             return Ok(());
         }
@@ -456,6 +450,14 @@ impl AwsHand {
             .or_default()
             .insert(installed_key);
         Ok(())
+    }
+
+    async fn already_installed(&self, target_ref: &str, installed_key: &str) -> bool {
+        self.prepared_targets
+            .read()
+            .await
+            .get(target_ref)
+            .is_some_and(|items| items.contains(installed_key))
     }
 
     async fn consume_secret_capability(&self, session_id: &str, capability_ref: &str) {
