@@ -130,9 +130,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HAND_TOOL_DIR=/var/hand/tools \
     HAND_TOOL_RUNNER=/usr/local/lib/hand/tool-runner.mjs \
     HAND_TOOL_BOUNDARY_LIBRARY=/usr/local/lib/hand/tool-boundary.so \
-    HAND_SUPERVISOR_UID=1001 \
-    HAND_TOOL_UID=1000 \
-    HAND_TOOL_GID=1000 \
+    HAND_SUPERVISOR_UID={SUPERVISOR_UID} \
+    HAND_TOOL_UID={TOOL_UID} \
+    HAND_TOOL_GID={TOOL_GID} \
     HAND_LISTEN=0.0.0.0:{AGENT_PORT}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -157,8 +157,8 @@ RUN deluser --remove-home ubuntu 2>/dev/null || true; \
     userdel -f ubuntu 2>/dev/null || true; \
     groupdel ubuntu 2>/dev/null || true; \
     useradd --create-home --home-dir /home/agent --shell /bin/bash --uid {TOOL_UID} --user-group agent \
-    && groupadd --gid 1001 hand \
-    && useradd --uid 1001 --gid hand --groups agent --no-create-home --home-dir /nonexistent hand \
+    && groupadd --gid {SUPERVISOR_UID} hand \
+    && useradd --uid {SUPERVISOR_UID} --gid hand --groups agent --no-create-home --home-dir /nonexistent hand \
     && mkdir -p /workspace /var/hand/ops /var/hand/bindings /var/hand/objects /var/hand/file-staging /var/hand/tools /usr/local/lib/hand \
     && chown -R agent:agent /workspace /home/agent \
     && chmod 2770 /workspace /home/agent \
