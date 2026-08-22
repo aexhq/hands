@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use std::sync::Mutex;
+
 use super::*;
 
 struct RejectingLauncher(LaunchError);

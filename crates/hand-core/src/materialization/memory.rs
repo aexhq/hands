@@ -1,6 +1,13 @@
 //! In-memory registry double with plane-quota semantics (test support only).
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use super::*;
+
+fn poisoned() -> MaterializationError {
+    MaterializationError::Storage("target registry lock is poisoned".into())
+}
 
 /// In-memory conformance implementation. Production uses the DynamoDB implementation, while this
 /// one makes every transition and crash point deterministic in tests.
@@ -288,5 +295,67 @@ impl DurableTargetRegistry for MemoryTargetRegistry {
             .cloned()
             .collect();
         Ok(crate::page::page(items, limit))
+    }
+}
+
+pub(crate) fn record_from_lease(lease: &MaterializationLease, now_ms: u64) -> DurableTargetRecord {
+    DurableTargetRecord {
+        key: lease.key.clone(),
+        spec: lease.spec.clone(),
+        spec_digest: lease.spec_digest.clone(),
+        generation: lease.generation.clone(),
+        state: DurableTargetState::Materializing {
+            reservation_id: lease.reservation_id.clone(),
+            launch_request: lease.launch_request.clone(),
+            attempt_id: lease.attempt_id.clone(),
+            attempt_expires_at_ms: lease.attempt_expires_at_ms,
+            target_expires_at_ms: lease.target_expires_at_ms,
+            lease_expires_at_ms: lease.lease_expires_at_ms,
+        },
+        updated_at_ms: now_ms,
+    }
+}
+pub(crate) fn take_materialization_attempt(
+    record: &mut DurableTargetRecord,
+    request: &AcquireTarget,
+) -> Result<MaterializationLease, MaterializationError> {
+    let DurableTargetState::Materializing {
+        attempt_id,
+        attempt_expires_at_ms,
+        lease_expires_at_ms,
+        ..
+    } = &mut record.state
+    else {
+        return Err(MaterializationError::Corrupt(
+            "expected materializing target".into(),
+        ));
+    };
+    *attempt_id = request.attempt_id.clone();
+    *attempt_expires_at_ms = request
+        .now_ms
+        .checked_add(request.attempt_duration_ms)
+        .ok_or(MaterializationError::InvalidLease)?
+        .min(*lease_expires_at_ms);
+    record.updated_at_ms = request.now_ms;
+    record.validate()?;
+    lease_from_materializing_record(record)
+}
+pub(crate) fn transition_installed(
+    records: &mut BTreeMap<TargetKey, DurableTargetRecord>,
+    target: &InstalledTarget,
+    transition: impl FnOnce(&mut DurableTargetRecord),
+) -> Result<(), MaterializationError> {
+    let record = records
+        .get_mut(&target.key)
+        .ok_or(MaterializationError::ReservationLost { cleanup: None })?;
+    match &record.state {
+        DurableTargetState::Installed { target_ref, .. }
+            if target_ref == &target.target_ref && record.generation == target.generation =>
+        {
+            transition(record);
+            Ok(())
+        }
+        DurableTargetState::Gone { .. } | DurableTargetState::Terminated { .. } => Ok(()),
+        _ => Err(MaterializationError::ReservationLost { cleanup: None }),
     }
 }

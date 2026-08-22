@@ -5,9 +5,6 @@
 //! retries reach the same guest and that guest atomically deduplicates `(operation_id, digest)`.
 //! There is deliberately no per-operation database write on the ordinary execution path.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -78,10 +75,6 @@ fn validate_reason(reason: &str) -> Result<(), MaterializationError> {
         return Err(MaterializationError::InvalidIdentity("reason"));
     }
     Ok(())
-}
-
-fn poisoned() -> MaterializationError {
-    MaterializationError::Storage("target registry lock is poisoned".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
