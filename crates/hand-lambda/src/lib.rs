@@ -50,7 +50,6 @@ pub async fn aws_config(region: &str) -> aws_config::SdkConfig {
 
 /// Builder for every client that talks to a MicroVM endpoint: no ambient proxy (guest JWE and
 /// one-purpose object authorities must never be forwarded through one) and no redirects.
-#[must_use]
 pub fn endpoint_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
