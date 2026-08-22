@@ -31,44 +31,17 @@ impl Hand {
         let execution = self.validate_operation(&request.envelope).await?;
         let operation = operation_ref(&request.envelope, &execution.target)?;
         let target = target_receipt(&execution.target)?;
-        let reservation_bytes = TERMINAL_ENVELOPE_BYTES;
-        let notify = Arc::new(Notify::new());
         let cancellation = CancellationToken::new();
-        let reservation = {
-            let mut operations = self.operations.book.lock().await;
-            let reservation = operations
-                .registry
-                .reserve(
-                    request.envelope.operation_id.as_str(),
-                    request.envelope.request_digest.as_str(),
-                    reservation_bytes,
-                )
-                .map_err(operation_error)?;
-            if reservation == Reservation::New {
-                operations.metadata.insert(
-                    request.envelope.operation_id.to_string(),
-                    OperationMeta {
-                        operation: operation.clone(),
-                        target: target.clone(),
-                        cancellation: cancellation.clone(),
-                        notify: notify.clone(),
-                        stdin: None,
-                    },
-                );
-                operations
-                    .registry
-                    .mark_running(request.envelope.operation_id.as_str())
-                    .map_err(operation_error)?;
-            } else {
-                validate_operation_ref(
-                    operations
-                        .metadata
-                        .get(request.envelope.operation_id.as_str()),
-                    &operation,
-                )?;
-            }
-            reservation
-        };
+        let reservation = self
+            .admit_operation(
+                request.envelope.operation_id.as_str(),
+                request.envelope.request_digest.as_str(),
+                &operation,
+                &target,
+                &cancellation,
+                None,
+            )
+            .await?;
         if reservation == Reservation::New {
             let execution_request = BundleExecution {
                 bundle_path: execution.bundle_path,
@@ -273,46 +246,21 @@ impl Hand {
                 .map_err(|_| invalid("target_ref is not a canonical operation locator"))?,
         };
         let target_receipt = target_receipt(&target)?;
-        let reservation_bytes = TERMINAL_ENVELOPE_BYTES;
-        let notify = Arc::new(Notify::new());
         let cancellation = CancellationToken::new();
         let control = request
             .input
             .interactive
             .then(|| Arc::new(InteractiveControl::default()));
-        let reservation = {
-            let mut operations = self.operations.book.lock().await;
-            let reservation = operations
-                .registry
-                .reserve(
-                    request.execution_id.as_str(),
-                    request.request_digest.as_str(),
-                    reservation_bytes,
-                )
-                .map_err(operation_error)?;
-            if reservation == Reservation::New {
-                operations.metadata.insert(
-                    request.execution_id.to_string(),
-                    OperationMeta {
-                        operation: operation.clone(),
-                        target: target_receipt.clone(),
-                        cancellation: cancellation.clone(),
-                        notify: notify.clone(),
-                        stdin: control.clone(),
-                    },
-                );
-                operations
-                    .registry
-                    .mark_running(request.execution_id.as_str())
-                    .map_err(operation_error)?;
-            } else {
-                validate_operation_ref(
-                    operations.metadata.get(request.execution_id.as_str()),
-                    &operation,
-                )?;
-            }
-            reservation
-        };
+        let reservation = self
+            .admit_operation(
+                request.execution_id.as_str(),
+                request.request_digest.as_str(),
+                &operation,
+                &target_receipt,
+                &cancellation,
+                control.clone(),
+            )
+            .await?;
         if reservation == Reservation::New {
             let execution_request = ShellExecution {
                 command: request.input.command.to_string(),
@@ -339,6 +287,43 @@ impl Hand {
             operation,
             replayed: reservation == Reservation::Existing,
         })
+    }
+
+    /// Reserves the operation id under the terminal-envelope byte reservation, records its
+    /// metadata, and marks it running — or, on an exact replay, validates the existing record.
+    async fn admit_operation(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        operation: &OperationRef,
+        target: &TargetReceipt,
+        cancellation: &CancellationToken,
+        stdin: Option<Arc<InteractiveControl>>,
+    ) -> Result<Reservation, HandError> {
+        let mut operations = self.operations.book.lock().await;
+        let reservation = operations
+            .registry
+            .reserve(operation_id, request_digest, TERMINAL_ENVELOPE_BYTES)
+            .map_err(operation_error)?;
+        if reservation == Reservation::New {
+            operations.metadata.insert(
+                operation_id.to_string(),
+                OperationMeta {
+                    operation: operation.clone(),
+                    target: target.clone(),
+                    cancellation: cancellation.clone(),
+                    notify: Arc::new(Notify::new()),
+                    stdin,
+                },
+            );
+            operations
+                .registry
+                .mark_running(operation_id)
+                .map_err(operation_error)?;
+        } else {
+            validate_operation_ref(operations.metadata.get(operation_id), operation)?;
+        }
+        Ok(reservation)
     }
 
     pub(crate) async fn validate_operation(
