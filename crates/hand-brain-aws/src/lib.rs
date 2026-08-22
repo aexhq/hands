@@ -1438,7 +1438,7 @@ impl AwsHand {
             .await?
         {
             ResponseReply::ReserveFileEffect(reservation) => Ok(reservation),
-            _ => Err(temporary("guest returned the wrong file reservation reply")),
+            _ => Err(wrong_reply("file reservation")),
         }
     }
 
@@ -1452,7 +1452,7 @@ impl AwsHand {
             .await?
         {
             ResponseReply::ClaimFileEffect(reservation) => Ok(reservation),
-            _ => Err(temporary("guest returned the wrong file claim reply")),
+            _ => Err(wrong_reply("file claim")),
         }
     }
 }
@@ -1513,7 +1513,7 @@ impl HandPort for AwsHand {
         let reply = self.guest_submit_rpc(&route, request).await?;
         match reply {
             ResponseReply::Submit(receipt) => Ok(receipt),
-            _ => Err(temporary("guest returned the wrong submit reply")),
+            _ => Err(wrong_reply("submit")),
         }
     }
 
@@ -1524,7 +1524,7 @@ impl HandPort for AwsHand {
             .await?
         {
             ResponseReply::Observe(observation) => Ok(observation),
-            _ => Err(temporary("guest returned the wrong observe reply")),
+            _ => Err(wrong_reply("observe")),
         }
     }
 
@@ -1535,7 +1535,7 @@ impl HandPort for AwsHand {
             .await?
         {
             ResponseReply::Cancel(receipt) => Ok(receipt),
-            _ => Err(temporary("guest returned the wrong cancel reply")),
+            _ => Err(wrong_reply("cancel")),
         }
     }
 
@@ -1549,7 +1549,7 @@ impl HandPort for AwsHand {
             .await?
         {
             ResponseReply::AcknowledgeTerminal(receipt) => Ok(receipt),
-            _ => Err(temporary("guest returned the wrong acknowledgement reply")),
+            _ => Err(wrong_reply("acknowledgement")),
         }
     }
 }
@@ -1993,7 +1993,7 @@ impl SandboxFilesPort for AwsHand {
             .await?
         {
             ResponseReply::ListFiles(value) => Ok(value),
-            _ => Err(temporary("guest returned the wrong list reply")),
+            _ => Err(wrong_reply("list")),
         }
     }
 
@@ -2006,7 +2006,7 @@ impl SandboxFilesPort for AwsHand {
             .await?
         {
             ResponseReply::StatFile(value) => Ok(value),
-            _ => Err(temporary("guest returned the wrong stat reply")),
+            _ => Err(wrong_reply("stat")),
         }
     }
 
@@ -2019,7 +2019,7 @@ impl SandboxFilesPort for AwsHand {
             .await?
         {
             ResponseReply::ReadFile(value) => Ok(value),
-            _ => Err(temporary("guest returned the wrong read reply")),
+            _ => Err(wrong_reply("read")),
         }
     }
 
@@ -2063,7 +2063,7 @@ impl SandboxFilesPort for AwsHand {
             .await?
         {
             ResponseReply::WriteFile(FileEffectStoredResult::Write(value)) => Ok(value),
-            _ => Err(temporary("guest returned the wrong write reply")),
+            _ => Err(wrong_reply("write")),
         }
     }
 
@@ -2076,7 +2076,7 @@ impl SandboxFilesPort for AwsHand {
             .await?
         {
             ResponseReply::FindFiles(value) => Ok(value),
-            _ => Err(temporary("guest returned the wrong find reply")),
+            _ => Err(wrong_reply("find")),
         }
     }
 
@@ -2089,7 +2089,7 @@ impl SandboxFilesPort for AwsHand {
             .await?
         {
             ResponseReply::GrepFiles(value) => Ok(value),
-            _ => Err(temporary("guest returned the wrong grep reply")),
+            _ => Err(wrong_reply("grep")),
         }
     }
 
@@ -2144,7 +2144,7 @@ impl SandboxFilesPort for AwsHand {
                     .await?
                 {
                     ResponseReply::WriteFile(FileEffectStoredResult::Copy(result)) => Ok(result),
-                    _ => Err(temporary("guest returned the wrong import reply")),
+                    _ => Err(wrong_reply("import")),
                 }
             }
             SandboxCopyRequestDirection::Export => {
@@ -2204,7 +2204,7 @@ impl SandboxFilesPort for AwsHand {
                     ResponseReply::CompleteFileEffect(FileEffectStoredResult::Copy(result)) => {
                         Ok(result)
                     }
-                    _ => Err(temporary("guest returned the wrong copy completion reply")),
+                    _ => Err(wrong_reply("copy completion")),
                 }
             }
         }
@@ -2261,7 +2261,7 @@ impl SandboxControlPort for AwsHand {
             .await?
         {
             ResponseReply::ExecuteSandbox(receipt) => Ok(receipt),
-            _ => Err(temporary("guest returned the wrong execute reply")),
+            _ => Err(wrong_reply("execute")),
         }
     }
 
@@ -2284,7 +2284,7 @@ impl SandboxControlPort for AwsHand {
             .await?
         {
             ResponseReply::WriteStdin(receipt) => Ok(receipt),
-            _ => Err(temporary("guest returned the wrong stdin reply")),
+            _ => Err(wrong_reply("stdin")),
         }
     }
 
@@ -3367,6 +3367,17 @@ fn now_ms() -> u64 {
 
 fn invalid(message: impl Into<String>) -> HandError {
     error(HandErrorCode::InvalidRequest, false, message)
+}
+
+/// A reply variant that does not match the request method is a host/guest contract violation
+/// (for example protocol-version skew), never a transient fault: a retry replays the exact same
+/// mismatch, so fail fast and non-retryable.
+fn wrong_reply(context: &'static str) -> HandError {
+    error(
+        HandErrorCode::InvalidRequest,
+        false,
+        format!("guest returned the wrong {context} reply"),
+    )
 }
 
 fn binding_error(message: impl Into<String>) -> HandError {

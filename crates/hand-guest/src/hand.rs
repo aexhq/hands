@@ -1,6 +1,7 @@
 //! Physical-generation implementation of Brain's canonical receipt protocol.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,7 +45,7 @@ use crate::config::{
     Config, MANAGED_BINDING_UID_MIN, MANAGED_BINDING_UID_SPAN, MAX_CONCURRENT_OPERATIONS,
     MAX_OPERATION_OUTPUT_BYTES, MAX_OPERATION_TIMEOUT_MS, MAX_PREPARED_BINDINGS,
     MAX_RETAINED_OPERATIONS, MAX_RETAINED_STDIN_WRITES, MAX_RETAINED_TERMINAL_BYTES,
-    MAX_TARGET_LIFETIME_MS, MAX_WAIT_MS, ToolIdentity,
+    MAX_TARGET_LIFETIME_MS, MAX_WAIT_MS, ToolIdentity, wall_ms,
 };
 use crate::errors::{hand_error, invalid, unavailable};
 use crate::file_effects::{EffectReservation, FileEffectStore, FileEffectStoreError};
@@ -741,29 +742,23 @@ impl Hand {
             reservation
         };
         if reservation == Reservation::New {
-            let hand = self.clone();
-            tokio::spawn(async move {
-                let _slot = match hand.operation_slots.clone().acquire_owned().await {
-                    Ok(slot) => slot,
-                    Err(_) => return,
-                };
-                let result = execute_bundle(BundleExecution {
-                    bundle_path: execution.bundle_path,
-                    descriptor: execution.descriptor,
-                    envelope: request.envelope.clone(),
-                    workspace: hand.cfg.workspace.clone(),
-                    runner: hand.cfg.tool_runner.clone(),
-                    environment: execution.environment,
-                    proxy_environment: execution.target.proxy_environment,
-                    identity: execution.identity,
-                    boundary_library: hand.cfg.tool_boundary_library.clone(),
-                    target_expires_at_ms: execution.target.expires_at_ms,
-                    cancellation,
-                })
-                .await;
-                hand.finish(request.envelope.operation_id.as_str(), result)
-                    .await;
-            });
+            let execution_request = BundleExecution {
+                bundle_path: execution.bundle_path,
+                descriptor: execution.descriptor,
+                envelope: request.envelope.clone(),
+                workspace: self.cfg.workspace.clone(),
+                runner: self.cfg.tool_runner.clone(),
+                environment: execution.environment,
+                proxy_environment: execution.target.proxy_environment,
+                identity: execution.identity,
+                boundary_library: self.cfg.tool_boundary_library.clone(),
+                target_expires_at_ms: execution.target.expires_at_ms,
+                cancellation,
+            };
+            self.spawn_execution(
+                request.envelope.operation_id.to_string(),
+                execute_bundle(execution_request),
+            );
         }
         let observation = self
             .observe_inner(operation.clone(), request.wait_up_to_ms)
@@ -1245,34 +1240,24 @@ impl Hand {
             reservation
         };
         if reservation == Reservation::New {
-            let hand = self.clone();
-            let execution_id = request.execution_id.to_string();
-            let command = request.input.command.to_string();
-            let timeout_ms = request.resources.timeout_ms.get();
-            let max_output_bytes = request.resources.max_output_bytes.get();
-            let interactive = request.input.interactive;
-            tokio::spawn(async move {
-                let _slot = match hand.operation_slots.clone().acquire_owned().await {
-                    Ok(slot) => slot,
-                    Err(_) => return,
-                };
-                let result = execute_shell(ShellExecution {
-                    command,
-                    cwd,
-                    workspace: hand.cfg.workspace.clone(),
-                    timeout_ms,
-                    max_output_bytes,
-                    interactive,
-                    proxy_environment: target.proxy_environment,
-                    identity: hand.cfg.tool_identity,
-                    boundary_library: hand.cfg.tool_boundary_library.clone(),
-                    target_expires_at_ms: target.expires_at_ms,
-                    cancellation,
-                    control,
-                })
-                .await;
-                hand.finish(&execution_id, result).await;
-            });
+            let execution_request = ShellExecution {
+                command: request.input.command.to_string(),
+                cwd,
+                workspace: self.cfg.workspace.clone(),
+                timeout_ms: request.resources.timeout_ms.get(),
+                max_output_bytes: request.resources.max_output_bytes.get(),
+                interactive: request.input.interactive,
+                proxy_environment: target.proxy_environment,
+                identity: self.cfg.tool_identity,
+                boundary_library: self.cfg.tool_boundary_library.clone(),
+                target_expires_at_ms: target.expires_at_ms,
+                cancellation,
+                control,
+            };
+            self.spawn_execution(
+                request.execution_id.to_string(),
+                execute_shell(execution_request),
+            );
         }
         let observation = self.observe_inner(operation.clone(), 0).await?;
         Ok(SubmitReceipt {
@@ -1558,6 +1543,57 @@ impl Hand {
         }
     }
 
+    /// Runs one admitted execution through to its terminal record. The body is supervised: a
+    /// panic in the executor or in `finish` must never leave the operation `Running` forever, so
+    /// the supervisor records an interrupted terminal instead of dying silently.
+    fn spawn_execution(
+        self: &Arc<Self>,
+        operation_id: String,
+        run: impl Future<Output = crate::process::ExecutionResult> + Send + 'static,
+    ) {
+        let hand = self.clone();
+        tokio::spawn(async move {
+            let supervised = tokio::spawn({
+                let hand = hand.clone();
+                let operation_id = operation_id.clone();
+                async move {
+                    let _slot = match hand.operation_slots.clone().acquire_owned().await {
+                        Ok(slot) => slot,
+                        Err(_) => {
+                            tracing::error!(
+                                operation_id,
+                                "operation slots closed before execution started"
+                            );
+                            return;
+                        }
+                    };
+                    let result = run.await;
+                    hand.finish(&operation_id, result).await;
+                }
+            });
+            if let Err(join_error) = supervised.await {
+                tracing::error!(
+                    operation_id,
+                    %join_error,
+                    "execution task died before recording a terminal; recording interrupted"
+                );
+                hand.finish(
+                    &operation_id,
+                    crate::process::ExecutionResult {
+                        outcome: TerminalOutcome::Interrupted,
+                        inline: serde_json::json!({
+                            "error": "execution was interrupted by an internal fault before a terminal result was recorded"
+                        }),
+                        is_error: true,
+                        exit_code: None,
+                        duration_ms: 0,
+                    },
+                )
+                .await;
+            }
+        });
+    }
+
     async fn finish(&self, operation_id: &str, mut result: crate::process::ExecutionResult) {
         // The child boundary already enforces the operation's narrower output ceiling. Keep this
         // final check at the receipt boundary as defense in depth: a future executor must never
@@ -1581,6 +1617,11 @@ impl Hand {
         terminal.terminal_digest = terminal_result_digest(&terminal);
         let mut operations = self.operations.lock().await;
         let Some(meta) = operations.metadata.get(operation_id) else {
+            // The child already ran: discarding its effect must at least be visible.
+            tracing::warn!(
+                operation_id,
+                "terminal result for an unknown operation was discarded"
+            );
             return;
         };
         let operation = meta.operation.clone();
@@ -1911,8 +1952,6 @@ fn canonical_equal<T: serde::Serialize>(left: &T, right: &T) -> Result<bool, Han
         serde_jcs::to_vec(right).map_err(|_| invalid("sealed value is not canonicalizable"))?;
     Ok(left == right)
 }
-
-use crate::config::wall_ms;
 
 fn operation_error(error: OperationError) -> HandError {
     let code = match error {

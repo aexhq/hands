@@ -1189,26 +1189,43 @@ async fn assert_persistent_502(
     let deadline = tokio::time::Instant::now() + STATE_TIMEOUT;
     let mut consecutive = 0usize;
     while tokio::time::Instant::now() < deadline {
-        let state = control.get(&hand.microvm_id).await?.state;
-        let status = http
+        // The state read only decorates the probe log; a transient control-plane blip must not
+        // abort a destructive gate that has a live VM outstanding.
+        let state = match control.get(&hand.microvm_id).await {
+            Ok(vm) => Some(vm.state),
+            Err(ControlError::Retryable(_) | ControlError::Throttled(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        // A transport failure is not a 502 observation: the consecutive run restarts and only
+        // the deadline can fail the gate.
+        let status = match http
             .get(format!("{}/", hand.endpoint))
             .header(AUTH_HEADER, &hand.auth_token)
             .timeout(PROBE_TIMEOUT)
             .send()
-            .await?
-            .status();
-        tracing::info!(microvm = %hand.microvm_id, ?state, %status, phase, "no-respawn canary probe");
-        if status.as_u16() == 502 {
-            consecutive += 1;
-            if consecutive == REQUIRED_CONSECUTIVE_502 {
-                return Ok(());
+            .await
+        {
+            Ok(response) => Some(response.status()),
+            Err(error) => {
+                tracing::info!(microvm = %hand.microvm_id, %error, phase, "no-respawn canary probe transport error");
+                consecutive = 0;
+                None
             }
-        } else {
-            ensure!(
-                !status.is_success(),
-                "image canary endpoint rearmed during {phase}"
-            );
-            consecutive = 0;
+        };
+        tracing::info!(microvm = %hand.microvm_id, ?state, ?status, phase, "no-respawn canary probe");
+        if let Some(status) = status {
+            if status.as_u16() == 502 {
+                consecutive += 1;
+                if consecutive == REQUIRED_CONSECUTIVE_502 {
+                    return Ok(());
+                }
+            } else {
+                ensure!(
+                    !status.is_success(),
+                    "image canary endpoint rearmed during {phase}"
+                );
+                consecutive = 0;
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

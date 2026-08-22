@@ -79,7 +79,7 @@ impl Config {
         let mut deny_hosts = builtin_deny_hosts();
         deny_hosts.extend(configured_deny_hosts);
         let mut deny_cidrs = Vec::new();
-        if let Ok(value) = std::env::var(ENV_DENY_CIDRS) {
+        if let Some(value) = optional_env(ENV_DENY_CIDRS)? {
             for cidr in split_values(&value) {
                 deny_cidrs.push(
                     cidr.parse()
@@ -166,15 +166,25 @@ fn split_values(value: &str) -> impl Iterator<Item = &str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Reads an optional variable, failing closed when a value is present but not UTF-8 instead of
+/// silently treating it as unset.
+fn optional_env(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid(name)),
+    }
+}
+
 fn usize_env(
     name: &'static str,
     default: usize,
     min: usize,
     max: usize,
 ) -> Result<usize, ConfigError> {
-    let value = match std::env::var(name) {
-        Ok(value) => usize::from_str(&value).map_err(|_| ConfigError::Invalid(name))?,
-        Err(_) => default,
+    let value = match optional_env(name)? {
+        Some(value) => usize::from_str(&value).map_err(|_| ConfigError::Invalid(name))?,
+        None => default,
     };
     if !(min..=max).contains(&value) {
         return Err(ConfigError::Invalid(name));
@@ -183,9 +193,9 @@ fn usize_env(
 }
 
 fn u64_env(name: &'static str, default: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
-    let value = match std::env::var(name) {
-        Ok(value) => u64::from_str(&value).map_err(|_| ConfigError::Invalid(name))?,
-        Err(_) => default,
+    let value = match optional_env(name)? {
+        Some(value) => u64::from_str(&value).map_err(|_| ConfigError::Invalid(name))?,
+        None => default,
     };
     if !(min..=max).contains(&value) {
         return Err(ConfigError::Invalid(name));

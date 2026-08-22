@@ -1,4 +1,23 @@
+use axum::http::StatusCode;
 use brain_protocol::hand::{HandError, HandErrorCode};
+
+/// HTTP projection of a Hand error for the install routes. The code and `retryable` flag carry
+/// the real distinction; the status keeps plain HTTP clients from reading every failure as 409.
+pub fn status_for(code: HandErrorCode) -> StatusCode {
+    match code {
+        HandErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        HandErrorCode::FileNotFound | HandErrorCode::OperationUnknown => StatusCode::NOT_FOUND,
+        HandErrorCode::BindingConflict
+        | HandErrorCode::OperationConflict
+        | HandErrorCode::GenerationConflict
+        | HandErrorCode::SandboxNotMaterialized => StatusCode::CONFLICT,
+        HandErrorCode::SandboxGone => StatusCode::GONE,
+        HandErrorCode::ResourceExhausted => StatusCode::PAYLOAD_TOO_LARGE,
+        HandErrorCode::CapabilityUnavailable | HandErrorCode::TemporarilyUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
 
 pub fn hand_error(code: HandErrorCode, retryable: bool, message: impl Into<String>) -> HandError {
     let mut message = message.into();
