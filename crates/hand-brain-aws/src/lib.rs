@@ -417,7 +417,7 @@ mod tests {
         assert!(cache.get("session-3").is_some());
         assert_eq!(cache.store.sessions.len(), 2);
         assert!(cache.store.preparation_bytes <= metadata_bytes * 2);
-        assert!(!cache.root_sessions.contains_key("root-2"));
+        assert!(!cache.store.root_sessions.contains_key("root-2"));
     }
 
     #[test]
