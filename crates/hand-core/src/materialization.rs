@@ -173,11 +173,19 @@ impl TargetKey {
         if self.is_default() {
             return Ok(());
         }
-        let sandbox_id = self
-            .target_key
+        validate_identifier(self.sandbox_identity()?, "sandbox_id")
+    }
+
+    /// Sandbox identity for capability minting and status projection: `"default"` for the
+    /// default target, the sandbox id for additional targets. Fails on any other key shape
+    /// instead of guessing.
+    pub fn sandbox_identity(&self) -> Result<&str, MaterializationError> {
+        if self.is_default() {
+            return Ok("default");
+        }
+        self.target_key
             .strip_prefix("target:additional:")
-            .ok_or(MaterializationError::InvalidIdentity("target_key"))?;
-        validate_identifier(sandbox_id, "sandbox_id")
+            .ok_or(MaterializationError::InvalidIdentity("target_key"))
     }
 }
 
@@ -229,15 +237,19 @@ impl TargetSpec {
     }
 
     /// Stable digest used by storage CAS expressions. This is an internal identity, not a fork of
-    /// Brain's public contract digest.
+    /// Brain's public contract digest. Canonical JSON (JCS) keeps the digest independent of
+    /// struct field order.
     #[must_use]
     pub fn digest(&self) -> String {
-        let encoded = serde_json::to_vec(self).expect("TargetSpec serialization is infallible");
+        let encoded = serde_jcs::to_vec(self).expect("TargetSpec serialization is infallible");
         hex::encode(Sha256::digest(encoded))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Deliberately not serde-serializable: `recovery_attempt` has no safe deserialization default
+// (a deserialized `false` would let recovery treat a possibly-dispatched launch as fresh), and
+// leases are always rebuilt field-by-field from durable records.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializationLease {
     pub key: TargetKey,
     pub spec: TargetSpec,
@@ -256,7 +268,6 @@ pub struct MaterializationLease {
     /// before its first provider dispatch. `true` means a prior worker may already have
     /// dispatched the exact sealed provider request, so an error from the idempotent replay can
     /// never be used as proof that no physical target exists.
-    #[serde(skip)]
     pub recovery_attempt: bool,
 }
 
@@ -1217,6 +1228,19 @@ mod tests {
 
     fn control_token() -> ControlToken {
         ControlToken::new(format!("control-{}", "a".repeat(64))).expect("test control token")
+    }
+
+    #[test]
+    fn spec_digest_is_canonical_json_independent_of_field_order() {
+        let spec = target_spec(ConnectorClass::None);
+        let canonical = format!(
+            "{{\"connector\":\"none\",\"image_identity\":\"image-digest-1\",\
+             \"materialized_mib\":1024,\"network_policy_digest\":\"{}\",\
+             \"resource_class\":\"microvm-1gb\",\"resource_policy_digest\":\"{}\"}}",
+            "b".repeat(64),
+            "a".repeat(64),
+        );
+        assert_eq!(spec.digest(), hex::encode(Sha256::digest(canonical)));
     }
 
     fn physical(target_ref: impl Into<String>, generation: impl Into<String>) -> PhysicalTarget {

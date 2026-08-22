@@ -2395,7 +2395,7 @@ impl GenerationLauncher {
             let capability = Capability {
                 root_id: self.key.root_id.clone(),
                 session_id: self.owner_session_id.clone(),
-                sandbox_id: sandbox_identity(&self.key),
+                sandbox_id: sandbox_identity(&self.key)?,
                 generation: lease.generation.clone(),
                 issued_at_ms,
                 // The grant never outlives Brain's journaled physical target deadline. That
@@ -3346,21 +3346,22 @@ fn terminated_status(
     }
 }
 
-fn sandbox_identity(key: &TargetKey) -> String {
-    key.target_key
-        .strip_prefix("target:additional:")
-        .unwrap_or("default")
-        .into()
+fn sandbox_identity(key: &TargetKey) -> HandResult<String> {
+    key.sandbox_identity()
+        .map(str::to_owned)
+        .map_err(|_| invalid("target key has an unrecognized shape"))
 }
 
 fn random_identifier(prefix: &str) -> String {
     format!("{prefix}-{}", hex::encode(rand::random::<[u8; 16]>()))
 }
 
+// Fail closed: every expiry predicate in this crate compares against this value, so a pre-epoch
+// clock must abort rather than make every expired authority look valid.
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is after the UNIX epoch")
         .as_millis() as u64
 }
 
