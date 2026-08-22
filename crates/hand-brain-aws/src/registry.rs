@@ -61,11 +61,6 @@ impl DynamoTargetRegistry {
         }
     }
 
-    #[must_use]
-    pub fn table(&self) -> &str {
-        &self.table
-    }
-
     async fn read(
         &self,
         key: &TargetKey,
