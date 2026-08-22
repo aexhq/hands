@@ -2,68 +2,60 @@
 
 use crate::*;
 
+/// One shape for every in-process admission-budget refusal.
+fn capacity_error(
+    scope: &'static str,
+    message: &'static str,
+    limits: &[(&'static str, u64)],
+) -> HandError {
+    let mut value = error(HandErrorCode::ResourceExhausted, true, message);
+    value.details.insert("scope".into(), scope.into());
+    for (key, amount) in limits {
+        value.details.insert((*key).into(), (*amount).into());
+    }
+    value
+}
+
 pub(crate) fn preparation_cache_capacity_error(limit_bytes: usize) -> HandError {
-    let mut value = error(
-        HandErrorCode::ResourceExhausted,
-        true,
+    capacity_error(
+        "hand_preparation_cache_bytes",
         "the in-process session preparation metadata budget is full",
-    );
-    value
-        .details
-        .insert("scope".into(), "hand_preparation_cache_bytes".into());
-    value
-        .details
-        .insert("limit_bytes".into(), (limit_bytes as u64).into());
-    value.details.insert(
-        "entry_limit".into(),
-        (MAX_CACHED_PREPARATIONS as u64).into(),
-    );
-    value
+        &[
+            ("limit_bytes", limit_bytes as u64),
+            ("entry_limit", MAX_CACHED_PREPARATIONS as u64),
+        ],
+    )
 }
 
 pub(crate) fn bundle_cache_capacity_error(limit_bytes: usize) -> HandError {
-    let mut value = error(
-        HandErrorCode::ResourceExhausted,
-        true,
+    capacity_error(
+        "hand_bundle_cache_bytes",
         "the in-process verified bundle memory budget is full",
-    );
-    value
-        .details
-        .insert("scope".into(), "hand_bundle_cache_bytes".into());
-    value
-        .details
-        .insert("limit_bytes".into(), (limit_bytes as u64).into());
-    value
+        &[("limit_bytes", limit_bytes as u64)],
+    )
 }
 
 pub(crate) fn bundle_fetch_capacity_error(limit_bytes: usize) -> HandError {
-    let mut value = error(
-        HandErrorCode::ResourceExhausted,
-        true,
+    capacity_error(
+        "hand_bundle_fetch_bytes",
         "the in-process cold bundle fetch budget is full",
-    );
-    value
-        .details
-        .insert("scope".into(), "hand_bundle_fetch_bytes".into());
-    value
-        .details
-        .insert("limit_bytes".into(), (limit_bytes as u64).into());
-    value
+        &[("limit_bytes", limit_bytes as u64)],
+    )
 }
 
 pub(crate) fn bundle_cache_entry_capacity_error() -> HandError {
-    let mut value = error(
-        HandErrorCode::ResourceExhausted,
-        true,
+    capacity_error(
+        "hand_bundle_cache_entries",
         "the in-process verified bundle entry budget is full",
-    );
-    value
-        .details
-        .insert("scope".into(), "hand_bundle_cache_entries".into());
-    value
-        .details
-        .insert("limit".into(), (MAX_CACHED_BUNDLES as u64).into());
-    value
+        &[("limit", MAX_CACHED_BUNDLES as u64)],
+    )
+}
+
+/// Sanitized retryable failure that still leaves an operator trail. The cause is logged here
+/// precisely because it must never enter the public Hand contract.
+pub(crate) fn temporary_from(message: &'static str, cause: impl std::fmt::Display) -> HandError {
+    tracing::warn!(%cause, "{message}");
+    temporary(message)
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> HandError {
@@ -109,11 +101,21 @@ pub(crate) fn classify_submit_delivery_error(error_value: HandError) -> HandErro
     }
 }
 
+// Both mappers enumerate their closed source enums exhaustively: a new variant must choose its
+// public classification at compile time instead of silently becoming a non-retryable
+// InvalidRequest.
 pub(crate) fn definition_error(error_value: DefinitionError) -> HandError {
     match error_value {
         DefinitionError::Conflict => binding_error(error_value.to_string()),
-        DefinitionError::Storage(_) => temporary(error_value.to_string()),
-        _ => invalid(error_value.to_string()),
+        DefinitionError::Storage(_) => temporary_from(
+            "definition registry is temporarily unavailable",
+            error_value,
+        ),
+        DefinitionError::InvalidIdentity(_)
+        | DefinitionError::InvalidPayload(_)
+        | DefinitionError::PayloadTooLarge
+        | DefinitionError::InvalidLimit
+        | DefinitionError::Corrupt(_) => invalid(error_value.to_string()),
     }
 }
 
@@ -158,15 +160,32 @@ pub(crate) fn materialization_error(error_value: MaterializationError) -> HandEr
             false,
             error_value.to_string(),
         ),
-        MaterializationError::Storage(_)
-        | MaterializationError::LaunchRetryable(_)
-        | MaterializationError::LaunchOutcomeUnknown(_)
-        | MaterializationError::ReservationLost { .. } => temporary(error_value.to_string()),
+        MaterializationError::Storage(_) => {
+            temporary_from("target registry is temporarily unavailable", error_value)
+        }
+        MaterializationError::LaunchRetryable(_) => temporary_from(
+            "sandbox launch dependency is temporarily unavailable",
+            error_value,
+        ),
+        MaterializationError::LaunchOutcomeUnknown(_) => temporary_from(
+            "sandbox launch outcome is unknown; bounded recovery will reconcile",
+            error_value,
+        ),
+        MaterializationError::ReservationLost { .. } => temporary_from(
+            "target reservation was superseded by a concurrent transition",
+            error_value,
+        ),
         MaterializationError::LaunchRejected(_) => error(
             HandErrorCode::CapabilityUnavailable,
             false,
             error_value.to_string(),
         ),
-        _ => invalid(error_value.to_string()),
+        MaterializationError::InvalidIdentity(_)
+        | MaterializationError::InvalidLease
+        | MaterializationError::InvalidLaunchRequest
+        | MaterializationError::InvalidControlToken
+        | MaterializationError::InvalidReplacement
+        | MaterializationError::InvalidCapacity
+        | MaterializationError::Corrupt(_) => invalid(error_value.to_string()),
     }
 }

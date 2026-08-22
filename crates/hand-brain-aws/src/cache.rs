@@ -506,7 +506,7 @@ impl BundleFetchReservation {
     ) -> HandResult<Self> {
         let mut in_flight = reserved
             .lock()
-            .map_err(|_| temporary("bundle fetch admission is unavailable"))?;
+            .map_err(|error| temporary_from("bundle fetch admission is unavailable", error))?;
         let projected_fetch = in_flight
             .bytes
             .checked_add(fetch_bytes)

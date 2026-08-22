@@ -45,7 +45,7 @@ impl AwsHand {
         let mut slot = self
             .secret_delivery
             .write()
-            .map_err(|_| temporary("secret delivery lock is unavailable"))?;
+            .map_err(|error| temporary_from("secret delivery lock is unavailable", error))?;
         if slot.is_some() {
             return Err(invalid("secret delivery port is already attached"));
         }
@@ -268,7 +268,9 @@ impl AwsHand {
                 .bundle_install_permits
                 .acquire()
                 .await
-                .map_err(|_| temporary("bundle installation admission is unavailable"))?;
+                .map_err(|error| {
+                    temporary_from("bundle installation admission is unavailable", error)
+                })?;
             // Cached bundle lookup only reads (the access clock is atomic), so concurrent
             // installs are not serialized behind the write lock.
             let bundle = self
@@ -374,11 +376,13 @@ impl AwsHand {
         {
             return Ok(());
         }
-        let _secret_memory_permit = self
-            .secret_install_permits
-            .acquire()
-            .await
-            .map_err(|_| temporary("secret installation admission is unavailable"))?;
+        let _secret_memory_permit =
+            self.secret_install_permits
+                .acquire()
+                .await
+                .map_err(|error| {
+                    temporary_from("secret installation admission is unavailable", error)
+                })?;
         let preparation = self.preparation(envelope.session_id.as_str()).await?;
         let capability = preparation
             .request
@@ -399,7 +403,7 @@ impl AwsHand {
         let port = self
             .secret_delivery
             .read()
-            .map_err(|_| temporary("secret delivery lock is unavailable"))?
+            .map_err(|error| temporary_from("secret delivery lock is unavailable", error))?
             .clone()
             .ok_or_else(|| {
                 error(

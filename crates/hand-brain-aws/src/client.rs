@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::temporary_from;
 use aws_sdk_lambdamicrovms::types::MicrovmState;
 use base64::Engine as _;
 use brain_protocol::contract::HAND_CONTRACT_DIGEST;
@@ -101,7 +102,9 @@ impl GuestClient {
                 INITIAL_TARGET_READY_TIMEOUT,
             )
             .await
-            .map_err(|_| temporary("physical sandbox endpoint did not become ready"))?;
+            .map_err(|error| {
+                temporary_from("physical sandbox endpoint did not become ready", error)
+            })?;
         }
         if is_terminated(&vm.state) {
             return Err(error(
@@ -183,17 +186,20 @@ impl GuestClient {
                     socket
                         .send(Message::Text(encoded.clone().into()))
                         .await
-                        .map_err(|_| temporary("could not send the Hand request"))?;
+                        .map_err(|error| {
+                            temporary_from("could not send the Hand request", error)
+                        })?;
                     while let Some(message) = socket.next().await {
                         let text = match message {
                             Ok(Message::Text(text)) => text.to_string(),
                             Ok(Message::Binary(bytes)) => String::from_utf8(bytes.to_vec())
-                                .map_err(|_| temporary("Hand response is not UTF-8"))?,
+                                .map_err(|error| {
+                                    temporary_from("Hand response is not UTF-8", error)
+                                })?,
                             Ok(Message::Ping(bytes)) => {
-                                socket
-                                    .send(Message::Pong(bytes))
-                                    .await
-                                    .map_err(|_| temporary("Hand ping response failed"))?;
+                                socket.send(Message::Pong(bytes)).await.map_err(|error| {
+                                    temporary_from("Hand ping response failed", error)
+                                })?;
                                 continue;
                             }
                             Ok(Message::Pong(_)) => continue,
@@ -205,7 +211,7 @@ impl GuestClient {
                             Ok(Message::Frame(_)) => continue,
                         };
                         let response: ResponseFrame = serde_json::from_str(&text)
-                            .map_err(|_| temporary("Hand response is malformed"))?;
+                            .map_err(|error| temporary_from("Hand response is malformed", error))?;
                         if response.request_id != frame.request_id {
                             continue;
                         }
@@ -289,7 +295,7 @@ impl GuestClient {
             let endpoint = self.endpoint(target).await?;
             let file = tokio::fs::File::open(file_path)
                 .await
-                .map_err(|_| temporary("staged object is unavailable"))?;
+                .map_err(|error| temporary_from("staged object is unavailable", error))?;
             let body =
                 reqwest::Body::wrap_stream(ReaderStream::new(file.take(bytes.saturating_add(1))));
             let response = self

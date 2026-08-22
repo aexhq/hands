@@ -45,7 +45,7 @@ impl HandPlane {
             .get_or_try_init(|| async {
                 hand_lambda::image::find_image_arn(&self.control, &self.cfg.image)
                     .await
-                    .map_err(|_| temporary("MicroVM image lookup failed"))?
+                    .map_err(|error| temporary_from("MicroVM image lookup failed", error))?
                     .ok_or_else(|| {
                         error(
                             HandErrorCode::CapabilityUnavailable,
@@ -73,7 +73,7 @@ impl HandPlane {
             .signing_algorithm(SigningAlgorithmSpec::EcdsaSha256)
             .send()
             .await
-            .map_err(|_| temporary("network capability signing failed"))?;
+            .map_err(|error| temporary_from("network capability signing failed", error))?;
         let signature = response
             .signature()
             .ok_or_else(|| temporary("network capability signature is absent"))?;

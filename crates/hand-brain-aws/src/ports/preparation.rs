@@ -253,10 +253,9 @@ impl AwsHand {
                     .ok_or_else(|| bundle_fetch_capacity_error(self.bundle_fetch_max_bytes))?;
                 missing_fetches.push(fetch.clone());
             }
-            let in_flight = *self
-                .bundle_fetch_reserved
-                .lock()
-                .map_err(|_| temporary("bundle fetch admission lock is unavailable"))?;
+            let in_flight = *self.bundle_fetch_reserved.lock().map_err(|error| {
+                temporary_from("bundle fetch admission lock is unavailable", error)
+            })?;
             let cache_limit = cache.bundles.max_bundle_bytes;
             cache.bundles.evict_idle_to_fit(
                 in_flight

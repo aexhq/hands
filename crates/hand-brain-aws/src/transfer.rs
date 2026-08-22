@@ -26,7 +26,7 @@ pub(crate) async fn fetch_bundle(
     let staged = stage_response(response, fetch.max_bytes.get(), fetch.expires_at_ms.get()).await?;
     let bytes = tokio::fs::read(staged.file.path())
         .await
-        .map_err(|_| temporary("verified bundle staging is unavailable"))?;
+        .map_err(|error| temporary_from("verified bundle staging is unavailable", error))?;
     if hex::encode(Sha256::digest(&bytes)) != fetch.bundle_digest.as_str() {
         return Err(invalid("fetched bundle does not match its digest"));
     }
@@ -76,7 +76,7 @@ pub(crate) async fn authorized_get<'a>(
         .timeout(timeout)
         .send()
         .await
-        .map_err(|_| temporary("authorized object download failed"))?;
+        .map_err(|error| temporary_from("authorized object download failed", error))?;
     if !response.status().is_success() {
         return Err(temporary("authorized object download was refused"));
     }
@@ -101,10 +101,10 @@ pub(crate) async fn stage_response(
         ));
     }
     let file = tempfile::NamedTempFile::new()
-        .map_err(|_| temporary("supervisor object staging is unavailable"))?;
+        .map_err(|error| temporary_from("supervisor object staging is unavailable", error))?;
     let std_file = file
         .reopen()
-        .map_err(|_| temporary("supervisor object staging is unavailable"))?;
+        .map_err(|error| temporary_from("supervisor object staging is unavailable", error))?;
     let mut output = tokio::fs::File::from_std(std_file);
     let mut bytes = 0u64;
     let mut hash = Sha256::new();
@@ -126,7 +126,8 @@ pub(crate) async fn stage_response(
         let Some(chunk) = next else {
             break;
         };
-        let chunk = chunk.map_err(|_| temporary("authorized object stream failed"))?;
+        let chunk =
+            chunk.map_err(|error| temporary_from("authorized object stream failed", error))?;
         bytes = bytes.saturating_add(chunk.len() as u64);
         if bytes > limit {
             return Err(error(
@@ -138,15 +139,15 @@ pub(crate) async fn stage_response(
         hash.update(&chunk);
         tokio::io::AsyncWriteExt::write_all(&mut output, &chunk)
             .await
-            .map_err(|_| temporary("supervisor object staging failed"))?;
+            .map_err(|error| temporary_from("supervisor object staging failed", error))?;
     }
     tokio::io::AsyncWriteExt::flush(&mut output)
         .await
-        .map_err(|_| temporary("supervisor object staging failed"))?;
+        .map_err(|error| temporary_from("supervisor object staging failed", error))?;
     output
         .sync_all()
         .await
-        .map_err(|_| temporary("supervisor object staging sync failed"))?;
+        .map_err(|error| temporary_from("supervisor object staging sync failed", error))?;
     drop(output);
     Ok(StagedObject {
         file,
@@ -164,7 +165,7 @@ pub(crate) async fn put_object(
     let url = validate_https_authority_url(authority.url.as_str())?;
     let file = tokio::fs::File::open(staged.file.path())
         .await
-        .map_err(|_| temporary("supervisor object staging is unavailable"))?;
+        .map_err(|error| temporary_from("supervisor object staging is unavailable", error))?;
     let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
         tokio::io::AsyncReadExt::take(file, staged.bytes.saturating_add(1)),
     ));
@@ -181,7 +182,7 @@ pub(crate) async fn put_object(
         .timeout(transfer_timeout(authority.expires_at_ms.get())?)
         .send()
         .await
-        .map_err(|_| temporary("authorized object upload failed"))?;
+        .map_err(|error| temporary_from("authorized object upload failed", error))?;
     if response.status().is_success() && now_ms() < authority.expires_at_ms.get() {
         Ok(())
     } else {
