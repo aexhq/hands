@@ -1,0 +1,492 @@
+//! In-memory preparation metadata and content-addressed bundle caches with admission accounting.
+
+use crate::*;
+
+#[derive(Clone)]
+pub(crate) struct Preparation {
+    pub(crate) request: Arc<PrepareSessionRequest>,
+    public_digest: String,
+    pub(crate) metadata_bytes: usize,
+    pub(crate) last_access: Arc<AtomicU64>,
+}
+
+pub(crate) struct CachedBundle {
+    pub(crate) bytes: Arc<Vec<u8>>,
+    pub(crate) last_access: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedPreparedBundle {
+    pub(crate) bytes: u64,
+    pub(crate) descriptor_digest: String,
+    pub(crate) digest: String,
+}
+
+pub(crate) struct PreparationCache {
+    pub(crate) sessions: HashMap<String, Preparation>,
+    pub(crate) root_sessions: HashMap<String, HashSet<String>>,
+    pub(crate) preparation_bytes: usize,
+    pub(crate) max_preparation_bytes: usize,
+    pub(crate) max_preparations: usize,
+    pub(crate) preparation_access_clock: AtomicU64,
+    pub(crate) bundles: HashMap<String, CachedBundle>,
+    pub(crate) bundle_bytes: usize,
+    pub(crate) max_bundle_bytes: usize,
+    pub(crate) access_clock: u64,
+}
+
+impl PreparationCache {
+    pub(crate) fn with_limit(max_bundle_bytes: usize) -> Self {
+        Self::with_limits(
+            max_bundle_bytes,
+            MAX_CACHED_PREPARATION_BYTES,
+            MAX_CACHED_PREPARATIONS,
+        )
+    }
+
+    pub(crate) fn with_limits(
+        max_bundle_bytes: usize,
+        max_preparation_bytes: usize,
+        max_preparations: usize,
+    ) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            root_sessions: HashMap::new(),
+            preparation_bytes: 0,
+            max_preparation_bytes,
+            max_preparations,
+            preparation_access_clock: AtomicU64::new(0),
+            bundles: HashMap::new(),
+            bundle_bytes: 0,
+            max_bundle_bytes,
+            access_clock: 0,
+        }
+    }
+
+    pub(crate) fn get(&self, session_id: &str) -> Option<Preparation> {
+        let access = self
+            .preparation_access_clock
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.sessions
+            .get(session_id)
+            .cloned()
+            .inspect(|preparation| {
+                preparation.last_access.store(access, Ordering::Relaxed);
+            })
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Option<Preparation> {
+        let removed = self.sessions.remove(session_id)?;
+        self.preparation_bytes = self
+            .preparation_bytes
+            .saturating_sub(removed.metadata_bytes);
+        let root_id = removed.request.root_id.to_string();
+        if let Some(sessions) = self.root_sessions.get_mut(&root_id) {
+            sessions.remove(session_id);
+            if sessions.is_empty() {
+                self.root_sessions.remove(&root_id);
+            }
+        }
+        Some(removed)
+    }
+
+    fn evict_preparations_to_fit(
+        &mut self,
+        additional_bytes: usize,
+        additional_entries: usize,
+        protected_session_id: &str,
+    ) -> HandResult<()> {
+        loop {
+            let bytes_fit = self
+                .preparation_bytes
+                .checked_add(additional_bytes)
+                .is_some_and(|total| total <= self.max_preparation_bytes);
+            let entries_fit = self
+                .sessions
+                .len()
+                .checked_add(additional_entries)
+                .is_some_and(|total| total <= self.max_preparations);
+            if bytes_fit && entries_fit {
+                return Ok(());
+            }
+            let candidate = self
+                .sessions
+                .iter()
+                .filter(|(session_id, _)| session_id.as_str() != protected_session_id)
+                .min_by_key(|(_, preparation)| preparation.last_access.load(Ordering::Relaxed))
+                .map(|(session_id, _)| session_id.clone())
+                .ok_or_else(|| preparation_cache_capacity_error(self.max_preparation_bytes))?;
+            self.remove_session(&candidate)
+                .expect("preparation eviction candidate exists");
+        }
+    }
+
+    pub(crate) fn bundle(&mut self, digest: &str) -> Option<Arc<Vec<u8>>> {
+        self.access_clock = self.access_clock.saturating_add(1);
+        let access = self.access_clock;
+        self.bundles.get_mut(digest).map(|bundle| {
+            bundle.last_access = access;
+            bundle.bytes.clone()
+        })
+    }
+
+    /// Makes room without invalidating an in-progress installation. A cached Arc is borrowed
+    /// while it is being installed into a guest; only entries owned solely by this cache are
+    /// eviction candidates. Immutable preparation metadata intentionally does not pin bytes.
+    pub(crate) fn evict_idle_to_fit(
+        &mut self,
+        additional_bytes: usize,
+        additional_entries: usize,
+        protected: &HashSet<String>,
+    ) -> HandResult<()> {
+        loop {
+            let bytes_fit = self
+                .bundle_bytes
+                .checked_add(additional_bytes)
+                .is_some_and(|total| total <= self.max_bundle_bytes);
+            let entries_fit = self
+                .bundles
+                .len()
+                .checked_add(additional_entries)
+                .is_some_and(|total| total <= MAX_CACHED_BUNDLES);
+            if bytes_fit && entries_fit {
+                return Ok(());
+            }
+            let candidate = self
+                .bundles
+                .iter()
+                .filter(|(digest, bundle)| {
+                    !protected.contains(digest.as_str()) && Arc::strong_count(&bundle.bytes) == 1
+                })
+                .min_by_key(|(_, bundle)| bundle.last_access)
+                .map(|(digest, _)| digest.clone())
+                .ok_or_else(|| {
+                    if !entries_fit && bytes_fit {
+                        bundle_cache_entry_capacity_error()
+                    } else {
+                        bundle_cache_capacity_error(self.max_bundle_bytes)
+                    }
+                })?;
+            let evicted = self.bundles.remove(&candidate).expect("candidate exists");
+            self.bundle_bytes = self.bundle_bytes.saturating_sub(evicted.bytes.len());
+        }
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        request: PrepareSessionRequest,
+        public_digest: String,
+        fetched: HashMap<String, Arc<Vec<u8>>>,
+    ) -> HandResult<()> {
+        let session_id = request.session_id.to_string();
+        let root_id = request.root_id.to_string();
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|old| old.request.root_id != request.root_id)
+        {
+            return Err(binding_error(
+                "prepared session cannot move to a different root",
+            ));
+        }
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|old| old.public_digest != public_digest)
+        {
+            return Err(binding_error(
+                "prepared session immutable routing or bundle seal changed",
+            ));
+        }
+        let required = required_bundle_digests(&request)?;
+        if fetched.keys().any(|digest| !required.contains(digest)) {
+            return Err(invalid(
+                "preparation contains a fetch for an unreferenced bundle",
+            ));
+        }
+        for digest in &required {
+            if !fetched.contains_key(digest) && !self.bundles.contains_key(digest) {
+                return Err(error(
+                    HandErrorCode::CapabilityUnavailable,
+                    false,
+                    "bundle cache recovery requires a fresh preparation fetch",
+                ));
+            }
+        }
+
+        // Preparation metadata is cold-path state and may be reconstructed by Brain. Bound it
+        // separately from resident bundle bytes so a large population of dormant sessions cannot
+        // grow the shared hosted process without limit. Eviction is safe: the next operation gets
+        // CapabilityUnavailable before materialization/effect and Brain supplies a fresh prepare.
+        let metadata_bytes = serde_jcs::to_vec(&request)
+            .map_err(|_| invalid("preparation metadata cannot be bounded"))?
+            .len();
+        if metadata_bytes > self.max_preparation_bytes || self.max_preparations == 0 {
+            return Err(preparation_cache_capacity_error(self.max_preparation_bytes));
+        }
+        let prior_metadata_bytes = self
+            .sessions
+            .get(&session_id)
+            .map_or(0, |preparation| preparation.metadata_bytes);
+        let additional_bytes = metadata_bytes.saturating_sub(prior_metadata_bytes);
+        let additional_entries = usize::from(!self.sessions.contains_key(&session_id));
+        self.evict_preparations_to_fit(additional_bytes, additional_entries, &session_id)?;
+
+        let missing = required
+            .iter()
+            .filter(|digest| !self.bundles.contains_key(digest.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let additional_bytes = missing.iter().try_fold(0usize, |total, digest| {
+            total
+                .checked_add(fetched.get(digest).expect("required fetch checked").len())
+                .ok_or_else(|| bundle_cache_capacity_error(self.max_bundle_bytes))
+        })?;
+        self.evict_idle_to_fit(additional_bytes, missing.len(), &required)?;
+        for digest in &required {
+            if !self.bundles.contains_key(digest) {
+                let bytes = fetched.get(digest).expect("required fetch checked").clone();
+                self.bundle_bytes += bytes.len();
+                self.access_clock = self.access_clock.saturating_add(1);
+                self.bundles.insert(
+                    digest.clone(),
+                    CachedBundle {
+                        bytes,
+                        last_access: self.access_clock,
+                    },
+                );
+            }
+            let _ = self.bundle(digest);
+        }
+        if self.sessions.contains_key(&session_id) {
+            self.remove_session(&session_id);
+        }
+        self.preparation_access_clock
+            .fetch_add(1, Ordering::Relaxed);
+        let last_access = self.preparation_access_clock.load(Ordering::Relaxed);
+        self.preparation_bytes = self
+            .preparation_bytes
+            .checked_add(metadata_bytes)
+            .ok_or_else(|| preparation_cache_capacity_error(self.max_preparation_bytes))?;
+        self.sessions.insert(
+            session_id.clone(),
+            Preparation {
+                request: Arc::new(request),
+                public_digest,
+                metadata_bytes,
+                last_access: Arc::new(AtomicU64::new(last_access)),
+            },
+        );
+        self.root_sessions
+            .entry(root_id)
+            .or_default()
+            .insert(session_id);
+        debug_assert_eq!(
+            self.bundle_bytes,
+            self.bundles
+                .values()
+                .map(|bundle| bundle.bytes.len())
+                .sum::<usize>()
+        );
+        Ok(())
+    }
+
+    /// Drops at most `limit` logical preparations and their bundle references.
+    pub(crate) fn purge_root_page(&mut self, root_id: &str, limit: usize) -> bool {
+        let session_ids = self
+            .root_sessions
+            .get(root_id)
+            .into_iter()
+            .flat_map(|sessions| sessions.iter().take(limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            let _ = self.remove_session(&session_id);
+        }
+        let complete = self
+            .root_sessions
+            .get(root_id)
+            .is_none_or(HashSet::is_empty);
+        if complete {
+            self.root_sessions.remove(root_id);
+        }
+        complete
+    }
+}
+
+impl Default for PreparationCache {
+    fn default() -> Self {
+        Self::with_limit(DEFAULT_BUNDLE_CACHE_MAX_MIB as usize * MIB)
+    }
+}
+
+/// Bundle fetch URLs and headers are short-lived bearer authorities. They are consumed while the
+/// preparation request is active and must not become part of the process-lifetime session cache.
+/// The immutable descriptors and binding-to-digest projection remain in the request, so bundle
+/// cache recovery still fails closed and asks Brain for a fresh preparation authority.
+pub(crate) fn cacheable_preparation(mut request: PrepareSessionRequest) -> PrepareSessionRequest {
+    request.bundles.clear();
+    request
+}
+
+pub(crate) fn preparation_public_projection(
+    request: &PrepareSessionRequest,
+) -> HandResult<serde_json::Value> {
+    let mut secret_env_names = request
+        .secret_capability
+        .iter()
+        .flat_map(|capability| capability.env_names.iter())
+        .map(|name| name.as_str().to_owned())
+        .collect::<Vec<_>>();
+    secret_env_names.sort_unstable();
+    if secret_env_names.len() > brain_protocol::MAX_SESSION_SECRET_NAMES
+        || secret_env_names
+            .iter()
+            .any(|name| !environment_name_is_valid(name) || reserved_tool_environment(name))
+        || secret_env_names.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err(invalid(
+            "secret capability has invalid, reserved, or repeated environment names",
+        ));
+    }
+    Ok(serde_json::json!({
+        "bindings": request.bindings,
+        "network": request.network,
+        "resources": request.resources,
+        "root_id": request.root_id,
+        // The one-purpose bearer and expiry may be refreshed after a control-process loss, but
+        // the declared session environment-name union is part of the immutable preparation.
+        "secret_env_names": secret_env_names,
+        "session_id": request.session_id,
+    }))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MaterializationMode<'a> {
+    LazyDefault,
+    ExplicitDefault(&'a str),
+    Additional(&'a str),
+}
+
+impl<'a> MaterializationMode<'a> {
+    pub(crate) fn generation_intent(self) -> Option<&'a str> {
+        match self {
+            Self::LazyDefault => None,
+            Self::ExplicitDefault(generation) | Self::Additional(generation) => Some(generation),
+        }
+    }
+
+    pub(crate) fn replace_after_loss(self) -> bool {
+        matches!(self, Self::LazyDefault | Self::ExplicitDefault(_))
+    }
+}
+
+pub(crate) fn zeroize_secret_values(values: &mut HashMap<String, String>) {
+    for value in values.values_mut() {
+        value.zeroize();
+    }
+    values.clear();
+}
+
+/// One shard derivation for every lock array: SHA-256 over NUL-joined parts, first 8 bytes.
+pub(crate) fn shard_index(parts: &[&str], shards: usize) -> usize {
+    let mut digest = Sha256::new();
+    for (position, part) in parts.iter().enumerate() {
+        if position > 0 {
+            digest.update([0]);
+        }
+        digest.update(part.as_bytes());
+    }
+    let digest = digest.finalize();
+    let prefix = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
+    prefix as usize % shards
+}
+
+pub(crate) fn secret_install_lock_index(target_ref: &str, session_id: &str) -> usize {
+    shard_index(&[target_ref, session_id], SECRET_INSTALL_LOCK_SHARDS)
+}
+
+/// Supervisor-owned temporary object. It has no stable external name, is mode 0600, and is
+/// removed automatically. Transfer authorities and values are deliberately not retained here.
+pub(crate) struct StagedObject {
+    pub(crate) file: tempfile::NamedTempFile,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
+}
+
+/// Process-wide bytes admitted for verified bundles that are currently being fetched but are not
+/// yet represented in `PreparationCache::bundle_bytes`. The reservation uses a synchronous lock
+/// only for integer accounting, so its `Drop` path remains cancellation-safe across network
+/// awaits.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BundleFetchInFlight {
+    pub(crate) bytes: usize,
+    pub(crate) entries: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct BundleFetchReservation {
+    pub(crate) reserved: Arc<StdMutex<BundleFetchInFlight>>,
+    pub(crate) bytes: usize,
+    pub(crate) entries: usize,
+}
+
+impl BundleFetchReservation {
+    /// Reserves the declared upper bound, rather than the eventual response size. This keeps the
+    /// cache plus every concurrent cold fetch below one process-wide limit even if all servers
+    /// return their maximum response at once.
+    pub(crate) fn admit(
+        reserved: Arc<StdMutex<BundleFetchInFlight>>,
+        cached_bytes: usize,
+        cached_entries: usize,
+        fetch_bytes: usize,
+        fetch_entries: usize,
+        cache_limit_bytes: usize,
+        fetch_limit_bytes: usize,
+    ) -> HandResult<Self> {
+        let mut in_flight = reserved
+            .lock()
+            .map_err(|_| temporary("bundle fetch admission is unavailable"))?;
+        let projected_fetch = in_flight
+            .bytes
+            .checked_add(fetch_bytes)
+            .ok_or_else(|| bundle_fetch_capacity_error(fetch_limit_bytes))?;
+        if projected_fetch > fetch_limit_bytes {
+            return Err(bundle_fetch_capacity_error(fetch_limit_bytes));
+        }
+        let admitted = cached_bytes
+            .checked_add(in_flight.bytes)
+            .and_then(|bytes| bytes.checked_add(fetch_bytes))
+            .ok_or_else(|| bundle_cache_capacity_error(cache_limit_bytes))?;
+        if admitted > cache_limit_bytes {
+            return Err(bundle_cache_capacity_error(cache_limit_bytes));
+        }
+        let admitted_entries = cached_entries
+            .checked_add(in_flight.entries)
+            .and_then(|entries| entries.checked_add(fetch_entries))
+            .ok_or_else(|| bundle_cache_capacity_error(cache_limit_bytes))?;
+        if admitted_entries > MAX_CACHED_BUNDLES {
+            return Err(bundle_cache_entry_capacity_error());
+        }
+        in_flight.bytes = projected_fetch;
+        in_flight.entries += fetch_entries;
+        drop(in_flight);
+        Ok(Self {
+            reserved,
+            bytes: fetch_bytes,
+            entries: fetch_entries,
+        })
+    }
+}
+
+impl Drop for BundleFetchReservation {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reserved.bytes = reserved.bytes.saturating_sub(self.bytes);
+        reserved.entries = reserved.entries.saturating_sub(self.entries);
+    }
+}

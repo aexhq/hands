@@ -1068,7 +1068,9 @@ mod tests {
     fn the_tool_runner_carries_the_supervisor_ipc_contract() {
         let runner = include_str!("../../../image/tool-runner.mjs");
         assert!(
-            runner.contains(&format!("maxOutputBytes + {RESULT_ENVELOPE_HEADROOM_BYTES}")),
+            runner.contains(&format!(
+                "maxOutputBytes + {RESULT_ENVELOPE_HEADROOM_BYTES}"
+            )),
             "runner envelope headroom must match RESULT_ENVELOPE_HEADROOM_BYTES"
         );
         assert!(

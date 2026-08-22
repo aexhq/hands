@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use crate::dynamo::{conditional_failure, n, s};
+use async_trait::async_trait;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{

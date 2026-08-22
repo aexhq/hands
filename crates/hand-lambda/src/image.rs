@@ -21,8 +21,8 @@ use aws_sdk_lambdamicrovms::types::{
 };
 use sha2::Digest as _;
 
-use crate::{AGENT_PORT, SUPERVISOR_UID, TOOL_GID, TOOL_UID};
 use crate::control::Control;
+use crate::{AGENT_PORT, SUPERVISOR_UID, TOOL_GID, TOOL_UID};
 
 /// The container base, pinned by digest (resolved from public ECR on 2026-08-18). A tag is a
 /// moving reference; a digest is the bytes. Public ECR rather than Docker Hub because the AWS
@@ -1019,7 +1019,10 @@ mod tests {
         // generated script. The shared boundary properties must never drift apart.
         let dev_boot = include_str!("../../../image/hand-boot.sh");
         let port_reserve = format!("$(( {AGENT_PORT} + 1 ))");
-        for (name, script) in [("generated", boot.as_str()), ("image/hand-boot.sh", dev_boot)] {
+        for (name, script) in [
+            ("generated", boot.as_str()),
+            ("image/hand-boot.sh", dev_boot),
+        ] {
             for property in [
                 "ip_unprivileged_port_start",
                 port_reserve.as_str(),

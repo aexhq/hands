@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use crate::dynamo::{conditional_failure, n, s};
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

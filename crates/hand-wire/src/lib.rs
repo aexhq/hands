@@ -253,5 +253,4 @@ mod tests {
         let padded_base64_bytes = MAX_INLINE_FILE_BYTES.div_ceil(3) * 4;
         assert!(padded_base64_bytes + 16 * 1024 < MAX_WIRE_FRAME_BYTES);
     }
-
 }
