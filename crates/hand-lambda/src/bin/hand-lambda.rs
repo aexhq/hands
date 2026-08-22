@@ -96,7 +96,7 @@ enum ImageCommand {
         #[arg(long)]
         gateway_authority: String,
         /// Host-only API Gateway names from the dev and production Platform outputs.
-        #[arg(long = "customer-hand-host", required = true, action = clap::ArgAction::Append)]
+        #[arg(long = "customer-hand-host", required = true, num_args = 2, action = clap::ArgAction::Append)]
         customer_hand_hosts: Vec<String>,
         #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
         confirm_dev_network_canary: bool,
@@ -196,11 +196,11 @@ async fn image_command(
                 NetworkBoundaryCanaryConfig {
                     image_arn,
                     image_version,
-                    none_connector: hand_core::connector::ConnectorRef::parse(none_connector)?,
-                    allowlist_connector: hand_core::connector::ConnectorRef::parse(
-                        allowlist_connector,
-                    )?,
-                    public_connector: hand_core::connector::ConnectorRef::parse(public_connector)?,
+                    connectors: hand_core::connector::ConnectorCatalog::new(
+                        hand_core::connector::ConnectorRef::parse(none_connector)?,
+                        hand_core::connector::ConnectorRef::parse(public_connector)?,
+                        hand_core::connector::ConnectorRef::parse(allowlist_connector)?,
+                    ),
                     gateway_authority: hand_core::connector::GatewayAuthority::parse(
                         &gateway_authority,
                     )?,
