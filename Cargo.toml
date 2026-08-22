@@ -30,7 +30,7 @@ aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behav
 aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23"
 cap-std = "4.0.3"
 futures-util = "0.3"
 globset = "0.4"
