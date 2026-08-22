@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use aws_sdk_lambdamicrovms::types::MicrovmState;
 use base64::Engine as _;
 use brain_protocol::contract::HAND_CONTRACT_DIGEST;
 use brain_protocol::hand::{HandError, HandErrorCode};
@@ -24,6 +25,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::io::ReaderStream;
 
 const AUTH_REFRESH_AFTER: Duration = Duration::from_secs(50 * 60);
+// The provider returns a target identity while RunMicrovm is still PENDING. External traffic is
+// admitted only after the /run hook succeeds and the target reaches RUNNING; the image gives that
+// hook 60 seconds, so the first guest request owns a small additional scheduling margin.
+const INITIAL_TARGET_READY_TIMEOUT: Duration = Duration::from_secs(65);
 const RPC_TIMEOUT: Duration = Duration::from_secs(45);
 
 enum RpcAttemptError {
@@ -87,7 +92,17 @@ impl GuestClient {
         {
             return Ok(endpoint.hand.clone());
         }
-        let vm = self.control.get(target_ref).await.map_err(control_error)?;
+        let mut vm = self.control.get(target_ref).await.map_err(control_error)?;
+        if vm.state == MicrovmState::Pending {
+            vm = launch::wait_for_state(
+                &self.control,
+                target_ref,
+                &MicrovmState::Running,
+                INITIAL_TARGET_READY_TIMEOUT,
+            )
+            .await
+            .map_err(|_| temporary("physical sandbox endpoint did not become ready"))?;
+        }
         if is_terminated(&vm.state) {
             return Err(error(
                 HandErrorCode::SandboxGone,
@@ -95,7 +110,7 @@ impl GuestClient {
                 "physical sandbox generation is gone",
             ));
         }
-        if vm.state == aws_sdk_lambdamicrovms::types::MicrovmState::Terminating {
+        if vm.state == MicrovmState::Terminating {
             return Err(temporary("physical sandbox generation is terminating"));
         }
         let endpoint = vm.endpoint.ok_or_else(|| {
