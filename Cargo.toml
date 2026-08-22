@@ -18,8 +18,8 @@ repository = "https://github.com/aexhq/hands"
 [workspace.dependencies]
 # Brain owns the protocol and Hand ports. Both packages resolve from one immutable source
 # identity so Hands can build without a sibling checkout and cannot drift across contracts.
-brain = { git = "https://github.com/aexhq/brain", rev = "23f71d6148b9fcf81b031517fafe8c4b411d9119" }
-brain-protocol = { git = "https://github.com/aexhq/brain", rev = "23f71d6148b9fcf81b031517fafe8c4b411d9119" }
+brain = { git = "https://github.com/aexhq/brain", rev = "8fbc42569d1e3bbe1af9b1e6e2e1bcc517de432b" }
+brain-protocol = { git = "https://github.com/aexhq/brain", rev = "8fbc42569d1e3bbe1af9b1e6e2e1bcc517de432b" }
 anyhow = "1"
 async-trait = "0.1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
